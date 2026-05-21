@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import Alert from "./Alert";
+// Remove axios import - not needed anymore
 
 export default function Navlines({ 
   user, 
@@ -18,75 +18,13 @@ export default function Navlines({
   formatTime
 }) {
   const [open, setOpen] = useState(false);
-  const [showAlerts, setShowAlerts] = useState(false);
-  const [alertCount, setAlertCount] = useState(0);
-  const [lines, setLines] = useState([]);
-  const [loadingLines, setLoadingLines] = useState(true);
   const navigate = useNavigate();
 
-  const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
-
-  // Fetch alert count
-  const fetchAlertCount = async () => {
-    try {
-      const token = localStorage.getItem("token");
-      if (!token) return;
-
-      const response = await fetch(`${API_BASE}/api/supervisor/alert-count`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          setAlertCount(data.count || 0);
-        }
-      }
-    } catch (error) {
-      console.error("Error fetching alert count:", error);
-    }
-  };
-
-  // Fetch all lines
-  const fetchAllLines = async () => {
-    setLoadingLines(true);
-    const token = localStorage.getItem('token');
-    const headers = { Authorization: `Bearer ${token}` };
-
-    try {
-      const response = await axios.get(`${API_BASE}/api/lines`, { headers });
-      if (response.data.success && response.data.lines) {
-        setLines(response.data.lines);
-      } else {
-        // Fallback to line numbers 1-20
-        const defaultLines = Array.from({ length: 20 }, (_, i) => ({
-          line_no: i + 1,
-          line_name: `Línea ${i + 1}`
-        }));
-        setLines(defaultLines);
-      }
-    } catch (err) {
-      console.error('Error fetching lines:', err);
-      // Fallback to line numbers 1-20
-      const defaultLines = Array.from({ length: 20 }, (_, i) => ({
-        line_no: i + 1,
-        line_name: `Línea ${i + 1}`
-      }));
-      setLines(defaultLines);
-    } finally {
-      setLoadingLines(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchAlertCount();
-    fetchAllLines();
-
-    // Refresh alert count every 2 minutes
-    const interval = setInterval(fetchAlertCount, 2 * 60 * 1000);
-
-    return () => clearInterval(interval);
-  }, []);
+  // Generate line numbers 1-26 directly - no API call needed
+  const lines = Array.from({ length: 26 }, (_, i) => ({
+    line_no: String(i + 1),
+    line_name: `Línea ${i + 1}`
+  }));
 
   const handleLogout = () => {
     localStorage.removeItem('token');
@@ -107,33 +45,11 @@ export default function Navlines({
           <div className="hidden md:flex items-center gap-4">
             <div className="text-sm text-gray-200">
               <div className="font-semibold">
-                {user?.full_name || user?.username || "Soporte_it"}
+                {user?.full_name || user?.username || "Usuario"}
               </div>
               <div className="text-xs text-gray-400">
-                {user?.role || "Soporte_it"}
+                {user?.role || "Rol"}
               </div>
-            </div>
-
-            {/* Alerts Button */}
-            <div className="relative">
-              <button
-                onClick={() => setShowAlerts(!showAlerts)}
-                className="relative px-4 py-2 text-sm font-medium bg-gray-800 text-white rounded-lg hover:bg-gray-700 transition-colors flex items-center gap-2"
-              >
-                <span>Alertas</span>
-                {alertCount > 0 && (
-                  <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
-                    {alertCount > 99 ? "99+" : alertCount}
-                  </span>
-                )}
-              </button>
-
-              {/* Alerts Dropdown */}
-              {showAlerts && (
-                <div className="absolute right-0 mt-2 w-96 bg-white rounded-xl shadow-xl border border-gray-200 z-50">
-                  <Alert supervisorMode={true} />
-                </div>
-              )}
             </div>
 
             <button
@@ -150,11 +66,6 @@ export default function Navlines({
             className="md:hidden text-2xl cursor-pointer relative"
           >
             ☰
-            {alertCount > 0 && (
-              <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
-                {alertCount}
-              </span>
-            )}
           </button>
         </div>
 
@@ -165,14 +76,11 @@ export default function Navlines({
             value={selectedLine || ''}
             onChange={(e) => onLineChange(e.target.value)}
             className="border-2 rounded-lg px-4 py-2.5 text-base bg-white text-gray-900 shadow-sm min-w-[200px]"
-            disabled={loadingLines}
           >
-            <option value="">
-              {loadingLines ? 'Cargando líneas...' : 'Seleccionar Línea'}
-            </option>
+            <option value="">Seleccionar Línea</option>
             {lines.map((line) => (
               <option key={line.line_no} value={line.line_no}>
-                {line.line_name || `Línea ${line.line_no}`}
+                {line.line_name}
               </option>
             ))}
           </select>
@@ -209,7 +117,7 @@ export default function Navlines({
           </button>
 
           {/* Last Updated Info */}
-          {selectedLine && (
+          {selectedLine && lastRefreshed && (
             <div className="text-sm text-gray-300 ml-auto flex items-center gap-3">
               <span>Última actualización: {formatTime(lastRefreshed)}</span>
               {autoRefresh && (
@@ -230,28 +138,12 @@ export default function Navlines({
             {/* User Info Mobile */}
             <div className="pb-3 border-b border-gray-700">
               <div className="font-semibold text-white">
-                {user?.full_name || user?.username || "Soporte_it"}
+                {user?.full_name || user?.username || "Usuario"}
               </div>
               <div className="text-sm text-gray-400">
-                {user?.role || "Soporte_it"}
+                {user?.role || "Rol"}
               </div>
             </div>
-
-            {/* Alerts Mobile */}
-            <button
-              onClick={() => {
-                setShowAlerts(!showAlerts);
-                setOpen(false);
-              }}
-              className="w-full text-left px-4 py-3 bg-gray-700 text-white rounded-lg hover:bg-gray-600 transition-colors flex justify-between items-center"
-            >
-              <span>Alertas</span>
-              {alertCount > 0 && (
-                <span className="bg-red-500 text-white text-xs rounded-full h-6 w-6 flex items-center justify-center">
-                  {alertCount}
-                </span>
-              )}
-            </button>
 
             {/* Logout Mobile */}
             <button
@@ -260,28 +152,6 @@ export default function Navlines({
             >
               Cerrar sesión
             </button>
-          </div>
-        </div>
-      )}
-
-      {/* Mobile Alerts Panel */}
-      {showAlerts && (
-        <div className="md:hidden fixed inset-0 bg-black bg-opacity-50 z-50">
-          <div className="absolute right-0 top-0 h-full w-96 bg-white shadow-xl overflow-y-auto">
-            <div className="p-4">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-xl font-bold text-gray-900">
-                  Alertas de Producción
-                </h3>
-                <button
-                  onClick={() => setShowAlerts(false)}
-                  className="text-2xl text-gray-500 hover:text-gray-700"
-                >
-                  ×
-                </button>
-              </div>
-              <Alert supervisorMode={true} />
-            </div>
           </div>
         </div>
       )}

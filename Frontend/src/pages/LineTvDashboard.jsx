@@ -145,6 +145,7 @@ export default function LineTvDashboard() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [countdown, setCountdown] = useState(300);
   const [lastRefreshed, setLastRefreshed] = useState(new Date());
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -221,7 +222,7 @@ export default function LineTvDashboard() {
     if (lineNo && date) {
       fetchLineData(lineNo, date);
     }
-  }, [lineNo, date]);
+  }, [lineNo, date, refreshKey]);
 
   const fetchLineData = async (line, selectedDate, isRefresh = false) => {
     if (!line || !selectedDate) return;
@@ -232,33 +233,48 @@ export default function LineTvDashboard() {
     const headers = { Authorization: `Bearer ${token}` };
 
     try {
-      // First, get all runs for this line on this date (including multiple styles)
       const runsRes = await axios.get(`${API_BASE}/api/line-runs/${line}`, { headers });
       
       if (!runsRes.data.success) {
         setError('No se pudo obtener información de la línea');
+        setLoading(false);
         return;
       }
 
-      // Filter runs for the selected date
-      const runsOnDate = runsRes.data.runs.filter(r => toYMD(r.run_date) === selectedDate);
+      const runsOnDate = runsRes.data.runs.filter(run => {
+        const runDateStr = toYMD(run.run_date);
+        return runDateStr === selectedDate;
+      });
+      
+      console.log(`Found ${runsOnDate.length} runs for line ${line} on ${selectedDate}`);
       
       if (runsOnDate.length === 0) {
         setError('No hay datos de producción para esta fecha');
+        setLoading(false);
         return;
       }
 
-      // Determine if multiple styles exist
       const hasMultipleStyles = runsOnDate.length > 1;
       setIsMultiStyle(hasMultipleStyles);
       
-      // Fetch detailed data for each run
       const allRunData = [];
       for (const run of runsOnDate) {
-        const detailRes = await axios.get(`${API_BASE}/api/get-run-data/${run.id}`, { headers });
-        if (detailRes.data.success) {
-          allRunData.push(detailRes.data);
+        try {
+          const detailRes = await axios.get(`${API_BASE}/api/get-run-data/${run.id}`, { headers });
+          if (detailRes.data.success) {
+            allRunData.push(detailRes.data);
+          } else {
+            console.warn(`No data for run ${run.id}`);
+          }
+        } catch (err) {
+          console.error(`Error fetching run ${run.id}:`, err.message);
         }
+      }
+      
+      if (allRunData.length === 0) {
+        setError('No se pudieron cargar los datos detallados');
+        setLoading(false);
+        return;
       }
       
       setRunDataList(allRunData);
@@ -273,7 +289,7 @@ export default function LineTvDashboard() {
 
     } catch (err) {
       console.error('Error fetching line data:', err);
-      setError('Error al cargar los datos');
+      setError('Error al cargar los datos: ' + (err.response?.data?.error || err.message));
     } finally {
       setLoading(false);
     }
@@ -282,16 +298,18 @@ export default function LineTvDashboard() {
   const handleDateChange = (newDate) => {
     setDate(newDate);
     setCountdown(300);
+    setRefreshKey(prev => prev + 1);
   };
 
   const handleLineChange = (newLine) => {
     setLineNo(newLine);
     setRunDataList([]);
     setCountdown(300);
+    setRefreshKey(prev => prev + 1);
   };
 
   const formatNumber = (value) => {
-    if (value == null) return '0';
+    if (value == null || isNaN(value)) return '0';
     return Number(value).toLocaleString(undefined, {
       minimumFractionDigits: 0,
       maximumFractionDigits: 0
@@ -299,14 +317,49 @@ export default function LineTvDashboard() {
   };
 
   const formatDecimal = (value) => {
-    if (value == null) return '0';
+    if (value == null || isNaN(value)) return '0';
     return Number(value).toLocaleString(undefined, {
       minimumFractionDigits: 1,
       maximumFractionDigits: 1
     });
   };
 
+  // Updated efficiency color function with new color scheme
+  const getEfficiencyColor = (eff) => {
+    if (isNaN(eff)) return 'text-gray-600';
+    if (eff < 60) return 'text-red-600';
+    if (eff >= 60 && eff < 70) return 'text-orange-500';
+    if (eff >= 70 && eff < 80) return 'text-yellow-600';
+    if (eff >= 80 && eff < 90) return 'text-green-600';
+    if (eff >= 90) return 'text-green-800';
+    return 'text-gray-600';
+  };
+
+  // Updated progress bar color function with new color scheme
+  const getProgressBarColor = (eff) => {
+    if (isNaN(eff)) return 'bg-gray-600';
+    if (eff < 60) return 'bg-red-600';
+    if (eff >= 60 && eff < 70) return 'bg-orange-500';
+    if (eff >= 70 && eff < 80) return 'bg-yellow-500';
+    if (eff >= 80 && eff < 90) return 'bg-green-600';
+    if (eff >= 90) return 'bg-green-800';
+    return 'bg-gray-600';
+  };
+
+  // Updated card background color based on efficiency
+  const getCardBgColor = (eff) => {
+    if (isNaN(eff)) return 'bg-white';
+    if (eff < 60) return 'bg-red-50';
+    if (eff >= 60 && eff < 70) return 'bg-orange-50';
+    if (eff >= 70 && eff < 80) return 'bg-yellow-50';
+    if (eff >= 80 && eff < 90) return 'bg-green-50';
+    if (eff >= 90) return 'bg-green-100';
+    return 'bg-white';
+  };
+
+  // Updated status color based on variance - keeping original but adjusting colors
   const getStatusColor = (variancePct) => {
+    if (isNaN(variancePct)) return { bg: 'bg-gray-50', border: 'border-gray-500', text: 'text-gray-700', badge: 'bg-gray-100 text-gray-800', icon: '⚪', label: 'Sin datos' };
     if (variancePct < -15) return { bg: 'bg-red-50', border: 'border-red-500', text: 'text-red-700', badge: 'bg-red-100 text-red-800', icon: '🔴', label: 'Crítico' };
     if (variancePct < -5) return { bg: 'bg-orange-50', border: 'border-orange-500', text: 'text-orange-700', badge: 'bg-orange-100 text-orange-800', icon: '🟠', label: 'Atrasado' };
     if (variancePct <= 5) return { bg: 'bg-green-50', border: 'border-green-500', text: 'text-green-700', badge: 'bg-green-100 text-green-800', icon: '🟢', label: 'En Ruta' };
@@ -314,25 +367,14 @@ export default function LineTvDashboard() {
     return { bg: 'bg-blue-50', border: 'border-blue-500', text: 'text-blue-700', badge: 'bg-blue-100 text-blue-800', icon: '🔵', label: 'Superando' };
   };
 
-  const getEfficiencyColor = (eff) => {
-    if (eff >= 80) return 'text-green-600';
-    if (eff >= 60) return 'text-yellow-600';
-    return 'text-red-600';
-  };
-
-  const getProgressBarColor = (eff) => {
-    if (eff >= 80) return 'bg-green-600';
-    if (eff >= 60) return 'bg-yellow-600';
-    return 'bg-red-600';
-  };
-
-  // Calculate card data for a specific run
   const getRunCardData = (runData) => {
     const rt = computeRealtimeTarget(runData, date);
     const finished = calculateFinishedGarments(runData);
     const operatorsCount = runData.operators?.length || 0;
     const sam = runData.run?.sam_minutes || 0;
-    const rtEff = calculateRealtimeEfficiency(runData, date);
+    let rtEff = calculateRealtimeEfficiency(runData, date);
+    // Cap efficiency at 100 for display purposes
+    const displayEfficiency = Math.min(rtEff, 100);
     const variance = finished - rt;
     const variancePct = rt > 0 ? (variance / rt) * 100 : 0;
     
@@ -340,6 +382,7 @@ export default function LineTvDashboard() {
       realtimeTarget: rt,
       finishedGarments: finished,
       realtimeEfficiency: rtEff,
+      displayEfficiency: displayEfficiency,
       operatorsCount,
       sam,
       styleName: runData.run?.style || 'N/A',
@@ -376,14 +419,12 @@ export default function LineTvDashboard() {
       />
 
       <main className="flex-1 max-w-7xl mx-auto px-4 py-4 w-full">
-        {/* Error message */}
         {error && (
-          <div className="bg-red-100 border-2 border-red-400 text-red-700 px-4 py-2 rounded-lg mb-4 text-base">
+          <div className="bg-red-100 border-2 border-red-400 text-red-700 px-6 py-4 rounded-lg mb-4 text-xl font-semibold">
             ⚠️ {error}
           </div>
         )}
 
-        {/* Loading */}
         {loading && lineNo && (
           <div className="text-center py-12">
             <div className="animate-spin rounded-full h-16 w-16 border-4 border-gray-200 border-t-gray-900 mx-auto"></div>
@@ -391,98 +432,107 @@ export default function LineTvDashboard() {
           </div>
         )}
 
-        {/* Multi-style header indicator */}
         {!loading && lineNo && runDataList.length > 1 && (
-          <div className="mb-4 bg-blue-100 border-2 border-blue-400 text-blue-800 px-4 py-2 rounded-lg text-center">
+          <div className="mb-4 bg-blue-100 border-2 border-blue-400 text-blue-800 px-4 py-2 rounded-lg text-center text-lg font-semibold">
             📊 Línea con múltiples estilos - Mostrando {runDataList.length} estilos
           </div>
         )}
 
-        {/* Cards Grid - Responsive for multiple styles */}
         {!loading && lineNo && runDataList.length > 0 && (
-          <div className={`grid gap-6 ${runDataList.length === 1 ? 'grid-cols-1 max-w-4xl mx-auto' : 'grid-cols-1 lg:grid-cols-2'}`}>
+          <div className={`grid gap-6 ${runDataList.length === 1 ? 'grid-cols-1 max-w-5xl mx-auto' : 'grid-cols-1 lg:grid-cols-2'}`}>
             {runDataList.map((runData, index) => {
               const cardData = getRunCardData(runData);
               const status = getStatusColor(cardData.variancePct);
+              const cardBg = getCardBgColor(cardData.displayEfficiency);
               
               return (
-                <div key={runData.run?.id || index} className={`border-4 ${status.border} rounded-xl overflow-hidden shadow-xl`}>
-                  {/* Header */}
-                  <div className={`${status.bg} px-5 py-3 flex justify-between items-center`}>
-                    <div className="flex items-center gap-3">
+                <div key={runData.run?.id || index} className={`border-4 ${status.border} rounded-xl overflow-hidden shadow-2xl ${cardBg}`}>
+                  {/* Header - Larger and more prominent */}
+                  <div className={`${status.bg} px-6 py-4 flex justify-between items-center`}>
+                    <div className="flex items-center gap-4">
                       <div>
-                        <span className="text-2xl font-bold text-gray-900">
+                        <span className="text-3xl font-black text-gray-900">
                           Línea {lineNo}
                         </span>
                         {runDataList.length > 1 && (
-                          <div className="text-sm text-gray-600 mt-0.5">
-                            {cardData.styleCode} - {cardData.styleName.length > 30 ? cardData.styleName.substring(0, 30) + '...' : cardData.styleName}
+                          <div className="text-base text-gray-600 mt-1 font-medium">
+                            {cardData.styleCode} - {cardData.styleName.length > 35 ? cardData.styleName.substring(0, 35) + '...' : cardData.styleName}
                           </div>
                         )}
                       </div>
-                      <span className="text-2xl">{status.icon}</span>
+                      <span className="text-3xl">{status.icon}</span>
                     </div>
-                    <div className={`${status.badge} px-4 py-1.5 rounded-full text-lg font-semibold shadow`}>
+                    <div className={`${status.badge} px-5 py-2 rounded-full text-xl font-bold shadow-md`}>
                       {status.label}
                     </div>
                   </div>
 
-                  {/* Card Content */}
-                  <div className="p-5 bg-white">
+                  {/* Card Content - Larger everything */}
+                  <div className="p-6">
                     {/* Style info - only show when single style */}
                     {runDataList.length === 1 && (
-                      <div className="mb-3 text-base text-gray-600 font-medium border-b pb-2 truncate">
-                        {cardData.styleCode} - {cardData.styleName}
+                      <div className="mb-4 text-lg text-gray-700 font-semibold border-b-2 pb-2 truncate">
+                        📦 {cardData.styleCode} - {cardData.styleName}
                       </div>
                     )}
 
-                    {/* Operator Info - 2 columns */}
-                    <div className="grid grid-cols-2 gap-3 mb-4">
-                      <div className="bg-gray-50 rounded-lg p-3 text-center">
-                        <div className="text-sm text-gray-600 mb-1">Operadores</div>
-                        <div className="text-2xl font-bold text-gray-900">{cardData.operatorsCount}</div>
+                    {/* Operator Info - 2 columns with larger numbers */}
+                    <div className="grid grid-cols-2 gap-4 mb-5">
+                      <div className="bg-gray-100 rounded-xl p-4 text-center">
+                        <div className="text-base text-gray-600 mb-2 font-semibold uppercase tracking-wide">👥 Operadores</div>
+                        <div className="text-4xl font-black text-gray-900">{cardData.operatorsCount}</div>
                       </div>
-                      <div className="bg-gray-50 rounded-lg p-3 text-center">
-                        <div className="text-sm text-gray-600 mb-1">SAM</div>
-                        <div className="text-2xl font-bold text-gray-900">{formatDecimal(cardData.sam)}</div>
+                      <div className="bg-gray-100 rounded-xl p-4 text-center">
+                        <div className="text-base text-gray-600 mb-2 font-semibold uppercase tracking-wide">⏱️ SAM</div>
+                        <div className="text-4xl font-black text-gray-900">{formatDecimal(cardData.sam)}</div>
                       </div>
                     </div>
 
-                    {/* Real-time Efficiency Section */}
-                    <div className="mb-4 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg p-4">
-                      <div className="flex justify-between items-center mb-2">
-                        <span className="text-lg text-gray-700 font-semibold">Eficiencia RT:</span>
-                        <span className={`text-2xl font-bold ${getEfficiencyColor(cardData.realtimeEfficiency)}`}>
-                          {formatDecimal(cardData.realtimeEfficiency)}%
+                    {/* Real-time Efficiency Section - More prominent with new colors */}
+                    <div className="mb-5 rounded-xl p-5" style={{ backgroundColor: 'rgba(255,255,255,0.7)' }}>
+                      <div className="flex justify-between items-center mb-3">
+                        <span className="text-xl text-gray-800 font-bold uppercase tracking-wide">⚡ Eficiencia RT:</span>
+                        <span className={`text-3xl font-black ${getEfficiencyColor(cardData.displayEfficiency)}`}>
+                          {formatDecimal(cardData.displayEfficiency)}%
                         </span>
                       </div>
-                      <div className="w-full bg-gray-200 rounded-full h-3">
+                      <div className="w-full bg-gray-300 rounded-full h-4">
                         <div
-                          className={`h-3 rounded-full transition-all duration-500 ${getProgressBarColor(cardData.realtimeEfficiency)}`}
-                          style={{ width: `${Math.min(cardData.realtimeEfficiency, 100)}%` }}
+                          className={`h-4 rounded-full transition-all duration-500 ${getProgressBarColor(cardData.displayEfficiency)}`}
+                          style={{ width: `${cardData.displayEfficiency}%` }}
                         ></div>
                       </div>
-                    </div>
-
-                    {/* Two column grid - Target and Produced */}
-                    <div className="grid grid-cols-2 gap-4 mb-4">
-                      <div className="bg-blue-50 rounded-lg p-4">
-                        <div className="text-base text-blue-800 font-medium mb-1">Objetivo (ahora)</div>
-                        <div className="text-3xl font-bold text-blue-900">{formatNumber(cardData.realtimeTarget)}</div>
-                      </div>
-                      <div className="bg-green-50 rounded-lg p-4">
-                        <div className="text-base text-green-800 font-medium mb-1">Cosido</div>
-                        <div className="text-3xl font-bold text-green-900">{formatNumber(cardData.finishedGarments)}</div>
+                      {/* Efficiency label */}
+                      <div className="mt-2 text-right">
+                        <span className={`text-sm font-semibold ${getEfficiencyColor(cardData.displayEfficiency)}`}>
+                          {cardData.displayEfficiency < 60 && '⚠️ Por debajo de meta'}
+                          {cardData.displayEfficiency >= 60 && cardData.displayEfficiency < 70 && '⚠️ Necesita mejorar'}
+                          {cardData.displayEfficiency >= 70 && cardData.displayEfficiency < 80 && '📈 Buen desempeño'}
+                          {cardData.displayEfficiency >= 80 && cardData.displayEfficiency < 90 && '🌟 Excelente'}
+                          {cardData.displayEfficiency >= 90 && '🏆 Outstanding!'}
+                        </span>
                       </div>
                     </div>
 
-                    {/* Variance */}
-                    <div className="flex justify-between items-center pt-3 border-t-2 border-gray-200">
-                      <span className="text-lg text-gray-700 font-semibold">Variación</span>
-                      <span className={`font-bold flex items-center gap-2 text-xl ${
+                    {/* Two column grid - Target and Produced with larger numbers */}
+                    <div className="grid grid-cols-2 gap-5 mb-5">
+                      <div className="bg-blue-100 rounded-xl p-5 text-center">
+                        <div className="text-lg text-blue-900 font-bold mb-2 uppercase tracking-wide">🎯 Objetivo (ahora)</div>
+                        <div className="text-5xl font-black text-blue-900">{formatNumber(cardData.realtimeTarget)}</div>
+                      </div>
+                      <div className="bg-green-100 rounded-xl p-5 text-center">
+                        <div className="text-lg text-green-900 font-bold mb-2 uppercase tracking-wide">✅ Cosido</div>
+                        <div className="text-5xl font-black text-green-900">{formatNumber(cardData.finishedGarments)}</div>
+                      </div>
+                    </div>
+
+                    {/* Variance - More visible */}
+                    <div className="flex justify-between items-center pt-4 border-t-2 border-gray-300">
+                      <span className="text-xl text-gray-800 font-bold uppercase tracking-wide">📊 Variación</span>
+                      <span className={`font-black flex items-center gap-3 text-2xl ${
                         cardData.variance > 0 ? 'text-green-600' : cardData.variance < 0 ? 'text-red-600' : 'text-gray-600'
                       }`}>
-                        <span className="text-2xl">{cardData.variance > 0 ? '↑' : cardData.variance < 0 ? '↓' : '→'}</span>
+                        <span className="text-3xl">{cardData.variance > 0 ? '↑' : cardData.variance < 0 ? '↓' : '→'}</span>
                         <span>{cardData.variance > 0 ? '+' : ''}{formatNumber(cardData.variance)}</span>
                       </span>
                     </div>
@@ -493,12 +543,19 @@ export default function LineTvDashboard() {
           </div>
         )}
 
-        {/* No line selected */}
+        {!loading && lineNo && runDataList.length === 0 && !error && (
+          <div className="bg-yellow-50 border-2 border-yellow-400 text-yellow-800 px-6 py-8 rounded-lg text-center">
+            <div className="text-5xl mb-4">📋</div>
+            <h3 className="text-2xl font-bold mb-3">No hay datos disponibles</h3>
+            <p className="text-lg">No se encontraron datos de producción para la línea {lineNo} en la fecha {date}</p>
+          </div>
+        )}
+
         {!lineNo && (
-          <div className="bg-white rounded-xl shadow-lg p-12 text-center">
-            <div className="text-5xl mb-4">📺</div>
-            <h2 className="text-3xl font-bold text-gray-800 mb-2">Selecciona una línea</h2>
-            <p className="text-lg text-gray-500">para ver los datos en tiempo real</p>
+          <div className="bg-white rounded-xl shadow-2xl p-16 text-center">
+            <div className="text-7xl mb-6">📺</div>
+            <h2 className="text-4xl font-black text-gray-800 mb-3">Selecciona una línea</h2>
+            <p className="text-xl text-gray-500">para ver los datos en tiempo real</p>
           </div>
         )}
       </main>

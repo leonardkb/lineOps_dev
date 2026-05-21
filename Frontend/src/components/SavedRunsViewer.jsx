@@ -53,10 +53,58 @@ export default function SavedRunsViewer({ onBack }) {
   const [showEditShiftSlots, setShowEditShiftSlots] = useState(false);
   const [isUpdatingShiftSlots, setIsUpdatingShiftSlots] = useState(false);
 
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+const [runToDelete, setRunToDelete] = useState(null);
+const [isDeleting, setIsDeleting] = useState(false);
+
   // Cargar todas las corridas guardadas
   useEffect(() => {
     fetchLineRuns();
   }, []);
+
+
+  // Add delete handler function after handleCopyRun
+const handleDeleteRun = async () => {
+  if (!runToDelete) return;
+
+  setIsDeleting(true);
+  setMessage("");
+
+  try {
+    const token = localStorage.getItem("token");
+    const response = await fetch(`http://localhost:5000/api/run/${runToDelete.id}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    const data = await response.json();
+
+    if (data.success) {
+      setMessage(`✅ ${data.message}`);
+      setShowDeleteConfirm(false);
+      setRunToDelete(null);
+      
+      // Refresh the runs list
+      await fetchLineRuns();
+      
+      // If the deleted run was currently selected, clear selection
+      if (selectedRun === runToDelete.id) {
+        setSelectedRun(null);
+        setRunData(null);
+        setOperators([]);
+        setActivePanel("select");
+      }
+    } else {
+      setMessage(`❌ Error: ${data.error}`);
+    }
+  } catch (err) {
+    setMessage(`❌ No se pudo eliminar la corrida: ${err.message}`);
+  } finally {
+    setIsDeleting(false);
+  }
+};
 
   const fetchLineRuns = async () => {
     setLoading(true);
@@ -290,49 +338,68 @@ export default function SavedRunsViewer({ onBack }) {
   };
 
   // Convertir operaciones de BD a formato rows del frontend
-  const getRowsFromData = () => {
-    if (!runData?.operations) return [];
+  // In SavedRunsViewer.jsx - REPLACE the getRowsFromData function
+const getRowsFromData = () => {
+  if (!runData?.operations) return [];
 
-    const rows = [];
+  // Create mapping from slot_label to slot_id
+  const slotLabelToId = {};
+  if (runData?.slots) {
+    runData.slots.forEach(slot => {
+      slotLabelToId[slot.slot_label] = slot.id;
+    });
+  }
 
-    runData.operations.forEach((opGroup) => {
-      opGroup.operations.forEach((op) => {
-        const stitched = {};
-        const sewed = {};
+  const rows = [];
 
-        // Get planned/stitched data
-        if (op.stitched_data) {
-          Object.entries(op.stitched_data).forEach(([slotLabel, qty]) => {
-            if (slotLabel) stitched[slotLabel] = qty;
-          });
-        }
+  runData.operations.forEach((opGroup) => {
+    opGroup.operations.forEach((op) => {
+      const stitched = {};
+      const sewed = {};
 
-        // Get actual/sewed data from line leader
-        if (op.sewed_data) {
-          Object.entries(op.sewed_data).forEach(([slotLabel, qty]) => {
-            if (slotLabel) sewed[slotLabel] = qty;
-          });
-        }
-
-        rows.push({
-          id: `db_${op.id}`,
-          operatorNo: opGroup.operator.operator_no.toString(),
-          operatorName: opGroup.operator.operator_name || "",
-          operation: op.operation_name,
-          t1: op.t1_sec?.toString() || "",
-          t2: op.t2_sec?.toString() || "",
-          t3: op.t3_sec?.toString() || "",
-          t4: op.t4_sec?.toString() || "",
-          t5: op.t5_sec?.toString() || "",
-          capPerOperator: parseFloat(op.capacity_per_hour) || 0,
-          stitched,
-          sewed,
+      // Get planned/stitched data - map from label to ID
+      if (op.stitched_data && typeof op.stitched_data === 'object') {
+        Object.entries(op.stitched_data).forEach(([slotLabel, qty]) => {
+          if (slotLabel && slotLabel !== '') {
+            const slotId = slotLabelToId[slotLabel];
+            if (slotId) {
+              stitched[slotId] = qty;
+            }
+          }
         });
+      }
+
+      // Get actual/sewed data from line leader - map from label to ID
+      if (op.sewed_data && typeof op.sewed_data === 'object') {
+        Object.entries(op.sewed_data).forEach(([slotLabel, qty]) => {
+          if (slotLabel && slotLabel !== '') {
+            const slotId = slotLabelToId[slotLabel];
+            if (slotId) {
+              sewed[slotId] = qty;
+            }
+          }
+        });
+      }
+
+      rows.push({
+        id: `db_${op.id}`,
+        operatorNo: opGroup.operator.operator_no.toString(),
+        operatorName: opGroup.operator.operator_name || "",
+        operation: op.operation_name,
+        t1: op.t1_sec?.toString() || "",
+        t2: op.t2_sec?.toString() || "",
+        t3: op.t3_sec?.toString() || "",
+        t4: op.t4_sec?.toString() || "",
+        t5: op.t5_sec?.toString() || "",
+        capPerOperator: parseFloat(op.capacity_per_hour) || 0,
+        stitched,
+        sewed,
       });
     });
+  });
 
-    return rows;
-  };
+  return rows;
+};
 
   // Metas por slot
   const getSlotTargets = () => {
@@ -464,41 +531,53 @@ export default function SavedRunsViewer({ onBack }) {
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {filteredRuns.map((run) => (
-                  <div
-                    key={run.id}
-                    className="rounded-xl border border-gray-200 p-4 hover:border-gray-300 hover:bg-gray-50 cursor-pointer transition flex flex-col h-full"
-                    onClick={() => handleSelectRun(run.id)}
-                  >
-                    <div className="flex-grow">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="font-semibold text-gray-900">{run.line_no}</div>
-                        <div className="text-xs text-gray-500">
-                          {new Date(run.run_date).toLocaleDateString()}
-                        </div>
-                      </div>
-                      <div className="text-sm text-gray-600 mb-1">Estilo: {run.style}</div>
-                      <div className="text-sm text-gray-600 mb-1">Operadores: {run.operators_count}</div>
-                      <div className="text-sm text-gray-600">Meta: {run.target_pcs} pzas</div>
-                      <div className="mt-3 text-xs text-gray-500">
-                        Creado: {new Date(run.created_at).toLocaleString()}
-                      </div>
-                    </div>
+  <div
+    key={run.id}
+    className="rounded-xl border border-gray-200 p-4 hover:border-gray-300 hover:bg-gray-50 transition flex flex-col h-full"
+  >
+    <div 
+      className="flex-grow cursor-pointer"
+      onClick={() => handleSelectRun(run.id)}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <div className="font-semibold text-gray-900">{run.line_no}</div>
+        <div className="text-xs text-gray-500">
+          {new Date(run.run_date).toLocaleDateString()}
+        </div>
+      </div>
+      <div className="text-sm text-gray-600 mb-1">Estilo: {run.style}</div>
+      <div className="text-sm text-gray-600 mb-1">Operadores: {run.operators_count}</div>
+      <div className="text-sm text-gray-600">Meta: {run.target_pcs} pzas</div>
+      <div className="mt-3 text-xs text-gray-500">
+        Creado: {new Date(run.created_at).toLocaleString()}
+      </div>
+    </div>
 
-                    {/* Botón de copiar (texto) */}
-                    <div className="mt-3 pt-3 border-t border-gray-100 flex justify-end">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setCopyDialog({ open: true, run });
-                          setNewDate("");
-                        }}
-                        className="text-sm text-blue-600 hover:text-blue-800 font-medium"
-                      >
-                        📋 Copiar a nueva fecha
-                      </button>
-                    </div>
-                  </div>
-                ))}
+    {/* Action Buttons */}
+    <div className="mt-3 pt-3 border-t border-gray-100 flex justify-end gap-3">
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          setCopyDialog({ open: true, run });
+          setNewDate("");
+        }}
+        className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+      >
+        📋 Copiar
+      </button>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          setRunToDelete(run);
+          setShowDeleteConfirm(true);
+        }}
+        className="text-sm text-red-600 hover:text-red-800 font-medium"
+      >
+        🗑️ Eliminar
+      </button>
+    </div>
+  </div>
+))}
               </div>
             )}
           </div>
@@ -542,6 +621,47 @@ export default function SavedRunsViewer({ onBack }) {
           </div>
         </div>
       )}
+
+      {/* Delete Confirmation Modal */}
+{showDeleteConfirm && runToDelete && (
+  <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+    <div className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6">
+      <h3 className="text-lg font-semibold text-gray-900 mb-2">
+        Confirmar eliminación
+      </h3>
+      <p className="text-sm text-gray-600 mb-4">
+        ¿Estás seguro de que deseas eliminar esta corrida?
+      </p>
+      <div className="bg-gray-50 p-3 rounded-lg mb-4">
+        <p className="text-sm font-medium text-gray-900">Línea: {runToDelete.line_no}</p>
+        <p className="text-sm text-gray-600">Estilo: {runToDelete.style}</p>
+        <p className="text-sm text-gray-600">Fecha: {new Date(runToDelete.run_date).toLocaleDateString()}</p>
+      </div>
+      <p className="text-xs text-red-600 mb-4">
+        ⚠️ Esta acción eliminará permanentemente la corrida, incluyendo todos los operadores,
+        operaciones, metas horarias y datos de producción asociados. No se puede deshacer.
+      </p>
+      <div className="flex justify-end gap-3">
+        <button
+          onClick={() => {
+            setShowDeleteConfirm(false);
+            setRunToDelete(null);
+          }}
+          className="px-4 py-2 text-sm border border-gray-200 rounded-xl hover:bg-gray-50"
+        >
+          Cancelar
+        </button>
+        <button
+          onClick={handleDeleteRun}
+          disabled={isDeleting}
+          className="px-4 py-2 text-sm bg-red-600 text-white rounded-xl hover:bg-red-700 disabled:opacity-50"
+        >
+          {isDeleting ? "Eliminando..." : "Sí, eliminar"}
+        </button>
+      </div>
+    </div>
+  </div>
+)}
 
       {/* Vista de detalles */}
       {activePanel !== "select" && runData && (

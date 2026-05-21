@@ -467,8 +467,7 @@ export default function SkyrinaDashboard() {
     return () => clearInterval(timer);
   }, [autoRefresh, date]);
 
-  // Fetch all run details for each line - grouped by line
-// Fetch all run details for each line - grouped by line
+// Replace the fetchAllRunDetails useEffect in SkyrinaDashboard.jsx
 useEffect(() => {
   const fetchAllRunDetails = async () => {
     if (!lineData.length || !date) return;
@@ -476,131 +475,95 @@ useEffect(() => {
     const token = localStorage.getItem('token');
     const headers = { Authorization: `Bearer ${token}` };
     
-    const newRunDataMap = {};
-    const lineTargets = {};
-    
-    // IMPORTANT: Declare these outside the line loop to accumulate across ALL lines
-    let totalWeightedRealtimeEff = 0;
-    let totalWeightedRealtimeTarget = 0;
-    
-    for (const line of lineData) {
-      try {
-        const runsRes = await axios.get(`${API_BASE}/api/line-runs/${line.lineNo}`, { headers });
-        if (!runsRes.data.success) continue;
+    try {
+      // Use batch endpoint instead of individual requests
+      const lines = lineData.map(line => line.lineNo);
+      const batchRes = await axios.post(`${API_BASE}/api/batch/line-runs-data`, 
+        { lines, date },
+        { headers }
+      );
+      
+      if (batchRes.data.success) {
+        const batchData = batchRes.data.data;
+        const newRunDataMap = {};
+        const lineTargets = {};
         
-        const runsForDate = runsRes.data.runs.filter(r => toYMD(r.run_date) === date);
+        let totalWeightedRealtimeEff = 0;
+        let totalWeightedRealtimeTarget = 0;
         
-        if (runsForDate.length === 0) {
-          newRunDataMap[line.lineNo] = [];
-          lineTargets[line.lineNo] = 0;
-          continue;
-        }
-        
-        const lineRuns = [];
-        
-        for (const run of runsForDate) {
-          const detailRes = await axios.get(`${API_BASE}/api/get-run-data/${run.id}`, { headers });
-          if (!detailRes.data.success) continue;
+        for (const lineNo in batchData) {
+          const runs = batchData[lineNo];
           
-          const runData = detailRes.data;
-          const finishedGarments = calculateFinishedGarments(runData);
-          
-          // Get real-time values using the same functions as Dashboard.jsx
-          const rtEff = calculateRealtimeEfficiency(runData, date);
-          const rtTarget = computeRealtimeTarget(runData, date);
-          const dailyEff = calculateActualDailyEfficiency(runData);
-          
-          const operatorsCount = runData.run?.operators_count || 0;
-          const workingHours = runData.run?.working_hours || 0;
-          const sam = runData.run?.sam_minutes || 0;
-          
-          // Ensure values are valid numbers
-          const safeFinishedGarments = (isNaN(finishedGarments) || !isFinite(finishedGarments)) ? 0 : finishedGarments;
-          const safeDailyEff = (isNaN(dailyEff) || !isFinite(dailyEff)) ? 0 : dailyEff;
-          
-          // Handle realtime efficiency (can be null)
-          let safeRealtimeEff = 0;
-          if (rtEff !== null && !isNaN(rtEff) && isFinite(rtEff)) {
-            safeRealtimeEff = rtEff;
+          if (runs.length === 0) {
+            newRunDataMap[lineNo] = [];
+            lineTargets[lineNo] = 0;
+            continue;
           }
           
-          const hasProductionData = safeFinishedGarments > 0 || (runData.operations && runData.operations.length > 0);
+          const lineRuns = [];
           
-          // EXACTLY MATCH Dashboard.jsx condition
-          // Dashboard.jsx uses: if (rtTarget > 0 && rtEff !== null)
-          if (rtTarget > 0 && rtEff !== null) {
-            totalWeightedRealtimeEff += rtEff * rtTarget;
-            totalWeightedRealtimeTarget += rtTarget;
+          for (const run of runs) {
+            const runData = {
+              run: run,
+              slots: run.runData.slots,
+              operators: run.runData.operators,
+              operations: run.runData.operations,
+              slotTargets: run.runData.slotTargets
+            };
             
-            console.log(`Adding to global: line ${line.lineNo}, style ${run.style}, eff=${rtEff}, target=${rtTarget}, weighted=${rtEff * rtTarget}`);
+            const finishedGarments = calculateFinishedGarments(runData);
+            const rtEff = calculateRealtimeEfficiency(runData, date);
+            const rtTarget = computeRealtimeTarget(runData, date);
+            const dailyEff = calculateActualDailyEfficiency(runData);
+            
+            // ... rest of your processing logic remains the same
+            if (rtTarget > 0 && rtEff !== null) {
+              totalWeightedRealtimeEff += rtEff * rtTarget;
+              totalWeightedRealtimeTarget += rtTarget;
+            }
+            
+            lineRuns.push({
+              runId: run.id,
+              style: run.style,
+              targetPcs: run.target_pcs,
+              finishedGarments: finishedGarments,
+              realtimeTarget: rtTarget,
+              realtimeEff: rtEff,
+              dailyEff: dailyEff,
+              operatorsCount: run.operators_count,
+              workingHours: run.working_hours,
+              sam: run.sam_minutes,
+              runData: runData,
+              hasProductionData: finishedGarments > 0 || (runData.operations && runData.operations.length > 0)
+            });
           }
           
-          lineRuns.push({
-            runId: run.id,
-            style: run.style,
-            styleGroupId: runData.run?.style_group_id,
-            styleGroupName: runData.run?.style_group_name,
-            targetPcs: run.target_pcs,
-            finishedGarments: safeFinishedGarments,
-            realtimeTarget: rtTarget,
-            realtimeEff: safeRealtimeEff,
-            dailyEff: safeDailyEff,
-            operatorsCount,
-            workingHours,
-            sam,
-            runData,
-            hasProductionData
-          });
-        }
-        
-        if (lineRuns.length > 0) {
-          newRunDataMap[line.lineNo] = lineRuns;
-          
-          // Calculate per-line real-time target
+          newRunDataMap[lineNo] = lineRuns;
           if (lineRuns.length > 0) {
             const firstRun = lineRuns[0];
             const lineRealtimeTarget = computeRealtimeTarget(firstRun.runData, date);
-            lineTargets[line.lineNo] = lineRealtimeTarget;
-          } else {
-            lineTargets[line.lineNo] = 0;
+            lineTargets[lineNo] = lineRealtimeTarget;
           }
-        } else {
-          lineTargets[line.lineNo] = 0;
         }
         
-      } catch (err) {
-        console.error(`Error fetching details for line ${line.lineNo}:`, err);
-        newRunDataMap[line.lineNo] = [];
-        lineTargets[line.lineNo] = 0;
+        setRunDataMap(newRunDataMap);
+        setGlobalRealtimeTarget(Object.values(lineTargets).reduce((a, b) => a + b, 0));
+        
+        if (!productionEnded && totalWeightedRealtimeTarget > 0) {
+          const correctGlobalRealtimeEfficiency = totalWeightedRealtimeEff / totalWeightedRealtimeTarget;
+          setGlobalRealtimeEfficiency(Math.round(correctGlobalRealtimeEfficiency * 100) / 100);
+        }
+        
+        if (summary && summary.overallEfficiency !== undefined) {
+          setGlobalDailyEfficiency(summary.overallEfficiency);
+        }
       }
-    }
-    
-    setRunDataMap(newRunDataMap);
-    
-    // Sum per-line targets for global real-time target
-    const targetSum = Object.values(lineTargets).reduce((a, b) => a + b, 0);
-    setGlobalRealtimeTarget(targetSum);
-    
-    console.log(`Global totals - Weighted Eff Sum: ${totalWeightedRealtimeEff}, Weighted Target Sum: ${totalWeightedRealtimeTarget}`);
-    
-    // Calculate global real-time efficiency using weighted average (EXACTLY matches Dashboard.jsx)
-    let correctGlobalRealtimeEfficiency = 0;
-    if (!productionEnded && totalWeightedRealtimeTarget > 0) {
-      correctGlobalRealtimeEfficiency = totalWeightedRealtimeEff / totalWeightedRealtimeTarget;
-      console.log(`Calculated global RT efficiency: ${correctGlobalRealtimeEfficiency}%`);
-    }
-    setGlobalRealtimeEfficiency(Math.round(correctGlobalRealtimeEfficiency * 100) / 100);
-    
-    // IMPORTANT: Daily efficiency comes from server's summary endpoint
-    if (summary && summary.overallEfficiency !== undefined) {
-      setGlobalDailyEfficiency(summary.overallEfficiency);
+    } catch (err) {
+      console.error('Error fetching batch data:', err);
     }
   };
   
   fetchAllRunDetails();
-  
-  const interval = setInterval(fetchAllRunDetails, 60000);
-  return () => clearInterval(interval);
 }, [lineData, date, productionEnded, summary]);
 
   const fetchDashboardData = async (selectedDate, isRefresh = false) => {

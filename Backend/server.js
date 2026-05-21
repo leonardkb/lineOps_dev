@@ -4480,6 +4480,218 @@ app.get("/api/skyrina/product-performance", authenticateToken, async (req, res) 
     client.release();
   }
 });
+
+// Add this endpoint to your server.js (without validate)
+// ========== BATCH ENDPOINT FOR SKYRINA DASHBOARD ==========
+app.post(
+  "/api/batch/line-runs-data",
+  authenticateToken,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      
+      const { lines, date } = req.body;
+      
+      // Validate inputs manually
+      if (!lines || !Array.isArray(lines)) {
+        return res.status(400).json({ success: false, error: "lines array required" });
+      }
+      if (!date) {
+        return res.status(400).json({ success: false, error: "date required" });
+      }
+      
+      const results = {};
+      
+      for (const lineNo of lines) {
+        // Get runs for this line
+        const runsResult = await client.query(
+          `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes,
+                  efficiency, target_pcs, target_per_hour, created_at
+           FROM line_runs
+           WHERE line_no = $1 AND run_date = $2
+           ORDER BY run_date DESC`,
+          [lineNo, date]
+        );
+        
+        const lineRuns = [];
+        
+        for (const run of runsResult.rows) {
+          // Get full run data
+          const runData = await getFullRunDataBatch(client, run.id);
+          lineRuns.push({
+            ...run,
+            runData
+          });
+        }
+        
+        results[lineNo] = lineRuns;
+      }
+      
+      res.json({ success: true, data: results });
+    } catch (err) {
+      console.error("❌ Error in batch endpoint:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// Helper function for batch endpoint (different name to avoid conflict)
+async function getFullRunDataBatch(client, runId) {
+  // Get slots
+  const slotsResult = await client.query(
+    "SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order",
+    [runId]
+  );
+  
+  // Get operators
+  const operatorsResult = await client.query(
+    "SELECT id, operator_no, operator_name FROM run_operators WHERE run_id = $1 ORDER BY operator_no",
+    [runId]
+  );
+  
+  // Get slot targets
+  const slotTargetsResult = await client.query(
+    `SELECT s.slot_label, t.slot_target, t.cumulative_target
+     FROM slot_targets t
+     JOIN shift_slots s ON t.slot_id = s.id
+     WHERE t.run_id = $1
+     ORDER BY s.slot_order`,
+    [runId]
+  );
+  
+  // Get operations with their data
+  const operationsData = [];
+  for (const operator of operatorsResult.rows) {
+    const operationsResult = await client.query(
+      `SELECT 
+        o.id,
+        o.operation_name,
+        o.t1_sec,
+        o.t2_sec,
+        o.t3_sec,
+        o.t4_sec,
+        o.t5_sec,
+        o.capacity_per_hour,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s.slot_label, ''),
+            COALESCE(h.stitched_qty, 0)
+          ) FILTER (WHERE s.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as stitched_data,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s2.slot_label, ''),
+            COALESCE(se.sewed_qty, 0)
+          ) FILTER (WHERE s2.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as sewed_data
+       FROM operator_operations o
+       LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
+       LEFT JOIN shift_slots s ON h.slot_id = s.id
+       LEFT JOIN operation_sewed_entries se ON o.id = se.operation_id
+       LEFT JOIN shift_slots s2 ON se.slot_id = s2.id
+       WHERE o.run_operator_id = $1 AND o.run_id = $2
+       GROUP BY o.id
+       ORDER BY o.created_at`,
+      [operator.id, runId]
+    );
+    
+    operationsData.push({
+      operator,
+      operations: operationsResult.rows,
+    });
+  }
+  
+  return {
+    slots: slotsResult.rows,
+    operators: operatorsResult.rows,
+    operations: operationsData,
+    slotTargets: slotTargetsResult.rows,
+  };
+}
+
+// Add the helper function getFullRunData
+
+
+// Helper function to get full run data
+async function getFullRunData(client, runId) {
+  // Get slots
+  const slotsResult = await client.query(
+    "SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours FROM shift_slots WHERE run_id = $1 ORDER BY slot_order",
+    [runId]
+  );
+  
+  // Get operators
+  const operatorsResult = await client.query(
+    "SELECT id, operator_no, operator_name FROM run_operators WHERE run_id = $1 ORDER BY operator_no",
+    [runId]
+  );
+  
+  // Get slot targets
+  const slotTargetsResult = await client.query(
+    `SELECT s.slot_label, t.slot_target, t.cumulative_target
+     FROM slot_targets t
+     JOIN shift_slots s ON t.slot_id = s.id
+     WHERE t.run_id = $1
+     ORDER BY s.slot_order`,
+    [runId]
+  );
+  
+  // Get operations with their data
+  const operationsData = [];
+  for (const operator of operatorsResult.rows) {
+    const operationsResult = await client.query(
+      `SELECT 
+        o.id,
+        o.operation_name,
+        o.t1_sec,
+        o.t2_sec,
+        o.t3_sec,
+        o.t4_sec,
+        o.t5_sec,
+        o.capacity_per_hour,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s.slot_label, ''),
+            COALESCE(h.stitched_qty, 0)
+          ) FILTER (WHERE s.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as stitched_data,
+        COALESCE(
+          jsonb_object_agg(
+            COALESCE(s2.slot_label, ''),
+            COALESCE(se.sewed_qty, 0)
+          ) FILTER (WHERE s2.slot_label IS NOT NULL),
+          '{}'::jsonb
+        ) as sewed_data
+       FROM operator_operations o
+       LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
+       LEFT JOIN shift_slots s ON h.slot_id = s.id
+       LEFT JOIN operation_sewed_entries se ON o.id = se.operation_id
+       LEFT JOIN shift_slots s2 ON se.slot_id = s2.id
+       WHERE o.run_operator_id = $1 AND o.run_id = $2
+       GROUP BY o.id
+       ORDER BY o.created_at`,
+      [operator.id, runId]
+    );
+    
+    operationsData.push({
+      operator,
+      operations: operationsResult.rows,
+    });
+  }
+  
+  return {
+    slots: slotsResult.rows,
+    operators: operatorsResult.rows,
+    operations: operationsData,
+    slotTargets: slotTargetsResult.rows,
+  };
+}
 // --------------------------------------------------------------
 // update-working-hours (FIXED)
 // --------------------------------------------------------------
@@ -4578,6 +4790,64 @@ app.put("/api/update-working-hours/:runId", authenticateToken, async (req, res) 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error updating working hours:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Delete a line run and all associated data
+app.delete("/api/run/:runId", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+
+    // Check if run exists
+    const runCheck = await client.query(
+      "SELECT id, line_no, run_date FROM line_runs WHERE id = $1",
+      [runId]
+    );
+
+    if (runCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        error: "Run not found",
+      });
+    }
+
+    const run = runCheck.rows[0];
+
+    // Check if user has permission to delete (engineer, supervisor, master, soporte_it)
+    const allowedRoles = ['engineer', 'supervisor', 'master', 'soporte_it'];
+    if (!allowedRoles.includes(req.user.role)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        error: "Access denied. Only engineers, supervisors, or support can delete runs.",
+      });
+    }
+
+    // Delete the run (CASCADE will handle all related data)
+    await client.query("DELETE FROM line_runs WHERE id = $1", [runId]);
+
+    await client.query("COMMIT");
+
+    console.log(`✅ Run ${runId} (Line ${run.line_no}, ${run.run_date}) deleted by user ${req.user.username}`);
+
+    res.json({
+      success: true,
+      message: `Run from line ${run.line_no} on ${run.run_date} deleted successfully`,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error deleting run:", err.message);
     res.status(500).json({
       success: false,
       error: err.message,
@@ -4694,6 +4964,8 @@ app.delete("/api/run/:runId/operators/:operatorId", authenticateToken, async (re
     client.release();
   }
 });
+
+
 
 // ✅ Get all operators for a run (with their operations count)
 app.get("/api/run/:runId/operators", authenticateToken, async (req, res) => {

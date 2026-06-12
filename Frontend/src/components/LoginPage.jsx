@@ -50,6 +50,8 @@ export default function LoginPage() {
         navigate("/advanced-planning", { replace: true });
       }else if(roleNorm === "master") {
         navigate("/overview", { replace: true });
+      }else if(roleNorm === "qualityinspector") {
+        navigate("/quality-inspector", { replace: true });
       }
       else {
         navigate("/", { replace: true });

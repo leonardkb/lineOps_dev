@@ -11,6 +11,7 @@ import SkyrinaDashboard from "./pages/SkyrinaDashboard";
 import AdvancedPlanningPage from "./pages/AdvancedPlanningPage";
 import Overview from "./pages/Overview";
 import ActualEfficiency from "./pages/ActualEfficiency";
+import QualityInspectorPage from "./pages/QualityInspectorPage";
 
 
 export default function App() {
@@ -29,6 +30,8 @@ export default function App() {
         <Route path="/advanced-planning" element={<AdvancedPlanningPage />} /> {/*advanced planning route */}
         <Route path="/overview" element= {<Overview />} /> {/*overview route */ }
         <Route path = "/actual-efficiency" element={<ActualEfficiency />} /> {/*actual efficiency route */}
+        <Route path="/quality-inspector" element={<QualityInspectorPage />} />  {/* ← ADD THIS */}
+
       </Routes>
     </Router>
   );

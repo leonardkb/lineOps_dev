@@ -9,6 +9,7 @@ export default function NavCeo() {
   const menu = [
     { name: "Dashboard", path: "/overview" },
     { name: "Actual Efficiency", path: "/actual-efficiency" },
+    { name: "Quality Monitor", path: "/quality-monitor" },
   ];
 
   const handleLogout = () => {

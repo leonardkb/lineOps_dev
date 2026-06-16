@@ -161,7 +161,7 @@ const QualityInspectorPage = () => {
         const runInspections = response.data.inspections.filter(
           i => i.style === selectedRun.style && i.inspection_date === today
         );
-        const total = runInspections.reduce((sum, i) => sum + (i.total_defects || 0), 0);
+        const total = runInspections.reduce((sum, i) => sum + (Number(i.total_defects) || 0), 0);
         setRunStats(prev => ({
           ...prev,
           [selectedRun.id]: { todayTotal: total }

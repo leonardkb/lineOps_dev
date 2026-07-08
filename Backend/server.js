@@ -940,6 +940,9 @@ app.get("/api/me", authenticateToken, async (req, res) => {
   });
 });
 
+const registerMechanicsSummary = require("./mechanics-summary");
+registerMechanicsSummary(app, authenticateToken);
+
 // ✅ Logout endpoint
 app.post("/api/logout", (req, res) => {
   res.json({

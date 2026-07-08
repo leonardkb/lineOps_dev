@@ -10,6 +10,7 @@ export default function NavCeo() {
     { name: "Dashboard", path: "/overview" },
     { name: "Actual Efficiency", path: "/actual-efficiency" },
     { name: "Quality Monitor", path: "/quality-monitor" },
+    { name: "Mechanics", path: "/mecanics" },
   ];
 
   const handleLogout = () => {

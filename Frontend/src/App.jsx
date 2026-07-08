@@ -13,6 +13,7 @@ import Overview from "./pages/Overview";
 import ActualEfficiency from "./pages/ActualEfficiency";
 import QualityInspectorPage from "./pages/QualityInspectorPage";
 import QualityAnalytics from "./pages/Qualityanalytics";
+import MechanicsDashboard from "./pages/MechanicsDashboard";
 
 
 export default function App() {
@@ -33,7 +34,7 @@ export default function App() {
         <Route path = "/actual-efficiency" element={<ActualEfficiency />} /> {/*actual efficiency route */}
         <Route path="/quality-inspector" element={<QualityInspectorPage />} />  {/* ← ADD THIS */}
         <Route path="/quality-monitor" element={<QualityAnalytics/>} />  {/*quality monitor route, same component as quality inspector */}
-
+        <Route path="/mecanics"        element={<MechanicsDashboard/>} />
       </Routes>
     </Router>
   );

@@ -3,11 +3,12 @@ const express = require("express");
 const { Pool } = require("pg");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
+const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl } = require("./s3-raw");
 
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "12mb" })); // photos travel as base64 JSON, ~33% bigger than raw bytes
 
 
 const pool = new Pool({
@@ -51,6 +52,16 @@ const createAllTables = async () => {
          'soporte_it','skyrina','planner','master', 'quality_inspector')),
         CONSTRAINT chk_line_number CHECK (line_number IS NULL OR (line_number >= 1 AND line_number <= 26))
       );
+    `);
+
+    // Ensure chk_role allows all current roles (table may pre-exist with an older list).
+    // Idempotent: drop and re-add the constraint with the full role set.
+    await client.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS chk_role;`);
+    await client.query(`
+      ALTER TABLE users ADD CONSTRAINT chk_role CHECK (role IN (
+        'engineer', 'line_leader', 'supervisor', 'soporte_it',
+        'skyrina', 'planner', 'master', 'quality_inspector', 'inspector','merchant','admin'
+      ));
     `);
     console.log("✅ users table ready in prod_db_schema");
 
@@ -225,6 +236,55 @@ await client.query(`
   );
 `);console.log("✅ work_orders table ready in prod_db_schema");
 
+// Customers table (referenced by work_orders.customer_id)
+await client.query(`
+  CREATE TABLE IF NOT EXISTS customers(
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(150) UNIQUE NOT NULL,
+    market_type VARCHAR(20) NOT NULL DEFAULT 'domestico',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_market_type CHECK (market_type IN ('domestico', 'export'))
+  );
+`);
+console.log("✅ customers table ready in prod_db_schema");
+
+// Links a customer to the 3-letter "cliente" code segment used inside
+// master codes (e.g. NIK), so selecting a master code can auto-select
+// the matching customer instead of the planner having to pick it by hand.
+await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS code VARCHAR(10);`);
+await client.query(`DROP INDEX IF EXISTS idx_customers_code_unique;`);
+await client.query(`CREATE UNIQUE INDEX idx_customers_code_unique ON customers (code) WHERE code IS NOT NULL;`);
+console.log("✅ customers.code ready in prod_db_schema");
+
+// Fabrics table (referenced by work_orders.fabrics[])
+await client.query(`
+  CREATE TABLE IF NOT EXISTS fabrics(
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(150) UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+`);
+console.log("✅ fabrics table ready in prod_db_schema");
+
+// Bring work_orders up to date with what WorkOrderForm.jsx actually sends,
+// and link it to a merchant master_code so the real style SAM travels with the order.
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS customer_id BIGINT REFERENCES customers(id) ON DELETE SET NULL;`);
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS warehouse_stock NUMERIC(12,2) NOT NULL DEFAULT 0;`);
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS extra_quantity NUMERIC(12,2) NOT NULL DEFAULT 0;`);
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS total_to_produce NUMERIC(12,2);`);
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS commitment_date DATE;`);
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS fabrics TEXT[] NOT NULL DEFAULT '{}';`);
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS estilo VARCHAR(20);`);
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS sam_minutes NUMERIC(8,2);`);
+// 'cancelled' is used by the soft-delete route below but was missing from the original check constraint
+await client.query(`ALTER TABLE work_orders DROP CONSTRAINT IF EXISTS chk_status;`);
+await client.query(`
+  ALTER TABLE work_orders ADD CONSTRAINT chk_status CHECK (
+    status IN ('pending', 'assigned', 'in_progress', 'completed', 'cancelled')
+  );
+`);
+console.log("✅ work_orders columns updated in prod_db_schema");
+
 // 9. Create line_assignments table (junction between work_orders and line_runs)
 await client.query(`
   CREATE TABLE IF NOT EXISTS line_assignments(
@@ -316,6 +376,41 @@ await client.query(`
   );
 `);
 console.log("✅ quality_defect_entries table ready");
+
+// In createAllTables function, add this after the quality tables:
+await client.query(`
+  CREATE TABLE IF NOT EXISTS master_codes(
+    id BIGSERIAL PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    type VARCHAR(3) NOT NULL,
+    modelo VARCHAR(3) NOT NULL,
+    correlativo VARCHAR(2) NOT NULL,
+    talla VARCHAR(3) NOT NULL,
+    cliente VARCHAR(3) NOT NULL,
+    color VARCHAR(3) NOT NULL,
+    estilo VARCHAR(6) NOT NULL,
+    description TEXT NOT NULL,
+    sam_minutes NUMERIC(8,2) NOT NULL,
+    photo_url TEXT,
+    photo_filename VARCHAR(255),
+    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+`);
+console.log("✅ master_codes table ready in prod_db_schema");
+
+// Add index
+await client.query("CREATE INDEX IF NOT EXISTS idx_master_codes_code ON master_codes(code);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_master_codes_type ON master_codes(type);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_master_codes_modelo ON master_codes(modelo);");
+await client.query("CREATE INDEX IF NOT EXISTS idx_master_codes_talla ON master_codes(talla);");
+
+// work_orders.master_code_id can only be added now that master_codes exists
+await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS master_code_id BIGINT REFERENCES master_codes(id) ON DELETE SET NULL;`);
+console.log("✅ work_orders.master_code_id linked to master_codes");
+
+
 
 // 12. Create indexes for quality tables
 await client.query("CREATE INDEX IF NOT EXISTS idx_quality_inspections_line_date ON quality_inspections(line_no, inspection_date);");
@@ -597,6 +692,13 @@ defaultUsers.push({
   full_name: "Soporte IT",
 });
 
+defaultUsers.push({
+  username: "admin",
+  password: "admin123",
+  role: "admin",
+  full_name: "System Administrator",
+});
+
 // Add skyrina user with password skyrina26
     defaultUsers.push({
       username: "skyrina",
@@ -627,6 +729,14 @@ defaultUsers.push({
   full_name: "Quality Inspector",
 });
 
+defaultUsers.push({
+  username: "merchant",
+  password: "merchant123",
+  role: "merchant",
+  full_name: "Merchant User",
+});
+
+
 // In the role validation, update validRoles:
 
     defaultUsers.push({
@@ -634,6 +744,18 @@ defaultUsers.push({
   password: "Cassab",
   role: "master",  // or 'engineer', 'supervisor', 'planner' depending on what access you want
   full_name: "Salvador Cassab",
+});
+
+
+
+
+
+// Verificador — inspector account (can edit produced/sewed quantities)
+defaultUsers.push({
+  username: "verificador",
+  password: "123456",
+  role: "inspector",
+  full_name: "Verificador",
 });
 
     let createdCount = 0;
@@ -1097,6 +1219,7 @@ const requireEngineerOrSupervisor = (req, res, next) => {
   if (req.user.role !== "engineer" && req.user.role !== "supervisor" 
     && req.user.role !== "soporte_it" && req.user.role !== "skyrina" && req.user.role !== "planner"
     && req.user.role !== "master" && req.user.role !== "quality_inspector"
+    && req.user.role !== "inspector" && req.user.role !== "merchant" && req.user.role !== "admin"
   ) {
     return res.status(403).json({
       success: false,
@@ -1160,11 +1283,11 @@ app.post("/api/users", authenticateToken, requireEngineerOrSupervisor, async (re
     }
 
     // Validate role
-    const validRoles = ["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "planner", "master", "quality_inspector"];
+    const validRoles = ["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "planner", "master", "quality_inspector", "inspector", "merchant", "admin"];
     if (!validRoles.includes(role)) {
       return res.status(400).json({
         success: false,
-        error: "Invalid role. Must be 'engineer', 'line_leader', 'supervisor', 'soporte_it', 'skyrina', 'planner', 'master', or 'quality_inspector'",
+        error: "Invalid role. Must be 'engineer', 'line_leader', 'supervisor', 'soporte_it', 'skyrina', 'planner', 'master', or 'quality_inspector', 'inspector', 'merchant', 'admin'",
       });
     }
 
@@ -4061,6 +4184,98 @@ app.get("/api/supervisor/line-performance", authenticateToken, requireSupervisor
  * GET /api/work-orders
  * Get all work orders with optional filters
  */
+/**
+ * GET /api/customers
+ * POST /api/customers
+ */
+app.get("/api/customers", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const result = await client.query("SELECT id, name, market_type, code, created_at FROM customers ORDER BY name");
+    res.json({ success: true, customers: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching customers:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/customers", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { name, market_type, code } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, error: "Customer name is required" });
+    }
+    const marketType = market_type === "export" ? "export" : "domestico";
+    const customerCode = code && code.trim() ? code.trim().toUpperCase() : null;
+    const result = await client.query(
+      "INSERT INTO customers (name, market_type, code) VALUES ($1, $2, $3) RETURNING id, name, market_type, code, created_at",
+      [name.trim(), marketType, customerCode]
+    );
+    res.json({ success: true, customer: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Error creating customer:", err.message);
+    if (err.code === "23505") {
+      const isCodeConflict = err.constraint === "idx_customers_code_unique";
+      return res.status(400).json({
+        success: false,
+        error: isCodeConflict
+          ? "Another customer already uses that code"
+          : "A customer with that name already exists",
+      });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/fabrics
+ * POST /api/fabrics
+ */
+app.get("/api/fabrics", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const result = await client.query("SELECT id, name, created_at FROM fabrics ORDER BY name");
+    res.json({ success: true, fabrics: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching fabrics:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/fabrics", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, error: "Fabric name is required" });
+    }
+    const result = await client.query(
+      "INSERT INTO fabrics (name) VALUES ($1) RETURNING id, name, created_at",
+      [name.trim()]
+    );
+    res.json({ success: true, fabric: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Error creating fabric:", err.message);
+    if (err.code === "23505") {
+      return res.status(400).json({ success: false, error: "That fabric already exists" });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/work-orders", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -4070,20 +4285,33 @@ app.get("/api/work-orders", authenticateToken, async (req, res) => {
     
     let query = `
       SELECT 
-        id,
-        work_order_no,
-        quantity,
-        customer_name,
-        style_description,
-        color,
-        fabric_supplier,
-        style_code,
-        line_no,
-        run_date,
-        created_at,
-        updated_at,
-        status
-      FROM work_orders
+        wo.id,
+        wo.work_order_no,
+        wo.quantity,
+        wo.customer_id,
+        wo.customer_name,
+        wo.style_description,
+        wo.color,
+        wo.fabric_supplier,
+        wo.fabrics,
+        wo.style_code,
+        wo.estilo,
+        wo.line_no,
+        wo.run_date,
+        wo.warehouse_stock,
+        wo.extra_quantity,
+        wo.total_to_produce,
+        wo.commitment_date,
+        wo.master_code_id,
+        wo.sam_minutes,
+        wo.created_at,
+        wo.updated_at,
+        wo.status,
+        MAX(mc.photo_filename) as master_code_photo_filename,
+        COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity
+      FROM work_orders wo
+      LEFT JOIN line_assignments la ON la.work_order_id = wo.id
+      LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
       WHERE 1=1
     `;
     
@@ -4091,32 +4319,40 @@ app.get("/api/work-orders", authenticateToken, async (req, res) => {
     let paramIndex = 1;
     
     if (status) {
-      query += ` AND status = $${paramIndex++}`;
+      query += ` AND wo.status = $${paramIndex++}`;
       params.push(status);
     }
     
     if (lineNo) {
-      query += ` AND line_no = $${paramIndex++}`;
+      query += ` AND wo.line_no = $${paramIndex++}`;
       params.push(lineNo);
     }
     
     if (startDate) {
-      query += ` AND run_date >= $${paramIndex++}`;
+      query += ` AND wo.run_date >= $${paramIndex++}`;
       params.push(startDate);
     }
     
     if (endDate) {
-      query += ` AND run_date <= $${paramIndex++}`;
+      query += ` AND wo.run_date <= $${paramIndex++}`;
       params.push(endDate);
     }
     
-    query += ` ORDER BY created_at DESC`;
+    query += ` GROUP BY wo.id ORDER BY wo.created_at DESC`;
     
     const result = await client.query(query, params);
+
+    const workOrders = result.rows.map((row) => {
+      const masterCodePhotoUrl = row.master_code_photo_filename
+        ? generatePresignedGetUrl(row.master_code_photo_filename, 3600)
+        : null;
+      delete row.master_code_photo_filename;
+      return { ...row, master_code_photo_url: masterCodePhotoUrl };
+    });
     
     res.json({
       success: true,
-      workOrders: result.rows,
+      workOrders,
     });
   } catch (err) {
     console.error("❌ Error fetching work orders:", err.message);
@@ -4141,6 +4377,8 @@ app.get("/api/work-orders/:id", authenticateToken, async (req, res) => {
       `
       SELECT 
         wo.*,
+        mc.code as master_code,
+        mc.photo_filename as master_code_photo_filename,
         json_agg(
           json_build_object(
             'id', la.id,
@@ -4154,8 +4392,9 @@ app.get("/api/work-orders/:id", authenticateToken, async (req, res) => {
         ) FILTER (WHERE la.id IS NOT NULL) as assignments
       FROM work_orders wo
       LEFT JOIN line_assignments la ON wo.id = la.work_order_id
+      LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
       WHERE wo.id = $1
-      GROUP BY wo.id
+      GROUP BY wo.id, mc.code, mc.photo_filename
       `,
       [id]
     );
@@ -4166,10 +4405,16 @@ app.get("/api/work-orders/:id", authenticateToken, async (req, res) => {
         error: "Work order not found",
       });
     }
+
+    const workOrder = result.rows[0];
+    workOrder.master_code_photo_url = workOrder.master_code_photo_filename
+      ? generatePresignedGetUrl(workOrder.master_code_photo_filename, 3600)
+      : null;
+    delete workOrder.master_code_photo_filename;
     
     res.json({
       success: true,
-      workOrder: result.rows[0],
+      workOrder,
     });
   } catch (err) {
     console.error("❌ Error fetching work order:", err.message);
@@ -4190,21 +4435,29 @@ app.post("/api/work-orders", authenticateToken, async (req, res) => {
     
     const {
       workOrderNo,
-      quantity,
-      customerName,
+      totalQuantity,
+      warehouseStock,
+      extraQuantity,
+      totalToProduce,
+      commitmentDate,
+      customerId,
       styleDescription,
+      styleCode,
+      estilo,
       color,
       fabricSupplier,
-      styleCode,
+      fabrics,
       lineNo,
       runDate,
+      masterCodeId,
+      samMinutes,
     } = req.body;
     
     // Validate required fields
-    if (!workOrderNo || !quantity || !customerName || !styleDescription) {
+    if (!workOrderNo || !totalToProduce || !customerId || !styleDescription) {
       return res.status(400).json({
         success: false,
-        error: "Missing required fields: workOrderNo, quantity, customerName, styleDescription",
+        error: "Missing required fields: workOrderNo, totalToProduce, customerId, styleDescription",
       });
     }
     
@@ -4220,43 +4473,94 @@ app.post("/api/work-orders", authenticateToken, async (req, res) => {
         error: "Work order number already exists",
       });
     }
+
+    // Look up the customer name for backward-compat display columns
+    const customerResult = await client.query(
+      "SELECT name FROM customers WHERE id = $1",
+      [parseInt(customerId)]
+    );
+    if (customerResult.rows.length === 0) {
+      return res.status(400).json({ success: false, error: "Customer not found" });
+    }
+    const customerName = customerResult.rows[0].name;
+
+    // If a master code was selected, use its own SAM unless the caller explicitly overrode it
+    let resolvedSamMinutes = samMinutes ? parseFloat(samMinutes) : null;
+    if (masterCodeId && resolvedSamMinutes === null) {
+      const mc = await client.query(
+        "SELECT sam_minutes FROM master_codes WHERE id = $1",
+        [parseInt(masterCodeId)]
+      );
+      if (mc.rows.length > 0) {
+        resolvedSamMinutes = parseFloat(mc.rows[0].sam_minutes);
+      }
+    }
     
     const result = await client.query(
       `
       INSERT INTO work_orders (
         work_order_no,
         quantity,
+        customer_id,
         customer_name,
         style_description,
         color,
         fabric_supplier,
         style_code,
+        estilo,
+        fabrics,
         line_no,
         run_date,
+        warehouse_stock,
+        extra_quantity,
+        total_to_produce,
+        commitment_date,
+        master_code_id,
+        sam_minutes,
         created_at,
         updated_at,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW(), 'pending')
-      RETURNING id, work_order_no, quantity, customer_name, style_description, status, created_at
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW(), 'pending')
+      RETURNING *
       `,
       [
         workOrderNo,
-        parseFloat(quantity),
+        parseFloat(totalQuantity) || parseFloat(totalToProduce),
+        parseInt(customerId),
         customerName,
         styleDescription,
         color || null,
         fabricSupplier || null,
         styleCode || null,
+        estilo || null,
+        Array.isArray(fabrics) ? fabrics : [],
         lineNo || null,
         runDate || null,
+        parseFloat(warehouseStock) || 0,
+        parseFloat(extraQuantity) || 0,
+        parseFloat(totalToProduce),
+        commitmentDate || null,
+        masterCodeId ? parseInt(masterCodeId) : null,
+        resolvedSamMinutes,
       ]
     );
+    
+    const workOrder = result.rows[0];
+    if (workOrder.master_code_id) {
+      const mcResult = await client.query(
+        "SELECT photo_filename FROM master_codes WHERE id = $1",
+        [workOrder.master_code_id]
+      );
+      workOrder.master_code_photo_url = mcResult.rows[0]?.photo_filename
+        ? generatePresignedGetUrl(mcResult.rows[0].photo_filename, 3600)
+        : null;
+    }
     
     res.json({
       success: true,
       message: "Work order created successfully",
-      workOrder: result.rows[0],
+      workOrder,
     });
   } catch (err) {
     console.error("❌ Error creating work order:", err.message);
@@ -4285,36 +4589,44 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
     
     const { id } = req.params;
     const {
-      workOrderNo,
-      quantity,
-      customerName,
+      totalQuantity,
+      warehouseStock,
+      extraQuantity,
+      totalToProduce,
+      commitmentDate,
+      customerId,
       styleDescription,
+      styleCode,
+      estilo,
       color,
       fabricSupplier,
-      styleCode,
+      fabrics,
       lineNo,
       runDate,
       status,
+      masterCodeId,
+      samMinutes,
     } = req.body;
     
     // Build update query dynamically
     const updates = [];
     const values = [];
     let paramIndex = 1;
-    
-    if (workOrderNo !== undefined) {
-      updates.push(`work_order_no = $${paramIndex++}`);
-      values.push(workOrderNo);
-    }
-    
-    if (quantity !== undefined) {
+
+    if (totalQuantity !== undefined) {
       updates.push(`quantity = $${paramIndex++}`);
-      values.push(parseFloat(quantity));
+      values.push(parseFloat(totalQuantity) || 0);
     }
-    
-    if (customerName !== undefined) {
+
+    if (customerId !== undefined) {
+      const customerResult = await client.query("SELECT name FROM customers WHERE id = $1", [parseInt(customerId)]);
+      if (customerResult.rows.length === 0) {
+        return res.status(400).json({ success: false, error: "Customer not found" });
+      }
+      updates.push(`customer_id = $${paramIndex++}`);
+      values.push(parseInt(customerId));
       updates.push(`customer_name = $${paramIndex++}`);
-      values.push(customerName);
+      values.push(customerResult.rows[0].name);
     }
     
     if (styleDescription !== undefined) {
@@ -4331,10 +4643,20 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       updates.push(`fabric_supplier = $${paramIndex++}`);
       values.push(fabricSupplier || null);
     }
+
+    if (fabrics !== undefined) {
+      updates.push(`fabrics = $${paramIndex++}`);
+      values.push(Array.isArray(fabrics) ? fabrics : []);
+    }
     
     if (styleCode !== undefined) {
       updates.push(`style_code = $${paramIndex++}`);
       values.push(styleCode || null);
+    }
+
+    if (estilo !== undefined) {
+      updates.push(`estilo = $${paramIndex++}`);
+      values.push(estilo || null);
     }
     
     if (lineNo !== undefined) {
@@ -4345,6 +4667,36 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
     if (runDate !== undefined) {
       updates.push(`run_date = $${paramIndex++}`);
       values.push(runDate || null);
+    }
+
+    if (warehouseStock !== undefined) {
+      updates.push(`warehouse_stock = $${paramIndex++}`);
+      values.push(parseFloat(warehouseStock) || 0);
+    }
+
+    if (extraQuantity !== undefined) {
+      updates.push(`extra_quantity = $${paramIndex++}`);
+      values.push(parseFloat(extraQuantity) || 0);
+    }
+
+    if (totalToProduce !== undefined) {
+      updates.push(`total_to_produce = $${paramIndex++}`);
+      values.push(parseFloat(totalToProduce) || 0);
+    }
+
+    if (commitmentDate !== undefined) {
+      updates.push(`commitment_date = $${paramIndex++}`);
+      values.push(commitmentDate || null);
+    }
+
+    if (masterCodeId !== undefined) {
+      updates.push(`master_code_id = $${paramIndex++}`);
+      values.push(masterCodeId ? parseInt(masterCodeId) : null);
+    }
+
+    if (samMinutes !== undefined) {
+      updates.push(`sam_minutes = $${paramIndex++}`);
+      values.push(samMinutes ? parseFloat(samMinutes) : null);
     }
     
     if (status !== undefined) {
@@ -4367,7 +4719,7 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       UPDATE work_orders 
       SET ${updates.join(", ")}
       WHERE id = $${paramIndex}
-      RETURNING id, work_order_no, quantity, customer_name, style_description, status, updated_at
+      RETURNING *
     `;
     
     const result = await client.query(query, values);
@@ -4404,7 +4756,7 @@ app.put("/api/work-orders/:id/status", authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
     
-    const validStatuses = ['pending', 'assigned', 'in_progress', 'completed'];
+    const validStatuses = ['pending', 'assigned', 'in_progress', 'completed', 'cancelled'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({
         success: false,
@@ -4443,6 +4795,68 @@ app.put("/api/work-orders/:id/status", authenticateToken, async (req, res) => {
  * DELETE /api/work-orders/:id
  * Soft delete a work order
  */
+/**
+ * POST /api/work-orders/recalculate-status
+ * Recomputes each work order's status from its actual line assignments:
+ * pending (nothing assigned) -> assigned (partially) -> in_progress (a line has started)
+ * -> completed (fully assigned and every assignment is completed).
+ */
+app.post("/api/work-orders/recalculate-status", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const orders = await client.query(`
+      SELECT
+        wo.id,
+        wo.status,
+        wo.total_to_produce,
+        COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity,
+        COUNT(la.id) FILTER (WHERE la.status = 'in_progress') as in_progress_count,
+        COUNT(la.id) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')) as active_count,
+        COUNT(la.id) FILTER (WHERE la.status = 'completed') as completed_count
+      FROM work_orders wo
+      LEFT JOIN line_assignments la ON la.work_order_id = wo.id
+      WHERE wo.status != 'cancelled'
+      GROUP BY wo.id
+    `);
+
+    let updated = 0;
+    for (const o of orders.rows) {
+      const totalToProduce = parseFloat(o.total_to_produce) || 0;
+      const assigned = parseFloat(o.assigned_quantity) || 0;
+      const activeCount = parseInt(o.active_count) || 0;
+      const completedCount = parseInt(o.completed_count) || 0;
+      const inProgressCount = parseInt(o.in_progress_count) || 0;
+
+      let newStatus = "pending";
+      if (activeCount > 0 && completedCount === activeCount && assigned >= totalToProduce && totalToProduce > 0) {
+        newStatus = "completed";
+      } else if (inProgressCount > 0) {
+        newStatus = "in_progress";
+      } else if (activeCount > 0) {
+        newStatus = "assigned";
+      }
+
+      if (newStatus !== o.status) {
+        await client.query("UPDATE work_orders SET status = $1, updated_at = NOW() WHERE id = $2", [newStatus, o.id]);
+        updated++;
+      }
+    }
+
+    await client.query("COMMIT");
+
+    res.json({ success: true, message: `Recalculated status for ${orders.rows.length} work orders`, updated });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error recalculating work order statuses:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.delete("/api/work-orders/:id", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -4494,6 +4908,317 @@ app.delete("/api/work-orders/:id", authenticateToken, async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error cancelling work order:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ========== planning api endpoints ==========
+
+/**
+ * Shared helper: returns per-line daily capacity for a given date.
+ * Prefers line_runs configured for that exact date; if none exist,
+ * falls back to the most recent prior configuration for each line
+ * (capacitySource: 'fallback') so planning isn't blocked on days
+ * nobody has entered a line_run for yet.
+ */
+async function getLineCapacityForDate(client, date) {
+  const exact = await client.query(
+    `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour
+     FROM line_runs WHERE run_date = $1 ORDER BY line_no::int`,
+    [date]
+  );
+
+  if (exact.rows.length > 0) {
+    return { lines: exact.rows, capacitySource: "exact", capacityDate: date };
+  }
+
+  // Fall back to the most recent run_date on or before the requested date
+  const fallbackDateResult = await client.query(
+    `SELECT MAX(run_date) as fallback_date FROM line_runs WHERE run_date <= $1`,
+    [date]
+  );
+  let fallbackDate = fallbackDateResult.rows[0]?.fallback_date;
+
+  if (!fallbackDate) {
+    // Nothing before the date either — just use the latest configuration that exists at all
+    const anyDateResult = await client.query(`SELECT MAX(run_date) as any_date FROM line_runs`);
+    fallbackDate = anyDateResult.rows[0]?.any_date;
+  }
+
+  if (!fallbackDate) {
+    return { lines: [], capacitySource: "none", capacityDate: null };
+  }
+
+  const fallback = await client.query(
+    `SELECT id, line_no, run_date, style, operators_count, working_hours, sam_minutes, efficiency, target_pcs, target_per_hour
+     FROM line_runs WHERE run_date = $1 ORDER BY line_no::int`,
+    [fallbackDate]
+  );
+
+  const dateStr = fallbackDate instanceof Date ? fallbackDate.toISOString().slice(0, 10) : fallbackDate;
+  return { lines: fallback.rows, capacitySource: "fallback", capacityDate: dateStr };
+}
+
+/**
+ * GET /api/planning/available-lines?date=YYYY-MM-DD
+ * Per-line capacity for a date, minus whatever is already assigned that date.
+ */
+app.get("/api/planning/available-lines", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter is required" });
+    }
+
+    const { lines, capacitySource, capacityDate } = await getLineCapacityForDate(client, date);
+
+    const assignedResult = await client.query(
+      `SELECT line_no, COALESCE(SUM(assigned_quantity), 0) as assigned
+       FROM line_assignments
+       WHERE assigned_date = $1 AND status NOT IN ('cancelled', 'rejected')
+       GROUP BY line_no`,
+      [date]
+    );
+    const assignedByLine = {};
+    assignedResult.rows.forEach((r) => { assignedByLine[r.line_no] = parseFloat(r.assigned) || 0; });
+
+    const linesWithAvailability = lines.map((line) => {
+      const targetPcs = parseFloat(line.target_pcs) || 0;
+      const assigned = assignedByLine[line.line_no] || 0;
+      const available = Math.max(0, targetPcs - assigned);
+      const utilizationPercentage = targetPcs > 0 ? (assigned / targetPcs) * 100 : 0;
+      return {
+        ...line,
+        assigned_quantity: Math.round(assigned * 100) / 100,
+        available_capacity: Math.round(available * 100) / 100,
+        utilization_percentage: Math.round(utilizationPercentage * 10) / 10,
+      };
+    });
+
+    res.json({ success: true, lines: linesWithAvailability, capacitySource, capacityDate });
+  } catch (err) {
+    console.error("❌ Error fetching available lines:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/planning/dashboard?date=YYYY-MM-DD
+ */
+app.get("/api/planning/dashboard", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ success: false, error: "date parameter is required" });
+    }
+
+    const orderCounts = await client.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status != 'cancelled') as total_work_orders,
+        COUNT(*) FILTER (WHERE status = 'pending') as pending_orders,
+        COUNT(*) FILTER (WHERE status = 'assigned') as assigned_orders,
+        COUNT(*) FILTER (WHERE status = 'completed') as completed_orders
+      FROM work_orders
+    `);
+
+    const assignedResult = await client.query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) as total, COUNT(DISTINCT line_no) as lines_utilized
+       FROM line_assignments WHERE assigned_date = $1 AND status NOT IN ('cancelled', 'rejected')`,
+      [date]
+    );
+
+    const { lines, capacitySource, capacityDate } = await getLineCapacityForDate(client, date);
+    const totalCapacity = lines.reduce((sum, l) => sum + (parseFloat(l.target_pcs) || 0), 0);
+    const totalAssigned = parseFloat(assignedResult.rows[0].total) || 0;
+    const capacityUtilization = totalCapacity > 0 ? (totalAssigned / totalCapacity) * 100 : 0;
+
+    const deadlinesResult = await client.query(
+      `SELECT
+         wo.id, wo.work_order_no, wo.customer_name, wo.commitment_date,
+         la.line_no, la.assigned_quantity, la.planned_end_date
+       FROM work_orders wo
+       JOIN line_assignments la ON la.work_order_id = wo.id
+       WHERE wo.status NOT IN ('completed', 'cancelled')
+         AND la.status NOT IN ('cancelled', 'rejected')
+         AND la.planned_end_date BETWEEN $1::date AND $1::date + INTERVAL '3 days'
+       ORDER BY la.planned_end_date ASC
+       LIMIT 20`,
+      [date]
+    );
+
+    res.json({
+      success: true,
+      summary: {
+        total_work_orders: parseInt(orderCounts.rows[0].total_work_orders) || 0,
+        pending_orders: parseInt(orderCounts.rows[0].pending_orders) || 0,
+        assigned_orders: parseInt(orderCounts.rows[0].assigned_orders) || 0,
+        completed_orders: parseInt(orderCounts.rows[0].completed_orders) || 0,
+        total_assigned_quantity: totalAssigned,
+        capacity_utilization: capacityUtilization,
+        lines_utilized: parseInt(assignedResult.rows[0].lines_utilized) || 0,
+        active_lines: lines.length,
+        capacitySource,
+        capacityDate,
+      },
+      upcomingDeadlines: deadlinesResult.rows,
+    });
+  } catch (err) {
+    console.error("❌ Error fetching planning dashboard:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/line-assignments?workOrderId=123
+ */
+app.get("/api/line-assignments", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { workOrderId, lineNo, date } = req.query;
+
+    let query = "SELECT * FROM line_assignments WHERE 1=1";
+    const params = [];
+    let paramIndex = 1;
+
+    if (workOrderId) {
+      query += ` AND work_order_id = $${paramIndex++}`;
+      params.push(parseInt(workOrderId));
+    }
+    if (lineNo) {
+      query += ` AND line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+    if (date) {
+      query += ` AND assigned_date = $${paramIndex++}`;
+      params.push(date);
+    }
+    query += " ORDER BY created_at DESC";
+
+    const result = await client.query(query, params);
+    res.json({ success: true, assignments: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching line assignments:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/line-assignments
+ * Assigns a quantity of a work order to a production line on a given date.
+ * Uses the work order's own SAM (set from its master code, if one was
+ * selected) rather than the line's generic SAM, so the day/rate math
+ * reflects the actual style being produced.
+ */
+app.post("/api/line-assignments", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate } = req.body;
+
+    if (!workOrderId || !lineNo || !assignedDate || !quantity || parseFloat(quantity) <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "workOrderId, lineNo, assignedDate and a positive quantity are required" });
+    }
+
+    const woResult = await client.query(
+      "SELECT id, total_to_produce, sam_minutes FROM work_orders WHERE id = $1",
+      [parseInt(workOrderId)]
+    );
+    if (woResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Work order not found" });
+    }
+    const workOrder = woResult.rows[0];
+
+    const { lines } = await getLineCapacityForDate(client, assignedDate);
+    const lineData = lines.find((l) => l.line_no === lineNo);
+    if (!lineData) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: `No capacity configuration found for line ${lineNo}` });
+    }
+
+    // Prefer the work order's own SAM (from its master code) over the line's generic SAM
+    const samMinutes = parseFloat(workOrder.sam_minutes) || parseFloat(lineData.sam_minutes) || 3.5;
+    const operators = parseInt(lineData.operators_count) || 20;
+    const workingHours = parseFloat(lineData.working_hours) || 8;
+    const efficiency = parseFloat(lineData.efficiency) || 0.85;
+
+    const dailyAvailableMinutes = operators * workingHours * 60;
+    const effectiveDailyMinutes = dailyAvailableMinutes * efficiency;
+    const piecesPerDay = effectiveDailyMinutes / samMinutes;
+
+    const qty = parseFloat(quantity);
+    const totalMinutesNeeded = qty * samMinutes;
+    const daysNeeded = Math.ceil(totalMinutesNeeded / effectiveDailyMinutes);
+
+    const startDate = plannedStartDate || assignedDate;
+    const endDateObj = new Date(startDate);
+    endDateObj.setDate(endDateObj.getDate() + daysNeeded);
+    const plannedEndDate = endDateObj.toISOString().slice(0, 10);
+
+    // Guard against double-booking beyond the line's daily target for that date
+    const alreadyAssignedResult = await client.query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) as total FROM line_assignments
+       WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
+      [lineNo, assignedDate]
+    );
+    const alreadyAssigned = parseFloat(alreadyAssignedResult.rows[0].total) || 0;
+    const availableCapacity = Math.max(0, parseFloat(lineData.target_pcs) - alreadyAssigned);
+    if (qty > availableCapacity) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        error: `Line ${lineNo} only has capacity for ${Math.floor(availableCapacity)} pieces on ${assignedDate}`,
+      });
+    }
+
+    const result = await client.query(
+      `INSERT INTO line_assignments (
+        work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+        available_minutes, required_production_rate, planned_start_date, planned_end_date, status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'planned')
+      RETURNING *`,
+      [
+        parseInt(workOrderId),
+        lineData.id || null,
+        lineNo,
+        assignedDate,
+        qty,
+        effectiveDailyMinutes,
+        piecesPerDay,
+        startDate,
+        plannedEndDate,
+      ]
+    );
+
+    // Move the work order out of 'pending' now that it has at least one assignment
+    await client.query(
+      "UPDATE work_orders SET status = CASE WHEN status = 'pending' THEN 'assigned' ELSE status END, updated_at = NOW() WHERE id = $1",
+      [parseInt(workOrderId)]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({ success: true, message: "Line assignment created", assignment: result.rows[0] });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error creating line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
@@ -4821,52 +5546,63 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
     
-    let query = `
-      WITH packing_sewed AS (
-        SELECT 
-          lr.id as run_id,
-          lr.line_no,
-          lr.target_pcs,
+    // Build optional filters that apply to the ALL-RUNS available-minutes set,
+    // so the denominator matches the proven-correct query (identical to the pgAdmin result).
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    let runFilters = "";
+
+    if (style && style !== 'all') {
+      runFilters += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+
+    if (lineNo && lineNo !== 'all') {
+      runFilters += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
+
+    // CORRECT global (diario) efficiency:
+    //   available minutes are summed over EVERY run on the date (matching the working query),
+    //   NOT only over runs that happen to contain a packing operation.
+    const query = `
+      WITH filtered_runs AS (
+        SELECT
+          lr.id            AS run_id,
+          lr.line_no       AS line_no,
+          lr.target_pcs    AS target_pcs,
           lr.operators_count,
           lr.working_hours,
           lr.sam_minutes,
-          COALESCE(SUM(se.sewed_qty), 0) as total_sewed
+          (lr.working_hours * lr.operators_count * 60) AS available_minutes
         FROM line_runs lr
-        LEFT JOIN run_operators ro ON lr.id = ro.run_id
-        LEFT JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
+      ),
+      run_packing_totals AS (
+        SELECT
+          fr.run_id,
+          fr.sam_minutes,
+          COALESCE(SUM(se.sewed_qty), 0) AS packing_total
+        FROM filtered_runs fr
+        JOIN run_operators ro ON fr.run_id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
         LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
-        WHERE lr.run_date BETWEEN $1 AND $2
-          AND (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%' OR oo.operation_name IS NULL)
-    `;
-    
-    const params = [startDate, endDate];
-    let paramIndex = 3;
-    
-    if (style && style !== 'all') {
-      query += ` AND lr.style = $${paramIndex++}`;
-      params.push(style);
-    }
-    
-    if (lineNo && lineNo !== 'all') {
-      query += ` AND lr.line_no = $${paramIndex++}`;
-      params.push(lineNo);
-    }
-    
-    query += `
-        GROUP BY lr.id, lr.line_no, lr.target_pcs, lr.operators_count, lr.working_hours, lr.sam_minutes
+        WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY fr.run_id, fr.sam_minutes
       )
-      SELECT 
-        COUNT(DISTINCT run_id) as total_runs,
-        COUNT(DISTINCT line_no) as lines_used,
-        COALESCE(SUM(total_sewed), 0) as total_sewed,
-        COALESCE(SUM(target_pcs), 0) as total_target,
-        -- CORRECT EFFICIENCY: Total SAM output / Total available minutes (NO ROUNDING)
-        CASE 
-          WHEN SUM(operators_count * working_hours * 60) > 0 
-          THEN (SUM(total_sewed * sam_minutes) / SUM(operators_count * working_hours * 60)) * 100
+      SELECT
+        (SELECT COUNT(*) FROM filtered_runs)                             AS total_runs,
+        (SELECT COUNT(DISTINCT line_no) FROM filtered_runs)             AS lines_used,
+        COALESCE((SELECT SUM(packing_total) FROM run_packing_totals),0) AS total_sewed,
+        COALESCE((SELECT SUM(target_pcs) FROM filtered_runs),0)         AS total_target,
+        CASE
+          WHEN (SELECT SUM(available_minutes) FROM filtered_runs) > 0
+          THEN (
+                 COALESCE((SELECT SUM(packing_total * sam_minutes) FROM run_packing_totals),0)
+                 / (SELECT SUM(available_minutes) FROM filtered_runs)
+               ) * 100
           ELSE 0
-        END as avg_efficiency
-      FROM packing_sewed
+        END                                                             AS avg_efficiency
     `;
     
     const result = await client.query(query, params);
@@ -6060,6 +6796,444 @@ app.get("/api/supervisor/assignments", authenticateToken, requireSupervisor, asy
   }
 });
 
+// ========== MASTER CODE MANAGEMENT ==========
+
+const requireMerchantAccess = (req, res, next) => {
+  const allowedRoles = ['engineer', 'supervisor', 'master', 'soporte_it', 'skyrina', 'merchant', 'admin', 'planner'];
+  if (!allowedRoles.includes(req.user?.role)) {
+    return res.status(403).json({
+      success: false,
+      error: "Access denied. Merchant access required.",
+    });
+  }
+  next();
+};
+
+/**
+ * GET /api/master-codes/next-correlativo
+ * Get the next correlativo number for a given type and modelo
+ * IMPORTANT: This must come BEFORE /api/master-codes/:id to avoid route conflicts
+ */
+app.get("/api/master-codes/next-correlativo", authenticateToken, requireMerchantAccess, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { type, modelo } = req.query;
+    
+    if (!type || !modelo) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "type and modelo parameters are required" 
+      });
+    }
+    
+    // Find the highest correlativo for this type+modelo combination
+    const result = await client.query(
+      `SELECT correlativo 
+       FROM master_codes 
+       WHERE type = $1 AND modelo = $2 
+       ORDER BY correlativo::int DESC 
+       LIMIT 1`,
+      [type, modelo]
+    );
+    
+    let nextCorrelativo = "01";
+    
+    if (result.rows.length > 0) {
+      const lastCorrelativo = parseInt(result.rows[0].correlativo, 10);
+      if (!isNaN(lastCorrelativo)) {
+        const next = lastCorrelativo + 1;
+        nextCorrelativo = String(next).padStart(2, '0');
+      }
+    }
+    
+    res.json({
+      success: true,
+      nextCorrelativo,
+      type,
+      modelo
+    });
+  } catch (err) {
+    console.error("❌ Error getting next correlativo:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/master-codes
+ * Get all master codes with optional filters
+ */
+app.get("/api/master-codes", authenticateToken, requireMerchantAccess, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { q, tipo, modelo, talla, cliente, estilo } = req.query;
+    
+    let query = `
+      SELECT 
+        id,
+        code,
+        type,
+        modelo,
+        correlativo,
+        talla,
+        cliente,
+        color,
+        estilo,
+        description,
+        sam_minutes as sam,
+        photo_url as "photoUrl",
+        photo_filename,
+        created_at as "createdAt",
+        created_by
+      FROM master_codes
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    let paramIndex = 1;
+    
+    if (q) {
+      query += ` AND (code ILIKE $${paramIndex} OR description ILIKE $${paramIndex} OR cliente ILIKE $${paramIndex} OR estilo ILIKE $${paramIndex})`;
+      params.push(`%${q}%`);
+      paramIndex++;
+    }
+    
+    if (tipo) {
+      query += ` AND type = $${paramIndex++}`;
+      params.push(tipo);
+    }
+    
+    if (modelo) {
+      query += ` AND modelo = $${paramIndex++}`;
+      params.push(modelo);
+    }
+    
+    if (talla) {
+      query += ` AND talla = $${paramIndex++}`;
+      params.push(talla);
+    }
+    
+    if (cliente) {
+      query += ` AND cliente = $${paramIndex++}`;
+      params.push(cliente);
+    }
+    
+    if (estilo) {
+      query += ` AND estilo = $${paramIndex++}`;
+      params.push(estilo);
+    }
+    
+    query += ` ORDER BY created_at DESC`;
+    
+    const result = await client.query(query, params);
+
+    // Bucket is private now — sign a fresh temporary URL for each photo instead
+    // of trusting the (now-inaccessible) permanent URL stored at upload time.
+    const rows = result.rows.map((row) => ({
+      ...row,
+      photoUrl: row.photo_filename ? generatePresignedGetUrl(row.photo_filename, 3600) : null,
+    }));
+    
+    res.json(rows);
+  } catch (err) {
+    console.error("❌ Error fetching master codes:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/master-codes/:id
+ * Get a specific master code by ID or code
+ * Fix: Properly handle both numeric IDs and string codes
+ */
+app.get("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    
+    const { id } = req.params;
+    
+    // Check if the parameter is numeric (ID) or string (code)
+    const isNumeric = /^\d+$/.test(id);
+    
+    let query;
+    let params;
+    
+    if (isNumeric) {
+      // Search by ID (numeric)
+      query = `
+        SELECT 
+          id,
+          code,
+          type,
+          modelo,
+          correlativo,
+          talla,
+          cliente,
+          color,
+          estilo,
+          description,
+          sam_minutes as sam,
+          photo_url as "photoUrl",
+          photo_filename,
+          created_at as "createdAt",
+          created_by
+        FROM master_codes
+        WHERE id = $1
+      `;
+      params = [parseInt(id, 10)];
+    } else {
+      // Search by code (string)
+      query = `
+        SELECT 
+          id,
+          code,
+          type,
+          modelo,
+          correlativo,
+          talla,
+          cliente,
+          color,
+          estilo,
+          description,
+          sam_minutes as sam,
+          photo_url as "photoUrl",
+          photo_filename,
+          created_at as "createdAt",
+          created_by
+        FROM master_codes
+        WHERE code = $1
+      `;
+      params = [id];
+    }
+    
+    const result = await client.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Master code not found" });
+    }
+
+    const row = result.rows[0];
+    row.photoUrl = row.photo_filename ? generatePresignedGetUrl(row.photo_filename, 3600) : null;
+    
+    res.json(row);
+  } catch (err) {
+    console.error("❌ Error fetching master code:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/master-codes
+ * Create a new master code
+ */
+app.post("/api/master-codes", authenticateToken, requireMerchantAccess, async (req, res) => {
+  const client = await pool.connect();
+  let photoUrl = null;
+  let photoKey = null;
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+    
+    const { 
+      code, 
+      type, 
+      modelo, 
+      correlativo, 
+      talla, 
+      cliente, 
+      color, 
+      estilo, 
+      description, 
+      sam,
+      photoBase64,    // e.g. "data:image/png;base64,iVBORw0KG..."
+      photoFilename,  // original filename, used only to infer extension
+    } = req.body;
+    
+    // Validate required fields
+    if (!code || !type || !modelo || !correlativo || !talla || !cliente || !color || !estilo || !description || !sam) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "All fields are required" 
+      });
+    }
+    
+    // Check if code already exists
+    const existingCheck = await client.query(
+      "SELECT id FROM master_codes WHERE code = $1",
+      [code]
+    );
+    
+    if (existingCheck.rows.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Master code already exists" 
+      });
+    }
+
+    // Upload the photo to S3, if one was sent
+    if (photoBase64) {
+      try {
+        const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(photoBase64);
+        if (!match) {
+          throw new Error("Photo must be a base64 image data URL");
+        }
+        const [, mimeType, base64Data] = match;
+        const buffer = Buffer.from(base64Data, "base64");
+
+        if (buffer.length > 8 * 1024 * 1024) {
+          throw new Error("Photo exceeds 8MB limit");
+        }
+
+        photoKey = makeStylePhotoKey(photoFilename || "");
+        const uploadResult = await uploadBufferToS3(buffer, photoKey, mimeType);
+        photoUrl = uploadResult.url;
+      } catch (uploadErr) {
+        await client.query("ROLLBACK");
+        console.error("❌ Error uploading photo to S3:", uploadErr.message);
+        return res.status(400).json({ success: false, error: `Photo upload failed: ${uploadErr.message}` });
+      }
+    }
+    
+    const result = await client.query(
+      `
+      INSERT INTO master_codes (
+        code,
+        type,
+        modelo,
+        correlativo,
+        talla,
+        cliente,
+        color,
+        estilo,
+        description,
+        sam_minutes,
+        photo_url,
+        photo_filename,
+        created_by,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+      RETURNING id, code, photo_url as "photoUrl", created_at as "createdAt"
+      `,
+      [
+        code,
+        type,
+        modelo,
+        correlativo,
+        talla,
+        cliente,
+        color,
+        estilo,
+        description,
+        parseFloat(sam) || 0,
+        photoUrl,
+        photoKey,
+        req.user.id
+      ]
+    );
+    
+    await client.query("COMMIT");
+
+    const masterCode = result.rows[0];
+    if (photoKey) {
+      masterCode.photoUrl = generatePresignedGetUrl(photoKey, 3600);
+    }
+    
+    res.json({
+      success: true,
+      message: "Master code created successfully",
+      masterCode
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error creating master code:", err.message);
+
+    if (photoKey) await deleteFromS3(photoKey); // avoid orphaned S3 objects
+    
+    if (err.code === "23505") {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Master code already exists" 
+      });
+    }
+    
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * DELETE /api/master-codes/:id
+ * Delete a master code
+ * Fix: Properly handle both numeric IDs and string codes
+ */
+app.delete("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+    
+    const { id } = req.params;
+    
+    // Check if the parameter is numeric (ID) or string (code)
+    const isNumeric = /^\d+$/.test(id);
+    
+    let query;
+    let params;
+    let deletedCode;
+    
+    if (isNumeric) {
+      // Delete by ID (numeric)
+      query = "DELETE FROM master_codes WHERE id = $1 RETURNING id, code, photo_filename";
+      params = [parseInt(id, 10)];
+    } else {
+      // Delete by code (string)
+      query = "DELETE FROM master_codes WHERE code = $1 RETURNING id, code, photo_filename";
+      params = [id];
+    }
+    
+    const result = await client.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "Master code not found" 
+      });
+    }
+    
+    deletedCode = result.rows[0].code;
+    const deletedPhotoKey = result.rows[0].photo_filename;
+    
+    await client.query("COMMIT");
+
+    if (deletedPhotoKey) {
+      await deleteFromS3(deletedPhotoKey);
+    }
+    
+    res.json({
+      success: true,
+      message: `Master code ${deletedCode} deleted successfully`
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error deleting master code:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 
 // ✅ Health check

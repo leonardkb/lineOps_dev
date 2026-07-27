@@ -1,12 +1,12 @@
-import { Camera, Copy, Trash2, Plus } from "lucide-react";
+import { Camera, Copy, Trash2, Plus, Pencil } from "lucide-react";
 import MasterCodeBadge from "./MasterCodeBadge";
 import { tallaLabel } from "../../lib/masterCodeCatalog";
 
 /*
   Table view of master codes.
-  <MasterCodeTable records={list} onOpen={fn} onCopy={fn} onDuplicate={fn} onDelete={fn} />
+  <MasterCodeTable records={list} onOpen={fn} onCopy={fn} onDuplicate={fn} onEdit={fn} onDelete={fn} />
 */
-export default function MasterCodeTable({ records, onOpen, onCopy, onDuplicate, onDelete }) {
+export default function MasterCodeTable({ records, onOpen, onCopy, onDuplicate, onEdit, onDelete }) {
   return (
     <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-x-auto">
       <table className="w-full text-sm">
@@ -54,6 +54,14 @@ export default function MasterCodeTable({ records, onOpen, onCopy, onDuplicate, 
               </td>
               <td className="px-4 py-2">
                 <div className="flex justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    type="button"
+                    onClick={() => onEdit?.(r)}
+                    title="Editar código"
+                    className="p-1.5 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-900"
+                  >
+                    <Pencil size={14} />
+                  </button>
                   <button
                     type="button"
                     onClick={() => onDuplicate?.(r.code)}

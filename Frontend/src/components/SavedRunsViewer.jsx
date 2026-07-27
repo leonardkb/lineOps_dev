@@ -758,6 +758,7 @@ const getRowsFromData = () => {
                     line: runData.run.line_no,
                     date: runData.run.run_date,
                     style: runData.run.style,
+                    workOrderNo: runData.run.work_order_no,
                     operators: runData.run.operators_count.toString(),
                     workingHours: runData.run.working_hours.toString(),
                     sam: runData.run.sam_minutes.toString(),

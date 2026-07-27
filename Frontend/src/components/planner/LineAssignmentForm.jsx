@@ -2,6 +2,7 @@
 import { useState, useEffect } from "react";
 import { format } from "date-fns";
 import { Calendar, AlertCircle, CheckCircle, Calculator, Plus, Trash2, Layers } from "lucide-react";
+import { API_URL } from "../../lib/masterCodeCatalog";
 
 export default function LineAssignmentForm({ workOrder, onAssignmentComplete }) {
   const [availableLines, setAvailableLines] = useState([]);
@@ -62,7 +63,7 @@ useEffect(() => {
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(
-        `http://localhost:5001/api/planning/available-lines?date=${selectedDate}`,
+        `http://localhost:5000/api/planning/available-lines?date=${selectedDate}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const data = await response.json();
@@ -82,7 +83,7 @@ useEffect(() => {
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(
-        `http://localhost:5001/api/line-assignments?workOrderId=${workOrder.id}`,
+        `http://localhost:5000/api/line-assignments?workOrderId=${workOrder.id}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const data = await response.json();
@@ -103,7 +104,11 @@ useEffect(() => {
     if (!lineData || !quantity || quantity <= 0) return null;
     
     const qty = quantity;
-    const samMinutes = parseFloat(lineData.sam_minutes) || 3.5;
+    // Prefer the work order's own SAM (set from its merchant master code) —
+    // that reflects the actual style being produced, not just whatever the
+    // line happens to be configured for on this date.
+    const samMinutes = parseFloat(workOrder?.sam_minutes) || parseFloat(lineData.sam_minutes) || 3.5;
+    const samSource = workOrder?.sam_minutes ? "master_code" : "line_default";
     const operators = parseInt(lineData.operators_count) || 20;
     const workingHours = parseFloat(lineData.working_hours) || 8;
     const efficiency = parseFloat(lineData.efficiency) || 0.85;
@@ -132,7 +137,9 @@ useEffect(() => {
       effectiveDailyMinutes: Math.round(effectiveDailyMinutes),
       minutesPerPiece: Math.round((samMinutes / efficiency) * 100) / 100,
       efficiency: Math.round(efficiency * 100),
-      quantity: qty
+      quantity: qty,
+      samMinutes,
+      samSource,
     };
   };
 
@@ -285,7 +292,7 @@ useEffect(() => {
       
       for (const assignment of validAssignments) {
         try {
-          const response = await fetch("http://localhost:5001/api/line-assignments", {
+          const response = await fetch(`http://localhost:5000/api/line-assignments`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -369,11 +376,24 @@ useEffect(() => {
     <div className="bg-white rounded-xl border shadow-sm">
       <div className="px-5 py-4 border-b bg-gradient-to-r from-gray-50 to-white">
         <div className="flex items-center justify-between">
-          <div>
-            <h2 className="font-semibold text-gray-900 text-lg">Asignar a Línea de Producción</h2>
-            <p className="text-sm text-gray-600">
-              Orden: {workOrder?.work_order_no} - {workOrder?.style_description}
-            </p>
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-lg bg-gray-100 border border-gray-200 flex items-center justify-center overflow-hidden shrink-0">
+              {workOrder?.master_code_photo_url ? (
+                <img
+                  src={workOrder.master_code_photo_url}
+                  alt={workOrder?.style_description || ""}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <Layers className="w-5 h-5 text-gray-300" />
+              )}
+            </div>
+            <div>
+              <h2 className="font-semibold text-gray-900 text-lg">Asignar a Línea de Producción</h2>
+              <p className="text-sm text-gray-600">
+                Orden: {workOrder?.work_order_no} - {workOrder?.style_description}
+              </p>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <Layers className="w-5 h-5 text-gray-400" />
@@ -525,6 +545,12 @@ useEffect(() => {
                           <span>Ritmo: {assignment.daysInfo.dailyRate.toLocaleString()} pzas/día</span>
                           <span>Fin: {assignment.daysInfo.endDate}</span>
                         </div>
+                        <p className={`mt-1 text-[11px] ${assignment.daysInfo.samSource === "master_code" ? "text-green-700" : "text-blue-500"}`}>
+                          SAM usado: {assignment.daysInfo.samMinutes} min
+                          {assignment.daysInfo.samSource === "master_code"
+                            ? " (código maestro del estilo)"
+                            : " (configuración por defecto de la línea)"}
+                        </p>
                       </div>
                     </div>
                   </div>

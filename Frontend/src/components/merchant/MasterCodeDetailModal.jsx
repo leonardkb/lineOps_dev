@@ -1,4 +1,4 @@
-import { X, Camera, Timer, Copy, Plus } from "lucide-react";
+import { X, Camera, Timer, Copy, Plus, Pencil } from "lucide-react";
 import MasterCodeBadge from "./MasterCodeBadge";
 import {
   SEGMENTS,
@@ -10,10 +10,10 @@ import {
 
 /*
   Detail modal for one master code.
-  <MasterCodeDetailModal record={selected} onClose={fn} onCopy={fn} />
+  <MasterCodeDetailModal record={selected} onClose={fn} onCopy={fn} onEdit={fn} />
   Render only when record is set: {selected && <MasterCodeDetailModal ... />}
 */
-export default function MasterCodeDetailModal({ record, onClose, onCopy }) {
+export default function MasterCodeDetailModal({ record, onClose, onCopy, onEdit }) {
   if (!record) return null;
   const parts = parseMasterCode(record.code);
 
@@ -42,6 +42,16 @@ export default function MasterCodeDetailModal({ record, onClose, onCopy }) {
             <MasterCodeBadge code={record.code} size="lg" showLabels />
           </div>
           <div className="flex gap-1 shrink-0">
+            {onEdit && (
+              <button
+                type="button"
+                onClick={() => onEdit(record)}
+                title="Editar código"
+                className="p-2 rounded-lg hover:bg-slate-100 text-slate-500"
+              >
+                <Pencil size={18} />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => {

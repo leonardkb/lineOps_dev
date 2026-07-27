@@ -23,6 +23,7 @@ export default function MetaSummary({ header, target, slots }) {
       <div className="p-5 space-y-3">
         
         {/* Basic Info */}
+        <Row k="Orden de Trabajo" v={header.workOrderNo || "—"} />
         <Row k="Línea" v={header.line || "—"} />
         <Row k="Fecha" v={header.date || "—"} />
         <Row k="Estilo" v={header.style || "—"} />

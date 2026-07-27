@@ -81,6 +81,23 @@ function prettyWeek(iso) {
     day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
   });
 }
+function recentMonths(n = 12) {
+  const now = new Date();
+  return Array.from({ length: n }, (_, i) => {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  });
+}
+function recentYears(n = 4) {
+  const y = new Date().getUTCFullYear();
+  return Array.from({ length: n }, (_, i) => String(y - i));
+}
+function prettyMonth(iso) {
+  const [y, m] = iso.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1, 1));
+  const s = d.toLocaleDateString('es-MX', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 // ---- small pieces -------------------------------------------------------
 
@@ -133,7 +150,12 @@ export default function MechanicsDashboard() {
   const [user, setUser] = useState(null);
 
   const weeks = useMemo(() => recentMondays(8), []);
+  const months = useMemo(() => recentMonths(12), []);
+  const years = useMemo(() => recentYears(4), []);
+  const [periodType, setPeriodType] = useState('semana'); // semana | mes | anio
   const [semana, setSemana] = useState(weeks[0]);
+  const [mes, setMes] = useState(months[0]);
+  const [anio, setAnio] = useState(years[0]);
   const [tab, setTab] = useState('mecanicos'); // mecanicos | bonos | ubicaciones
 
   const [data, setData] = useState(null);
@@ -158,10 +180,12 @@ export default function MechanicsDashboard() {
     if (!token) return;
     setLoading(true);
     setError(null);
+    const valor = periodType === 'semana' ? semana : periodType === 'mes' ? mes : anio;
     try {
-      const res = await axios.get(`${API_BASE}/api/mechanics-summary?semana=${semana}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await axios.get(
+        `${API_BASE}/api/mechanics-summary?tipo=${periodType}&valor=${valor}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
       if (res.data.success) setData(res.data);
       else setError(res.data.error || 'No se pudieron cargar los datos.');
     } catch (err) {
@@ -169,7 +193,7 @@ export default function MechanicsDashboard() {
     } finally {
       setLoading(false);
     }
-  }, [semana]);
+  }, [periodType, semana, mes, anio]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -229,7 +253,7 @@ export default function MechanicsDashboard() {
 
       <div className="flex-1 min-h-0 flex flex-col max-w-[1600px] w-full mx-auto px-3 sm:px-4 lg:px-6 py-3 gap-3">
 
-        {/* Header + week picker (compact, fixed) */}
+        {/* Header + period picker (compact, fixed) */}
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2 flex-shrink-0">
           <div className="min-w-0">
             <h1 className="text-xl sm:text-2xl font-bold flex items-center gap-2 flex-wrap">
@@ -237,21 +261,61 @@ export default function MechanicsDashboard() {
                 Mecánicos &amp; Bonos
               </span>
               <span className="text-[11px] font-normal text-gray-600">
-                Semana del {prettyWeek(semana)}
+                {periodType === 'semana'
+                  ? `Semana del ${prettyWeek(semana)}`
+                  : periodType === 'mes'
+                  ? `Mes de ${prettyMonth(mes)}`
+                  : `Año ${anio}`}
               </span>
-              {data?.weekBonoClosed && (
+              {periodType === 'semana' && data?.weekBonoClosed && (
                 <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
                   Cerrada
                 </span>
               )}
             </h1>
+            {periodType !== 'semana' && data?.bonusWeeksOpen > 0 && (
+              <p className="text-[10px] text-amber-600 mt-0.5">
+                {fmt(data.bonusWeeksOpen)} semana(s) abierta(s) no incluida(s) en el bono ·{' '}
+                {fmt(data.bonusWeeksConfirmed)} confirmada(s)
+              </p>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <select value={semana} onChange={(e) => setSemana(e.target.value)}
-              className="bg-white border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
-              {weeks.map((w) => <option key={w} value={w}>{prettyWeek(w)}</option>)}
-            </select>
+            {/* Period type toggle */}
+            <div className="inline-flex rounded-lg border border-gray-200 bg-white p-0.5">
+              {[
+                { id: 'semana', label: 'Semana' },
+                { id: 'mes', label: 'Mes' },
+                { id: 'anio', label: 'Año' },
+              ].map((p) => (
+                <button key={p.id} onClick={() => setPeriodType(p.id)}
+                  className={`px-2.5 py-1 text-xs font-medium rounded-md transition ${
+                    periodType === p.id ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:text-gray-800'
+                  }`}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Value select, depends on type */}
+            {periodType === 'semana' ? (
+              <select value={semana} onChange={(e) => setSemana(e.target.value)}
+                className="bg-white border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                {weeks.map((w) => <option key={w} value={w}>{prettyWeek(w)}</option>)}
+              </select>
+            ) : periodType === 'mes' ? (
+              <select value={mes} onChange={(e) => setMes(e.target.value)}
+                className="bg-white border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                {months.map((m) => <option key={m} value={m}>{prettyMonth(m)}</option>)}
+              </select>
+            ) : (
+              <select value={anio} onChange={(e) => setAnio(e.target.value)}
+                className="bg-white border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                {years.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+            )}
+
             <button onClick={fetchData}
               className="bg-gray-900 text-white rounded-lg px-3 py-1.5 text-sm font-medium hover:bg-gray-700 transition">
               Actualizar
@@ -268,8 +332,8 @@ export default function MechanicsDashboard() {
         {/* KPI strip (fixed) */}
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 flex-shrink-0">
           <Kpi label="Bono total (todos)" value={mxnCompact.format(g.totalBonusAllMechanics || 0)} sub={`${fmt(mechanics.length)} mecánicos`} tone="emerald" />
-          <Kpi label="Tickets creados" value={fmt(g.ticketsCreated)} tone="indigo" />
-          <Kpi label="Tickets cerrados" value={fmt(g.ticketsClosed)} />
+          <Kpi label="Tickets creados" value={fmt(g.ticketsCreated)} sub={periodType === 'semana' ? undefined : 'en el periodo'} tone="indigo" />
+          <Kpi label="Tickets cerrados" value={fmt(g.ticketsClosed)} sub={periodType === 'semana' ? undefined : 'en el periodo'} />
           <Kpi label="Activos" value={fmt(g.activeTickets)} sub={`${fmt(g.pendingValidation)} por validar`} />
           <Kpi label="Tiempo prom. cierre" value={g.avgClosingMinutes != null ? `${fmt(g.avgClosingMinutes)} min` : '—'} />
         </div>
@@ -333,7 +397,9 @@ export default function MechanicsDashboard() {
             <div className="bg-white rounded-xl shadow-sm border border-gray-100 flex flex-col min-h-0 flex-shrink-0 max-h-[38%]">
               <div className="px-3 pt-3 flex-shrink-0">
                 <h3 className="text-xs font-bold text-gray-800">Tiempo de cierre por mecánico</h3>
-                <p className="text-[10px] text-gray-400 leading-none mt-0.5">Promedio histórico · minutos</p>
+                <p className="text-[10px] text-gray-400 leading-none mt-0.5">
+                  {data?.avgCloseScope === 'periodo' ? 'Promedio del periodo' : 'Promedio histórico'} · minutos
+                </p>
               </div>
               <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-3 pt-2 space-y-1.5">
                 {closeTimes.length === 0 ? (

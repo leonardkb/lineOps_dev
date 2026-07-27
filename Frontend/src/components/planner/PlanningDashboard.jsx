@@ -2,11 +2,15 @@
 import { useState, useEffect } from "react";
 import { format } from "date-fns";
 import { Calendar, BarChart3, ClipboardList, AlertTriangle, CheckCircle, Clock } from "lucide-react";
+import { API_URL } from "../../lib/masterCodeCatalog";
+import { colorForWO } from "../../lib/workOrderColors";
 
 export default function PlanningDashboard() {
   const [selectedDate, setSelectedDate] = useState(format(new Date(), "yyyy-MM-dd"));
   const [dashboardData, setDashboardData] = useState(null);
   const [lineLoad, setLineLoad] = useState([]);
+  const [assignments, setAssignments] = useState([]);
+  const [workOrders, setWorkOrders] = useState([]);
   const [upcomingDeadlines, setUpcomingDeadlines] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -14,6 +18,8 @@ export default function PlanningDashboard() {
   useEffect(() => {
     fetchDashboardData();
     fetchLineLoad();
+    fetchAssignments();
+    fetchWorkOrders();
     fetchUpcomingDeadlines();
   }, [selectedDate]);
 
@@ -22,7 +28,7 @@ export default function PlanningDashboard() {
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(
-        `http://localhost:5001/api/planning/dashboard?date=${selectedDate}`,
+        `${API_URL}/api/planning/dashboard?date=${selectedDate}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const data = await response.json();
@@ -42,7 +48,7 @@ export default function PlanningDashboard() {
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(
-        `http://localhost:5001/api/planning/available-lines?date=${selectedDate}`,
+        `${API_URL}/api/planning/available-lines?date=${selectedDate}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const data = await response.json();
@@ -54,11 +60,66 @@ export default function PlanningDashboard() {
     }
   };
 
+  const fetchAssignments = async () => {
+    try {
+      const token = localStorage.getItem("token");
+      const response = await fetch(`${API_URL}/api/line-assignments`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (data.success) setAssignments(data.assignments || []);
+    } catch (err) {
+      console.error("Error fetching assignments:", err);
+    }
+  };
+
+  const fetchWorkOrders = async () => {
+    try {
+      const token = localStorage.getItem("token");
+      const response = await fetch(`${API_URL}/api/work-orders`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (data.success) setWorkOrders(data.workOrders || []);
+    } catch (err) {
+      console.error("Error fetching work orders:", err);
+    }
+  };
+
+  const woInfo = (id) => workOrders.find((w) => w.id === id);
+
+  // Work orders assigned to a given line on the selected date.
+  const ordersForLine = (lineNo) => {
+    const rows = assignments.filter(
+      (a) =>
+        String(a.line_no) === String(lineNo) &&
+        a.assigned_date &&
+        format(new Date(a.assigned_date), "yyyy-MM-dd") === selectedDate &&
+        !["cancelled", "rejected"].includes(a.status)
+    );
+    // Collapse multiple same-order chunks on the same line/day into one entry.
+    const byOrder = new Map();
+    rows.forEach((a) => {
+      const info = woInfo(a.work_order_id);
+      const cur = byOrder.get(a.work_order_id) || {
+        work_order_id: a.work_order_id,
+        // The assignments endpoint doesn't include these, so fall back to the
+        // work-order record fetched separately.
+        work_order_no: a.work_order_no || info?.work_order_no || `#${a.work_order_id}`,
+        style_description: a.style_description || info?.style_description || "",
+        qty: 0,
+      };
+      cur.qty += parseFloat(a.assigned_quantity) || 0;
+      byOrder.set(a.work_order_id, cur);
+    });
+    return [...byOrder.values()];
+  };
+
   const fetchUpcomingDeadlines = async () => {
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(
-        `http://localhost:5001/api/planning/dashboard?date=${selectedDate}`,
+        `${API_URL}/api/planning/dashboard?date=${selectedDate}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const data = await response.json();
@@ -224,12 +285,37 @@ export default function PlanningDashboard() {
                 </div>
                 <div className="flex justify-between text-xs mt-1">
                   <span className="text-gray-500">
-                    Disponible: {Math.max(0, (line.target_pcs || 0) - (line.assigned_quantity || 0))} pzas
+                    Disponible: {Math.round(Math.max(0, (line.target_pcs || 0) - (line.assigned_quantity || 0)))} pzas
                   </span>
                   <span className="text-gray-500">
                     Utilización: {Math.round(line.utilization_percentage || 0)}%
                   </span>
                 </div>
+
+                {/* Work orders assigned to this line on the selected date */}
+                {(() => {
+                  const orders = ordersForLine(line.line_no);
+                  if (orders.length === 0) {
+                    return (
+                      <p className="mt-2 text-xs text-gray-400 italic">Sin órdenes asignadas este día</p>
+                    );
+                  }
+                  return (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {orders.map((o) => (
+                        <span
+                          key={o.work_order_id}
+                          title={o.style_description || ""}
+                          className="inline-flex items-center gap-1.5 rounded-full bg-gray-50 border border-gray-200 pl-1.5 pr-2 py-0.5 text-[11px]"
+                        >
+                          <span className={`w-2.5 h-2.5 rounded-full ${colorForWO(o.work_order_id).dot}`} />
+                          <span className="font-mono font-medium text-gray-800">{o.work_order_no}</span>
+                          <span className="text-gray-500">{Math.round(o.qty).toLocaleString()} pzas</span>
+                        </span>
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
             ))}
           </div>

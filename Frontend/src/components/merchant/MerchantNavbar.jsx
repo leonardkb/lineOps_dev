@@ -63,16 +63,18 @@ export default function MerchantNavbar({
             Dashboard
           </Link>
 
+          
+
           <Link
-            to="/merchant"
+            to="/nuevo-orden-wizard"
             className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition-all ${
-              isActive("/merchant")
+              isActive("/nuevo-orden-wizard")
                 ? "bg-white text-slate-900"
                 : "bg-white/10 hover:bg-white/20 text-white"
             }`}
           >
             <Plus size={14} />
-            Nuevo código
+            Nuevo Codigo + PO
           </Link>
 
           {/* Refresh Button */}

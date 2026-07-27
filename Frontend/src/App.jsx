@@ -14,8 +14,11 @@ import ActualEfficiency from "./pages/ActualEfficiency";
 import QualityInspectorPage from "./pages/QualityInspectorPage";
 import QualityAnalytics from "./pages/Qualityanalytics";
 import MechanicsDashboard from "./pages/MechanicsDashboard";
-
-
+import MerchantDashboard from "./pages/merchant/MerchantDashboard";
+import MerchantPage from "./pages/merchant/MerchantPage";
+import WorkOrderForm from "./components/merchant/WorkOrderForm";
+import NuevaOrdenWizard from "./components/merchant/NuevaOrdenWizard";
+import CuttingApp from "./pages/Corte/CuttingApp";
 export default function App() {
   return (
     <Router>
@@ -35,6 +38,11 @@ export default function App() {
         <Route path="/quality-inspector" element={<QualityInspectorPage />} />  {/* ← ADD THIS */}
         <Route path="/quality-monitor" element={<QualityAnalytics/>} />  {/*quality monitor route, same component as quality inspector */}
         <Route path="/mecanics"        element={<MechanicsDashboard/>} />
+        <Route path="/merchant-dashboard" element={<MerchantDashboard />} /> {/*merchant dashboard route */}
+        <Route path="/merchant"      element={<MerchantPage />} /> {/*merchant dashboard route */}
+        <Route path="/work-order-form" element={<WorkOrderForm />} /> {/*work order form route */}
+        <Route path="/nuevo-orden-wizard"  element={<NuevaOrdenWizard/>} /> {/*new work order wizard route */}
+        <Route path="/cutting" element={<CuttingApp />} /> {/*cutting app route */}
       </Routes>
     </Router>
   );

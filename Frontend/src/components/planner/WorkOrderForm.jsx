@@ -1,6 +1,9 @@
 // components/planner/WorkOrderForm.jsx - Fixed market type detection
 import { useState, useEffect } from "react";
+import { Tag } from "lucide-react";
 import StyleSelectorModal from "./StyleSelectorModal";
+import MasterCodeSelectorModal from "./MasterCodeSelectorModal";
+import { API_URL } from "../../lib/masterCodeCatalog";
 
 export default function WorkOrderForm({ 
   workOrderData, 
@@ -14,11 +17,15 @@ export default function WorkOrderForm({
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [showStyleModal, setShowStyleModal] = useState(false);
+  const [showMasterCodeModal, setShowMasterCodeModal] = useState(false);
+  const [selectedMasterCode, setSelectedMasterCode] = useState(null);
   const [customers, setCustomers] = useState([]);
   const [fabrics, setFabrics] = useState([]);
   const [selectedFabrics, setSelectedFabrics] = useState([]);
   const [newCustomer, setNewCustomer] = useState("");
   const [newCustomerMarket, setNewCustomerMarket] = useState("domestico");
+  const [newCustomerCode, setNewCustomerCode] = useState("");
+  const [customerLinkWarning, setCustomerLinkWarning] = useState("");
   const [newFabric, setNewFabric] = useState("");
   const [showNewCustomerForm, setShowNewCustomerForm] = useState(false);
   const [isGeneratingNumber, setIsGeneratingNumber] = useState(false);
@@ -62,7 +69,7 @@ export default function WorkOrderForm({
   const fetchCustomers = async () => {
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch("http://localhost:5001/api/customers", {
+      const response = await fetch(`${API_URL}/api/customers`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await response.json();
@@ -83,7 +90,7 @@ export default function WorkOrderForm({
   const fetchFabrics = async () => {
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch("http://localhost:5001/api/fabrics", {
+      const response = await fetch(`${API_URL}/api/fabrics`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await response.json();
@@ -97,7 +104,7 @@ export default function WorkOrderForm({
 
   const getCustomerMarketType = () => {
     if (!workOrderData.customerId) return null;
-    const customer = customers.find(c => c.id === parseInt(workOrderData.customerId));
+    const customer = customers.find(c => String(c.id) === String(workOrderData.customerId));
     if (!customer) return null;
     
     // Debug log to see what we're getting from the database
@@ -192,7 +199,7 @@ export default function WorkOrderForm({
     try {
       const token = localStorage.getItem("token");
       // Fetch all work orders to find the max number for this prefix
-      const response = await fetch("http://localhost:5001/api/work-orders", {
+      const response = await fetch(`${API_URL}/api/work-orders`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       
@@ -247,7 +254,7 @@ export default function WorkOrderForm({
 
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch("http://localhost:5001/api/customers", {
+      const response = await fetch(`${API_URL}/api/customers`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -255,17 +262,22 @@ export default function WorkOrderForm({
         },
         body: JSON.stringify({ 
           name: newCustomer.trim(), 
-          market_type: newCustomerMarket 
+          market_type: newCustomerMarket,
+          code: newCustomerCode.trim() || null,
         })
       });
       const data = await response.json();
       if (data.success) {
         setCustomers([...customers, data.customer]);
         onChange("customerId", data.customer.id);
+        setCustomerLinkWarning("");
         setNewCustomer("");
+        setNewCustomerCode("");
         setShowNewCustomerForm(false);
         setSuccess(`✅ Cliente "${newCustomer}" agregado correctamente`);
         setTimeout(() => setSuccess(""), 3000);
+      } else {
+        setError(data.error || "Error al agregar cliente");
       }
     } catch (err) {
       setError(`Error al agregar cliente: ${err.message}`);
@@ -277,7 +289,7 @@ export default function WorkOrderForm({
     
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch("http://localhost:5001/api/fabrics", {
+      const response = await fetch(`${API_URL}/api/fabrics`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -327,8 +339,8 @@ export default function WorkOrderForm({
       
       // FIXED: Use workOrderId prop for edit mode
       const url = isEditMode 
-        ? `http://localhost:5001/api/work-orders/${workOrderId}`
-        : "http://localhost:5001/api/work-orders";
+        ? `${API_URL}/api/work-orders/${workOrderId}`
+        : `${API_URL}/api/work-orders`;
       
       const method = isEditMode ? "PUT" : "POST";
       
@@ -352,10 +364,13 @@ export default function WorkOrderForm({
           customerId: parseInt(workOrderData.customerId),
           styleDescription: workOrderData.styleDescription || "",
           styleCode: workOrderData.styleCode || "",
+          estilo: workOrderData.estilo || "",
           color: workOrderData.color || "",
           fabrics: selectedFabrics,
           lineNo: workOrderData.lineNo || null,
           runDate: workOrderData.runDate || null,
+          masterCodeId: workOrderData.masterCodeId || null,
+          samMinutes: workOrderData.samMinutes || null,
         };
       } else {
         // For create mode: include workOrderNo
@@ -369,10 +384,13 @@ export default function WorkOrderForm({
           customerId: parseInt(workOrderData.customerId),
           styleDescription: workOrderData.styleDescription || "",
           styleCode: workOrderData.styleCode || "",
+          estilo: workOrderData.estilo || "",
           color: workOrderData.color || "",
           fabrics: selectedFabrics,
           lineNo: workOrderData.lineNo || null,
           runDate: workOrderData.runDate || null,
+          masterCodeId: workOrderData.masterCodeId || null,
+          samMinutes: workOrderData.samMinutes || null,
         };
       }
       
@@ -419,7 +437,11 @@ export default function WorkOrderForm({
           onChange("customerId", "");
           onChange("styleDescription", "");
           onChange("styleCode", "");
+          onChange("estilo", "");
           onChange("color", "");
+          onChange("masterCodeId", "");
+          onChange("samMinutes", "");
+          setSelectedMasterCode(null);
           setSelectedFabrics([]);
           onChange("fabrics", []);
           onChange("lineNo", "");
@@ -438,16 +460,10 @@ export default function WorkOrderForm({
 
   const handleChange = (e) => {
     const { name, value } = e.target;
+    // Only update the edited field here. The totalToProduce value is derived
+    // automatically by the useEffect below, which always reads the latest
+    // workOrderData — avoiding stale-state / double-write bugs on keystroke.
     onChange(name, value);
-    
-    // Auto-calculate total to produce when totalQuantity, warehouseStock, or extraQuantity changes
-    if (name === "totalQuantity" || name === "warehouseStock" || name === "extraQuantity") {
-      const totalQty = parseFloat(name === "totalQuantity" ? value : workOrderData.totalQuantity) || 0;
-      const warehouse = parseFloat(name === "warehouseStock" ? value : workOrderData.warehouseStock) || 0;
-      const extra = parseFloat(name === "extraQuantity" ? value : workOrderData.extraQuantity) || 0;
-      const totalToProduce = totalQty - warehouse + extra;
-      onChange("totalToProduce", totalToProduce > 0 ? totalToProduce : 0);
-    }
   };
 
   const handleFabricToggle = (fabricName) => {
@@ -466,6 +482,28 @@ export default function WorkOrderForm({
     onChange("fabrics", newSelected);
   };
 
+  // If editing an order that already has a master code linked, fetch its
+  // details so the breakdown panel can show it without forcing a re-select.
+  useEffect(() => {
+    const loadLinkedMasterCode = async () => {
+      if (workOrderData.masterCodeId && !selectedMasterCode) {
+        try {
+          const token = localStorage.getItem("token");
+          const response = await fetch(`${API_URL}/api/master-codes/${workOrderData.masterCodeId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (response.ok) {
+            const mc = await response.json();
+            setSelectedMasterCode(mc);
+          }
+        } catch (err) {
+          console.debug("Could not load linked master code:", err.message);
+        }
+      }
+    };
+    loadLinkedMasterCode();
+  }, [workOrderData.masterCodeId]);
+
   const handleStyleSelect = (styleData) => {
     onChange("styleDescription", styleData.style);
     onChange("styleCode", styleData.style);
@@ -473,6 +511,45 @@ export default function WorkOrderForm({
     onChange("runDate", styleData.run_date);
     
     setSuccess(`✅ Estilo "${styleData.style}" seleccionado. Meta diaria: ${Math.round(styleData.target_pcs).toLocaleString()} pzas/día`);
+    setTimeout(() => setSuccess(""), 3000);
+  };
+
+  const handleMasterCodeSelect = (masterCode) => {
+    // masterCode.cliente is a 3-letter CODE SEGMENT baked into the garment
+    // code (e.g. "NIK"). It only becomes useful once it's linked to a real
+    // row in customers via customers.code — that's what we look up here.
+    onChange("styleDescription", masterCode.description);
+    onChange("styleCode", masterCode.code);
+    onChange("estilo", masterCode.estilo || "");
+    if (masterCode.color) onChange("color", masterCode.color);
+    onChange("masterCodeId", masterCode.id);
+    onChange("samMinutes", masterCode.sam);
+
+    // Kept only for the read-only breakdown panel below
+    setSelectedMasterCode(masterCode);
+    setCustomerLinkWarning("");
+
+    const clienteCode = (masterCode.cliente || "").trim().toUpperCase();
+    if (clienteCode) {
+      const matchedCustomer = customers.find(
+        (c) => (c.code || "").trim().toUpperCase() === clienteCode
+      );
+      if (matchedCustomer) {
+        onChange("customerId", matchedCustomer.id); // triggers auto work-order-number generation below
+        setSuccess(
+          `✅ Código maestro "${masterCode.code}" seleccionado · Cliente "${matchedCustomer.name}" vinculado automáticamente · SAM ${masterCode.sam} min`
+        );
+        setTimeout(() => setSuccess(""), 4000);
+        return;
+      }
+      // No customer has this code yet — surface it clearly and offer a shortcut to create one
+      setCustomerLinkWarning(
+        `⚠️ Ningún cliente tiene el código "${clienteCode}" vinculado. Selecciona un cliente manualmente o crea uno nuevo con ese código para que la próxima vez se vincule automáticamente.`
+      );
+      setNewCustomerCode(clienteCode);
+    }
+
+    setSuccess(`✅ Código maestro "${masterCode.code}" seleccionado · SAM ${masterCode.sam} min`);
     setTimeout(() => setSuccess(""), 3000);
   };
 
@@ -488,7 +565,7 @@ export default function WorkOrderForm({
   }, [workOrderData.totalQuantity, workOrderData.warehouseStock, workOrderData.extraQuantity]);
 
   const getSelectedCustomer = () => {
-    return customers.find(c => c.id === parseInt(workOrderData.customerId));
+    return customers.find(c => String(c.id) === String(workOrderData.customerId));
   };
 
   const resetForm = () => {
@@ -500,7 +577,11 @@ export default function WorkOrderForm({
     onChange("customerId", "");
     onChange("styleDescription", "");
     onChange("styleCode", "");
+    onChange("estilo", "");
     onChange("color", "");
+    onChange("masterCodeId", "");
+    onChange("samMinutes", "");
+    setSelectedMasterCode(null);
     setSelectedFabrics([]);
     onChange("fabrics", []);
     onChange("lineNo", "");
@@ -517,6 +598,12 @@ export default function WorkOrderForm({
         isOpen={showStyleModal}
         onClose={() => setShowStyleModal(false)}
         onSelectStyle={handleStyleSelect}
+      />
+
+      <MasterCodeSelectorModal
+        isOpen={showMasterCodeModal}
+        onClose={() => setShowMasterCodeModal(false)}
+        onSelectMasterCode={handleMasterCodeSelect}
       />
 
       <form onSubmit={handleSubmit} className="rounded-2xl border bg-white shadow-sm">
@@ -548,25 +635,96 @@ export default function WorkOrderForm({
                       {workOrderData.runDate && <>Fecha sugerida: {workOrderData.runDate ? new Date(workOrderData.runDate).toLocaleDateString() : ''}</>}
                     </div>
                   )}
+                  {workOrderData.masterCodeId && workOrderData.samMinutes && (
+                    <div className="text-xs text-green-700 mt-1 font-medium">
+                      📦 Código maestro: {workOrderData.styleCode} · SAM real: {workOrderData.samMinutes} min
+                    </div>
+                  )}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowStyleModal(true)}
-                  className="text-xs text-blue-600 hover:text-blue-800 underline"
-                >
-                  {workOrderData.styleDescription ? "Cambiar" : "Seleccionar estilo"}
-                </button>
+                <div className="flex flex-col gap-1 items-end shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowStyleModal(true)}
+                    className="text-xs text-blue-600 hover:text-blue-800 underline whitespace-nowrap"
+                  >
+                    {workOrderData.styleDescription ? "Cambiar estilo" : "Seleccionar estilo"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowMasterCodeModal(true)}
+                    className="text-xs text-green-700 hover:text-green-900 underline whitespace-nowrap"
+                  >
+                    {workOrderData.masterCodeId ? "Cambiar código maestro" : "Usar código maestro"}
+                  </button>
+                </div>
               </div>
+
+              {/* Full breakdown of the selected master code, read-only.
+                  "Cliente (código)" here is the 3-letter segment baked into
+                  the garment code — it is NOT the customerId selected below. */}
+              {selectedMasterCode && (
+                <div className="mt-3 pt-3 border-t border-blue-200 flex gap-3">
+                  <div className="w-14 h-14 rounded-lg bg-white border border-blue-200 flex items-center justify-center overflow-hidden shrink-0">
+                    {selectedMasterCode.photoUrl ? (
+                      <img src={selectedMasterCode.photoUrl} alt="" className="w-full h-full object-cover" />
+                    ) : (
+                      <span className="text-blue-200 text-xs">Sin foto</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 flex-1 text-center">
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.type}</p>
+                      <p className="text-[10px] text-blue-400 uppercase">Tipo</p>
+                    </div>
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.modelo}</p>
+                      <p className="text-[10px] text-blue-400 uppercase">Modelo</p>
+                    </div>
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.correlativo}</p>
+                      <p className="text-[10px] text-blue-400 uppercase">Correl.</p>
+                    </div>
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.talla}</p>
+                      <p className="text-[10px] text-blue-400 uppercase">Talla</p>
+                    </div>
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.cliente}</p>
+                      <p className="text-[10px] text-blue-400 uppercase">Cliente (código)</p>
+                    </div>
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.color}</p>
+                      <p className="text-[10px] text-blue-400 uppercase">Color</p>
+                    </div>
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.estilo}</p>
+                      <p className="text-[10px] text-blue-400 uppercase">Estilo</p>
+                    </div>
+                    <div className="bg-white rounded-lg border border-blue-100 p-1.5">
+                      <p className="font-mono text-xs font-bold text-blue-900">{selectedMasterCode.sam} min</p>
+                      <p className="text-[10px] text-blue-400 uppercase">SAM</p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
-          {/* Style Selection Button */}
+          {/* Entry point when nothing is selected yet */}
           {!workOrderData.styleDescription && (
-            <div className="mb-4">
+            <div className="mb-4 grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setShowMasterCodeModal(true)}
+                className="py-3 bg-gradient-to-r from-green-50 to-green-100 border border-green-200 rounded-xl text-green-700 font-medium hover:from-green-100 hover:to-green-200 transition flex items-center justify-center gap-2"
+              >
+                <Tag className="w-5 h-5" />
+                Usar código maestro
+              </button>
               <button
                 type="button"
                 onClick={() => setShowStyleModal(true)}
-                className="w-full py-3 bg-gradient-to-r from-blue-50 to-blue-100 border border-blue-200 rounded-xl text-blue-700 font-medium hover:from-blue-100 hover:to-blue-200 transition flex items-center justify-center gap-2"
+                className="py-3 bg-gradient-to-r from-blue-50 to-blue-100 border border-blue-200 rounded-xl text-blue-700 font-medium hover:from-blue-100 hover:to-blue-200 transition flex items-center justify-center gap-2"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -634,7 +792,7 @@ export default function WorkOrderForm({
                     <option value="">Seleccionar cliente...</option>
                     {customers.map(customer => (
                       <option key={customer.id} value={customer.id}>
-                        {customer.name} - {customer.market_type === 'export' ? '🌎 Export' : '🇲🇽 Doméstico'}
+                        {customer.name}{customer.code ? ` (${customer.code})` : ""} - {customer.market_type === 'export' ? '🌎 Export' : '🇲🇽 Doméstico'}
                       </option>
                     ))}
                   </select>
@@ -656,6 +814,13 @@ export default function WorkOrderForm({
                       placeholder="Nombre del cliente"
                       className="flex-1 rounded-xl border border-gray-200 px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-gray-900/10"
                     />
+                    <input
+                      type="text"
+                      value={newCustomerCode}
+                      onChange={(e) => setNewCustomerCode(e.target.value.toUpperCase().slice(0, 10))}
+                      placeholder="Código (ej. NIK)"
+                      className="w-32 rounded-xl border border-gray-200 px-3 py-2 text-sm font-mono outline-none focus:ring-2 focus:ring-gray-900/10"
+                    />
                     <select
                       value={newCustomerMarket}
                       onChange={(e) => setNewCustomerMarket(e.target.value)}
@@ -665,6 +830,9 @@ export default function WorkOrderForm({
                       <option value="export">🌎 Export</option>
                     </select>
                   </div>
+                  <p className="text-xs text-gray-400">
+                    El código debe coincidir con el segmento "cliente" de sus códigos maestros, para que se vincule automáticamente la próxima vez.
+                  </p>
                   <div className="flex gap-2">
                     <button
                       type="button"
@@ -678,12 +846,19 @@ export default function WorkOrderForm({
                       onClick={() => {
                         setShowNewCustomerForm(false);
                         setNewCustomer("");
+                        setNewCustomerCode("");
                       }}
                       className="px-4 py-2 bg-gray-100 text-gray-700 rounded-xl text-sm hover:bg-gray-200"
                     >
                       Cancelar
                     </button>
                   </div>
+                </div>
+              )}
+
+              {customerLinkWarning && (
+                <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">
+                  {customerLinkWarning}
                 </div>
               )}
               
@@ -697,6 +872,9 @@ export default function WorkOrderForm({
                   }`}>
                     {getCustomerMarketType() === 'export' ? '🌎 Exportación' : '🇲🇽 Doméstico'}
                   </span>
+                  {getSelectedCustomer().code && (
+                    <span className="text-gray-400">Código: {getSelectedCustomer().code}</span>
+                  )}
                 </div>
               )}
             </div>
@@ -715,6 +893,27 @@ export default function WorkOrderForm({
                 className="w-full rounded-xl border border-gray-200 px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-gray-900/10"
                 placeholder="Descripción del estilo (Ej: Short Selve, Long Selve, Body MC)"
               />
+            </div>
+
+            {/* Estilo (código, distinto de la descripción) */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Estilo
+                {workOrderData.masterCodeId && (
+                  <span className="ml-1 text-xs text-green-600 font-normal">(del código maestro)</span>
+                )}
+              </label>
+              <input
+                type="text"
+                name="estilo"
+                value={workOrderData.estilo || ""}
+                onChange={handleChange}
+                className="w-full rounded-xl border border-gray-200 px-4 py-2 text-sm font-mono outline-none focus:ring-2 focus:ring-gray-900/10"
+                placeholder="Ej: FN2178"
+              />
+              <p className="text-xs text-gray-400 mt-1">
+                Código de estilo del cliente — distinto de la descripción de arriba.
+              </p>
             </div>
 
             {/* Color */}

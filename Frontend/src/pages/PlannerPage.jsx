@@ -15,6 +15,8 @@ const initialHeader = {
   style: "",
   operators: "",
   efficiency: 0.7,
+  workOrderId: null,
+  workOrderNo: "",
 };
 
 export default function PlannerPage() {

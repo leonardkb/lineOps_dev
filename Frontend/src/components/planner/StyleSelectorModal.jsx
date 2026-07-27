@@ -2,6 +2,7 @@
 import { useState, useEffect } from "react";
 import { X, Search, Calendar, Users, Target, Clock } from "lucide-react";
 import { format } from "date-fns";
+import { API_URL } from "../../lib/masterCodeCatalog";
 
 export default function StyleSelectorModal({ isOpen, onClose, onSelectStyle }) {
   const [styles, setStyles] = useState([]);
@@ -19,7 +20,7 @@ export default function StyleSelectorModal({ isOpen, onClose, onSelectStyle }) {
     setLoading(true);
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch("http://localhost:5001/api/line-runs", {
+      const response = await fetch(`${API_URL}/api/line-runs`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await response.json();

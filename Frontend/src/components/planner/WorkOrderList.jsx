@@ -11,8 +11,10 @@ import {
   Calendar, 
   Factory, 
   AlertTriangle,
-  RefreshCw
+  RefreshCw,
+  Camera
 } from "lucide-react";
+import { API_URL } from "../../lib/masterCodeCatalog";
 
 export default function WorkOrderList({ onSelectWorkOrder, onEdit, onDelete }) {
   const [workOrders, setWorkOrders] = useState([]);
@@ -33,7 +35,7 @@ export default function WorkOrderList({ onSelectWorkOrder, onEdit, onDelete }) {
     setLoading(true);
     try {
       const token = localStorage.getItem("token");
-      let url = "http://localhost:5001/api/work-orders";
+      let url = `${API_URL}/api/work-orders`;
       if (filter !== "all") {
         url += `?status=${filter}`;
       }
@@ -57,7 +59,7 @@ export default function WorkOrderList({ onSelectWorkOrder, onEdit, onDelete }) {
   const fetchAssignments = async () => {
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch("http://localhost:5001/api/line-assignments", {
+      const response = await fetch(`${API_URL}/api/line-assignments`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await response.json();
@@ -86,7 +88,7 @@ const deleteWorkOrder = async (id) => {
   if (!confirm("¿Está seguro de cancelar esta orden?")) return;
   try {
     const token = localStorage.getItem("token");
-    const response = await fetch(`http://localhost:5001/api/work-orders/${id}`, {
+    const response = await fetch(`${API_URL}/api/work-orders/${id}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -106,7 +108,7 @@ const deleteWorkOrder = async (id) => {
     setRefreshing(true);
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch("http://localhost:5001/api/work-orders/recalculate-status", {
+      const response = await fetch(`${API_URL}/api/work-orders/recalculate-status`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -202,7 +204,7 @@ const deleteWorkOrder = async (id) => {
   const updateStatus = async (id, newStatus) => {
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch(`http://localhost:5001/api/work-orders/${id}/status`, {
+      const response = await fetch(`${API_URL}/api/work-orders/${id}/status`, {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
@@ -247,6 +249,7 @@ const deleteWorkOrder = async (id) => {
     const matchesSearch = searchTerm === "" || 
       order.work_order_no?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       order.style_description?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      order.estilo?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       (order.customer_name && order.customer_name.toLowerCase().includes(searchTerm.toLowerCase()));
     return matchesSearch;
   });
@@ -334,7 +337,21 @@ const deleteWorkOrder = async (id) => {
             return (
               <div key={order.id} className="p-4 hover:bg-gray-50 transition">
                 <div className="flex items-start justify-between">
-                  <div className="flex-1">
+                  <div className="flex items-start gap-3 flex-1">
+                    {/* Master code photo */}
+                    <div className="w-14 h-14 rounded-lg bg-gray-100 border border-gray-200 flex items-center justify-center overflow-hidden shrink-0">
+                      {order.master_code_photo_url ? (
+                        <img
+                          src={order.master_code_photo_url}
+                          alt={order.style_description || ""}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <Camera className="w-5 h-5 text-gray-300" />
+                      )}
+                    </div>
+
+                    <div className="flex-1">
                     {/* Header */}
                     <div className="flex items-center gap-3 mb-2 flex-wrap">
                       <span className="font-medium text-gray-900">{order.work_order_no}</span>
@@ -360,11 +377,17 @@ const deleteWorkOrder = async (id) => {
                     </div>
                     
                     {/* Style Info */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-sm mb-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3 text-sm mb-3">
                       <div>
-                        <span className="text-gray-500">Estilo:</span>
+                        <span className="text-gray-500">Descripción:</span>
                         <span className="ml-1 text-gray-700 font-medium">
                           {order.style_description || 'N/A'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500">Estilo:</span>
+                        <span className="ml-1 text-gray-700 font-mono">
+                          {order.estilo || order.style_code || 'N/A'}
                         </span>
                       </div>
                       <div>
@@ -452,6 +475,7 @@ const deleteWorkOrder = async (id) => {
                     {/* Created Date */}
                     <div className="mt-2 text-xs text-gray-400">
                       Creada: {format(new Date(order.created_at), "dd/MM/yyyy HH:mm")}
+                    </div>
                     </div>
                   </div>
                   

@@ -52,6 +52,10 @@ export default function LoginPage() {
         navigate("/overview", { replace: true });
       }else if(roleNorm === "qualityinspector") {
         navigate("/quality-inspector", { replace: true });
+      }else if(roleNorm === "merchant") {
+        navigate("/merchant-dashboard", { replace: true });
+      }else if(roleNorm === "corte") {
+        navigate("/cutting-dashboard", { replace: true });
       }
       else {
         navigate("/", { replace: true });

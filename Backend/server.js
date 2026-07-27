@@ -4,6 +4,7 @@ const { Pool } = require("pg");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl } = require("./s3-raw");
+const { getCachedPresignedUrl } = require("./presignCache");
 
 
 const app = express();
@@ -49,7 +50,7 @@ const createAllTables = async () => {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor',
-         'soporte_it','skyrina','planner','master', 'quality_inspector')),
+         'soporte_it','skyrina','planner','master', 'quality_inspector','corte')),
         CONSTRAINT chk_line_number CHECK (line_number IS NULL OR (line_number >= 1 AND line_number <= 26))
       );
     `);
@@ -60,7 +61,7 @@ const createAllTables = async () => {
     await client.query(`
       ALTER TABLE users ADD CONSTRAINT chk_role CHECK (role IN (
         'engineer', 'line_leader', 'supervisor', 'soporte_it',
-        'skyrina', 'planner', 'master', 'quality_inspector', 'inspector','merchant','admin'
+        'skyrina', 'planner', 'master', 'quality_inspector', 'inspector','merchant','admin','corte'
       ));
     `);
     console.log("✅ users table ready in prod_db_schema");
@@ -266,6 +267,8 @@ await client.query(`
 `);
 console.log("✅ fabrics table ready in prod_db_schema");
 
+
+
 // Bring work_orders up to date with what WorkOrderForm.jsx actually sends,
 // and link it to a merchant master_code so the real style SAM travels with the order.
 await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS customer_id BIGINT REFERENCES customers(id) ON DELETE SET NULL;`);
@@ -410,7 +413,8 @@ await client.query("CREATE INDEX IF NOT EXISTS idx_master_codes_talla ON master_
 await client.query(`ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS master_code_id BIGINT REFERENCES master_codes(id) ON DELETE SET NULL;`);
 console.log("✅ work_orders.master_code_id linked to master_codes");
 
-
+await registerWorkOrders.initSchema({ pool, setSchema });
+await registerCutOrders.initSchema({ pool, setSchema });
 
 // 12. Create indexes for quality tables
 await client.query("CREATE INDEX IF NOT EXISTS idx_quality_inspections_line_date ON quality_inspections(line_no, inspection_date);");
@@ -940,8 +944,22 @@ app.get("/api/me", authenticateToken, async (req, res) => {
   });
 });
 
+const registerCutOrders = require("./cut-orders");
+registerCutOrders(app, { authenticateToken, pool, setSchema });
+const registerWorkOrders = require("./work-orders");
+registerWorkOrders(app, {
+  authenticateToken,
+  pool,
+  setSchema,
+  getCachedPresignedUrl,
+   uploadBufferToS3,      // add
+  makeStylePhotoKey,     // add
+});
 const registerMechanicsSummary = require("./mechanics-summary");
 registerMechanicsSummary(app, authenticateToken);
+
+
+
 
 // ✅ Logout endpoint
 app.post("/api/logout", (req, res) => {
@@ -959,7 +977,9 @@ app.post("/api/save-production", async (req, res) => {
     await setSchema(client);
     await client.query("BEGIN");
 
-    const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots } = req.body;
+    const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots, workOrderId } = req.body;
+
+    
 
     // Validate required fields
     if (!line || !date || !style || !operators || !workingHours || !sam) {
@@ -981,10 +1001,11 @@ app.post("/api/save-production", async (req, res) => {
         efficiency, 
         target_pcs,
         target_per_hour,
+        work_order_id,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
       RETURNING id;
     `;
 
@@ -998,6 +1019,7 @@ app.post("/api/save-production", async (req, res) => {
       parseFloat(efficiency) || 0.7,
       parseFloat(target) || 0,
       parseFloat(targetPerHour) || 0,
+      workOrderId || null,
     ]);
 
     const runId = lineRunResult.rows[0].id;
@@ -1054,6 +1076,7 @@ app.post("/api/save-production", async (req, res) => {
     client.release();
   }
 });
+
 
 // ✅ Save operators and operations (Step 2)
 app.post("/api/save-operations", async (req, res) => {
@@ -2021,7 +2044,13 @@ app.get("/api/get-run-data/:runId", async (req, res) => {
     const { runId } = req.params;
 
     // 1) Get line run data
-    const runResult = await client.query("SELECT * FROM line_runs WHERE id = $1", [runId]);
+   const runResult = await client.query(
+  `SELECT lr.*, wo.work_order_no
+   FROM line_runs lr
+   LEFT JOIN work_orders wo ON wo.id = lr.work_order_id
+   WHERE lr.id = $1`,
+  [runId]
+);
 
     if (runResult.rows.length === 0) {
       return res.status(404).json({
@@ -2162,6 +2191,157 @@ app.get("/api/line-runs", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// PATCH /api/line-runs/operators  —  add to server.js (near the other
+// /api/line-runs routes). Changing the number of sewers (operators) on a line
+// recomputes its daily capacity:
+//
+//   available minutes/day = operators × working_hours × 60 × efficiency
+//   target_pcs (per day)  = available minutes/day ÷ SAM
+//   target_per_hour       = target_pcs ÷ working_hours
+//
+// By default it applies to ALL runs of the line (each recomputed with its own
+// working_hours / efficiency / SAM). Pass an optional `date` to scope it to a
+// single run_date.
+// ---------------------------------------------------------------------------
+app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { lineNo, operators, date } = req.body;
+    const ops = parseInt(operators);
+
+    if (lineNo === undefined || lineNo === null || String(lineNo).trim() === "" || isNaN(ops) || ops < 0) {
+      return res.status(400).json({ success: false, error: "lineNo y operators (>= 0) son obligatorios" });
+    }
+
+    const params = [String(lineNo)];
+    let where = "WHERE line_no = $1";
+    if (date) {
+      params.push(date);
+      where += " AND run_date = $2";
+    }
+
+    const runs = await client.query(
+      `SELECT id, working_hours, efficiency, sam_minutes FROM line_runs ${where}`,
+      params
+    );
+    if (runs.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "No hay corridas para esa línea" });
+    }
+
+    await client.query("BEGIN");
+    let updated = 0;
+    for (const r of runs.rows) {
+      const wh = parseFloat(r.working_hours) || 0;
+      const eff = parseFloat(r.efficiency) || 0;
+      const sam = parseFloat(r.sam_minutes) || 0;
+      const availableMin = ops * wh * 60 * eff;
+      const targetPcs = sam > 0 ? availableMin / sam : 0;
+      const targetPerHour = wh > 0 ? targetPcs / wh : 0;
+      await client.query(
+        `UPDATE line_runs
+            SET operators_count = $1, target_pcs = $2, target_per_hour = $3, updated_at = now()
+          WHERE id = $4`,
+        [ops, targetPcs, targetPerHour, r.id]
+      );
+      updated++;
+    }
+    await client.query("COMMIT");
+
+    res.json({ success: true, updated, operators: ops });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error updating line operators:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/line-assignments/:id/move  —  add to server.js near the other
+// line-assignments routes.
+//
+// Moves an existing assignment to another line and/or day. Revalidates the
+// target's daily capacity (target_pcs of the line's run for that date, minus
+// what's already assigned there — excluding this assignment itself).
+// ---------------------------------------------------------------------------
+app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const id = parseInt(req.params.id);
+    const { lineNo, assignedDate } = req.body;
+
+    if (!lineNo || !assignedDate) {
+      return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
+    }
+
+    const cur = await client.query(
+      "SELECT id, assigned_quantity FROM line_assignments WHERE id = $1",
+      [id]
+    );
+    if (cur.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Assignment not found" });
+    }
+    const qty = parseFloat(cur.rows[0].assigned_quantity) || 0;
+
+    // Target capacity: exact run for that line+date, else the line's latest run.
+    let capRes = await client.query(
+      "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 AND run_date = $2 ORDER BY updated_at DESC LIMIT 1",
+      [String(lineNo), assignedDate]
+    );
+    if (capRes.rows.length === 0) {
+      capRes = await client.query(
+        "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 ORDER BY run_date DESC LIMIT 1",
+        [String(lineNo)]
+      );
+    }
+    if (capRes.rows.length === 0) {
+      return res.status(400).json({ success: false, error: `Línea ${lineNo} sin capacidad configurada` });
+    }
+    const capacity = parseFloat(capRes.rows[0].target_pcs) || 0;
+    const runId = capRes.rows[0].id;
+
+    // Already assigned on the target line/day, excluding this assignment.
+    const usedRes = await client.query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
+         FROM line_assignments
+        WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled') AND id <> $3`,
+      [String(lineNo), assignedDate, id]
+    );
+    const used = parseFloat(usedRes.rows[0].used) || 0;
+    const available = capacity - used;
+
+    if (qty > available) {
+      return res.status(400).json({
+        success: false,
+        error: `La línea ${lineNo} solo tiene ${Math.max(0, Math.round(available))} pzas disponibles el ${assignedDate}`,
+      });
+    }
+
+    const upd = await client.query(
+      `UPDATE line_assignments
+          SET line_no = $1,
+              line_run_id = $2,
+              assigned_date = $3,
+              planned_start_date = $3,
+              planned_end_date = $3,
+              updated_at = now()
+        WHERE id = $4
+        RETURNING *`,
+      [String(lineNo), runId, assignedDate, id]
+    );
+    res.json({ success: true, assignment: upd.rows[0] });
+  } catch (err) {
+    console.error("❌ Error moving line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ✅ Get line runs by line number
 app.get("/api/line-runs/:lineNo", async (req, res) => {
   const client = await pool.connect();
@@ -2268,7 +2448,7 @@ app.get("/api/run/:runId", async (req, res) => {
     const { runId } = req.params;
 
     // Get line run data
-    const runResult = await client.query("SELECT * FROM line_runs WHERE id = $1", [runId]);
+    const runResult = await client.query("SELECT lr.*, wo.work_order_no FROM line_runs lr LEFT JOIN work_orders wo ON wo.id = lr.work_order_id WHERE lr.id = $1", [runId]);
 
     if (runResult.rows.length === 0) {
       return res.status(404).json({
@@ -4279,307 +4459,15 @@ app.post("/api/fabrics", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/api/work-orders", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-    
-    const { status, lineNo, startDate, endDate } = req.query;
-    
-    let query = `
-      SELECT 
-        wo.id,
-        wo.work_order_no,
-        wo.quantity,
-        wo.customer_id,
-        wo.customer_name,
-        wo.style_description,
-        wo.color,
-        wo.fabric_supplier,
-        wo.fabrics,
-        wo.style_code,
-        wo.estilo,
-        wo.line_no,
-        wo.run_date,
-        wo.warehouse_stock,
-        wo.extra_quantity,
-        wo.total_to_produce,
-        wo.commitment_date,
-        wo.master_code_id,
-        wo.sam_minutes,
-        wo.created_at,
-        wo.updated_at,
-        wo.status,
-        MAX(mc.photo_filename) as master_code_photo_filename,
-        COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity
-      FROM work_orders wo
-      LEFT JOIN line_assignments la ON la.work_order_id = wo.id
-      LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
-      WHERE 1=1
-    `;
-    
-    const params = [];
-    let paramIndex = 1;
-    
-    if (status) {
-      query += ` AND wo.status = $${paramIndex++}`;
-      params.push(status);
-    }
-    
-    if (lineNo) {
-      query += ` AND wo.line_no = $${paramIndex++}`;
-      params.push(lineNo);
-    }
-    
-    if (startDate) {
-      query += ` AND wo.run_date >= $${paramIndex++}`;
-      params.push(startDate);
-    }
-    
-    if (endDate) {
-      query += ` AND wo.run_date <= $${paramIndex++}`;
-      params.push(endDate);
-    }
-    
-    query += ` GROUP BY wo.id ORDER BY wo.created_at DESC`;
-    
-    const result = await client.query(query, params);
 
-    const workOrders = result.rows.map((row) => {
-      const masterCodePhotoUrl = row.master_code_photo_filename
-        ? generatePresignedGetUrl(row.master_code_photo_filename, 3600)
-        : null;
-      delete row.master_code_photo_filename;
-      return { ...row, master_code_photo_url: masterCodePhotoUrl };
-    });
-    
-    res.json({
-      success: true,
-      workOrders,
-    });
-  } catch (err) {
-    console.error("❌ Error fetching work orders:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
 
-/**
- * GET /api/work-orders/:id
- * Get a specific work order by ID
- */
-app.get("/api/work-orders/:id", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-    
-    const { id } = req.params;
-    
-    const result = await client.query(
-      `
-      SELECT 
-        wo.*,
-        mc.code as master_code,
-        mc.photo_filename as master_code_photo_filename,
-        json_agg(
-          json_build_object(
-            'id', la.id,
-            'line_no', la.line_no,
-            'assigned_date', la.assigned_date,
-            'assigned_quantity', la.assigned_quantity,
-            'status', la.status,
-            'planned_start_date', la.planned_start_date,
-            'planned_end_date', la.planned_end_date
-          )
-        ) FILTER (WHERE la.id IS NOT NULL) as assignments
-      FROM work_orders wo
-      LEFT JOIN line_assignments la ON wo.id = la.work_order_id
-      LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
-      WHERE wo.id = $1
-      GROUP BY wo.id, mc.code, mc.photo_filename
-      `,
-      [id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: "Work order not found",
-      });
-    }
 
-    const workOrder = result.rows[0];
-    workOrder.master_code_photo_url = workOrder.master_code_photo_filename
-      ? generatePresignedGetUrl(workOrder.master_code_photo_filename, 3600)
-      : null;
-    delete workOrder.master_code_photo_filename;
-    
-    res.json({
-      success: true,
-      workOrder,
-    });
-  } catch (err) {
-    console.error("❌ Error fetching work order:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
 
 /**
  * POST /api/work-orders
  * Create a new work order
  */
-app.post("/api/work-orders", authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await setSchema(client);
-    
-    const {
-      workOrderNo,
-      totalQuantity,
-      warehouseStock,
-      extraQuantity,
-      totalToProduce,
-      commitmentDate,
-      customerId,
-      styleDescription,
-      styleCode,
-      estilo,
-      color,
-      fabricSupplier,
-      fabrics,
-      lineNo,
-      runDate,
-      masterCodeId,
-      samMinutes,
-    } = req.body;
-    
-    // Validate required fields
-    if (!workOrderNo || !totalToProduce || !customerId || !styleDescription) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required fields: workOrderNo, totalToProduce, customerId, styleDescription",
-      });
-    }
-    
-    // Check if work order number already exists
-    const existingCheck = await client.query(
-      "SELECT id FROM work_orders WHERE work_order_no = $1",
-      [workOrderNo]
-    );
-    
-    if (existingCheck.rows.length > 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Work order number already exists",
-      });
-    }
 
-    // Look up the customer name for backward-compat display columns
-    const customerResult = await client.query(
-      "SELECT name FROM customers WHERE id = $1",
-      [parseInt(customerId)]
-    );
-    if (customerResult.rows.length === 0) {
-      return res.status(400).json({ success: false, error: "Customer not found" });
-    }
-    const customerName = customerResult.rows[0].name;
-
-    // If a master code was selected, use its own SAM unless the caller explicitly overrode it
-    let resolvedSamMinutes = samMinutes ? parseFloat(samMinutes) : null;
-    if (masterCodeId && resolvedSamMinutes === null) {
-      const mc = await client.query(
-        "SELECT sam_minutes FROM master_codes WHERE id = $1",
-        [parseInt(masterCodeId)]
-      );
-      if (mc.rows.length > 0) {
-        resolvedSamMinutes = parseFloat(mc.rows[0].sam_minutes);
-      }
-    }
-    
-    const result = await client.query(
-      `
-      INSERT INTO work_orders (
-        work_order_no,
-        quantity,
-        customer_id,
-        customer_name,
-        style_description,
-        color,
-        fabric_supplier,
-        style_code,
-        estilo,
-        fabrics,
-        line_no,
-        run_date,
-        warehouse_stock,
-        extra_quantity,
-        total_to_produce,
-        commitment_date,
-        master_code_id,
-        sam_minutes,
-        created_at,
-        updated_at,
-        status
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW(), 'pending')
-      RETURNING *
-      `,
-      [
-        workOrderNo,
-        parseFloat(totalQuantity) || parseFloat(totalToProduce),
-        parseInt(customerId),
-        customerName,
-        styleDescription,
-        color || null,
-        fabricSupplier || null,
-        styleCode || null,
-        estilo || null,
-        Array.isArray(fabrics) ? fabrics : [],
-        lineNo || null,
-        runDate || null,
-        parseFloat(warehouseStock) || 0,
-        parseFloat(extraQuantity) || 0,
-        parseFloat(totalToProduce),
-        commitmentDate || null,
-        masterCodeId ? parseInt(masterCodeId) : null,
-        resolvedSamMinutes,
-      ]
-    );
-    
-    const workOrder = result.rows[0];
-    if (workOrder.master_code_id) {
-      const mcResult = await client.query(
-        "SELECT photo_filename FROM master_codes WHERE id = $1",
-        [workOrder.master_code_id]
-      );
-      workOrder.master_code_photo_url = mcResult.rows[0]?.photo_filename
-        ? generatePresignedGetUrl(mcResult.rows[0].photo_filename, 3600)
-        : null;
-    }
-    
-    res.json({
-      success: true,
-      message: "Work order created successfully",
-      workOrder,
-    });
-  } catch (err) {
-    console.error("❌ Error creating work order:", err.message);
-    
-    if (err.code === "23505") {
-      return res.status(400).json({
-        success: false,
-        error: "Work order number already exists",
-      });
-    }
-    
-    res.status(500).json({ success: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
 
 /**
  * PUT /api/work-orders/:id
@@ -5012,6 +4900,65 @@ app.get("/api/planning/available-lines", authenticateToken, async (req, res) => 
 });
 
 /**
+ * GET /api/planning/line-work-orders?line=8&date=YYYY-MM-DD
+ * Work orders the planner assigned to a given line (optional single date),
+ * for the line engineer to pick during line creation (step 1). SAM travels
+ * from the work order (fixed by merchant/planner) as `sam`.
+ * Same join as /api/lineleader/work-orders, but scoped by ?line= not the user.
+ */
+app.get("/api/planning/line-work-orders", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    const { line, date } = req.query;
+    if (line == null || String(line).trim() === "") {
+      return res.status(400).json({ success: false, error: "line parameter is required" });
+    }
+
+    const params = [String(line)]; // line_assignments.line_no is TEXT
+    let query = `
+      SELECT
+        la.id              AS assignment_id,
+        la.work_order_id,
+        la.line_no,
+        la.assigned_date,
+        la.assigned_quantity,
+        la.planned_start_date,
+        la.planned_end_date,
+        la.priority,
+        la.status          AS assignment_status,
+        wo.work_order_no,
+        wo.customer_name,
+        wo.style_description,
+        wo.style_code,
+        wo.estilo,
+        wo.color,
+        wo.total_to_produce,
+        wo.commitment_date,
+        wo.sam_minutes     AS sam,
+        wo.status          AS work_order_status
+      FROM line_assignments la
+      JOIN work_orders wo ON wo.id = la.work_order_id
+      WHERE la.line_no = $1
+        AND la.status <> 'cancelled'
+    `;
+    if (date) {
+      params.push(date);
+      query += ` AND la.assigned_date = $${params.length}`;
+    }
+    query += ` ORDER BY la.priority DESC, la.assigned_date ASC, la.created_at DESC;`;
+
+    const result = await client.query(query, params);
+    res.json({ success: true, workOrders: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching planning line work orders:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * GET /api/planning/dashboard?date=YYYY-MM-DD
  */
 app.get("/api/planning/dashboard", authenticateToken, async (req, res) => {
@@ -5090,23 +5037,30 @@ app.get("/api/line-assignments", authenticateToken, async (req, res) => {
     await setSchema(client);
     const { workOrderId, lineNo, date } = req.query;
 
-    let query = "SELECT * FROM line_assignments WHERE 1=1";
+    let query = `
+      SELECT la.*,
+             wo.work_order_no,
+             wo.style_description,
+             wo.customer_name
+        FROM line_assignments la
+        JOIN work_orders wo ON wo.id = la.work_order_id
+       WHERE 1=1`;
     const params = [];
     let paramIndex = 1;
-
+ 
     if (workOrderId) {
-      query += ` AND work_order_id = $${paramIndex++}`;
+      query += ` AND la.work_order_id = $${paramIndex++}`;
       params.push(parseInt(workOrderId));
     }
     if (lineNo) {
-      query += ` AND line_no = $${paramIndex++}`;
+      query += ` AND la.line_no = $${paramIndex++}`;
       params.push(lineNo);
     }
     if (date) {
-      query += ` AND assigned_date = $${paramIndex++}`;
+      query += ` AND la.assigned_date = $${paramIndex++}`;
       params.push(date);
     }
-    query += " ORDER BY created_at DESC";
+    query += " ORDER BY la.created_at DESC";
 
     const result = await client.query(query, params);
     res.json({ success: true, assignments: result.rows });
@@ -5222,6 +5176,63 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error creating line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * DELETE /api/line-assignments/:id
+ * Removes an assignment from a line. If the work order has no active
+ * assignments left afterward, it goes back to 'pending' so it reappears
+ * in the planner's board pool / "por asignar" list.
+ *
+ * Paste this block into server.js immediately AFTER the
+ * `app.post("/api/line-assignments", ...)` handler closes (the `});`),
+ * and BEFORE the `// ========== overview api endpoints ==========` comment.
+ */
+app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+
+    const { id } = req.params;
+
+    const existing = await client.query(
+      "SELECT work_order_id FROM line_assignments WHERE id = $1",
+      [parseInt(id)]
+    );
+    if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Assignment not found" });
+    }
+    const workOrderId = existing.rows[0].work_order_id;
+
+    await client.query("DELETE FROM line_assignments WHERE id = $1", [parseInt(id)]);
+
+    // If no active assignments remain, return the work order to 'pending'
+    // (mirror of the POST, which moves 'pending' -> 'assigned').
+    const remainingActive = await client.query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) AS total
+         FROM line_assignments
+        WHERE work_order_id = $1 AND status NOT IN ('cancelled')`,
+      [workOrderId]
+    );
+    const stillAssigned = parseFloat(remainingActive.rows[0].total) || 0;
+    if (stillAssigned <= 0) {
+      await client.query(
+        "UPDATE work_orders SET status = CASE WHEN status = 'assigned' THEN 'pending' ELSE status END, updated_at = NOW() WHERE id = $1",
+        [workOrderId]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, message: "Line assignment removed", workOrderId });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error deleting line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
@@ -6754,6 +6765,72 @@ app.get("/api/lineleader/assignments/:runId", authenticateToken, async (req, res
   }
 });
 
+/**
+ * GET /api/lineleader/work-orders
+ * Returns the work orders assigned to the authenticated line leader's own
+ * line (scoped by req.user.line_number, so a leader only ever sees their
+ * line). Joined with work_orders for display. Optional ?date=YYYY-MM-DD
+ * limits results to a single assigned_date.
+ */
+app.get("/api/lineleader/work-orders", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const lineNo = req.user.line_number;
+    if (lineNo === null || lineNo === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: "Este usuario no tiene una línea asignada",
+      });
+    }
+
+    const { date } = req.query;
+    const params = [String(lineNo)]; // line_assignments.line_no is TEXT
+    let query = `
+      SELECT
+        la.id                    AS assignment_id,
+        la.work_order_id,
+        la.line_no,
+        la.assigned_date,
+        la.assigned_quantity,
+        la.required_production_rate,
+        la.planned_start_date,
+        la.planned_end_date,
+        la.priority,
+        la.status                AS assignment_status,
+        wo.work_order_no,
+        wo.customer_name,
+        wo.style_description,
+        wo.style_code,
+        wo.color,
+        wo.fabric_supplier,
+        wo.quantity              AS work_order_quantity,
+        wo.total_to_produce,
+        wo.commitment_date,
+        wo.sam_minutes,
+        wo.status                AS work_order_status
+      FROM line_assignments la
+      JOIN work_orders wo ON wo.id = la.work_order_id
+      WHERE la.line_no = $1
+        AND la.status <> 'cancelled'
+    `;
+    if (date) {
+      params.push(date);
+      query += ` AND la.assigned_date = $${params.length}`;
+    }
+    query += ` ORDER BY la.priority DESC, la.assigned_date ASC, la.created_at DESC;`;
+
+    const result = await client.query(query, params);
+    res.json({ success: true, workOrders: result.rows });
+  } catch (err) {
+    console.error("❌ Error fetching lineleader work orders:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 // ========== SUPERVISOR ASSIGNMENTS ==========
 
@@ -6939,7 +7016,7 @@ app.get("/api/master-codes", authenticateToken, requireMerchantAccess, async (re
     // of trusting the (now-inaccessible) permanent URL stored at upload time.
     const rows = result.rows.map((row) => ({
       ...row,
-      photoUrl: row.photo_filename ? generatePresignedGetUrl(row.photo_filename, 3600) : null,
+      photoUrl: row.photo_filename ? getCachedPresignedUrl(row.photo_filename) : null,
     }));
     
     res.json(rows);
@@ -7024,7 +7101,7 @@ app.get("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async
     }
 
     const row = result.rows[0];
-    row.photoUrl = row.photo_filename ? generatePresignedGetUrl(row.photo_filename, 3600) : null;
+    row.photoUrl = row.photo_filename ? getCachedPresignedUrl(row.photo_filename) : null;
     
     res.json(row);
   } catch (err) {
@@ -7150,7 +7227,7 @@ app.post("/api/master-codes", authenticateToken, requireMerchantAccess, async (r
 
     const masterCode = result.rows[0];
     if (photoKey) {
-      masterCode.photoUrl = generatePresignedGetUrl(photoKey, 3600);
+      masterCode.photoUrl = getCachedPresignedUrl(photoKey);
     }
     
     res.json({
@@ -7238,6 +7315,150 @@ app.delete("/api/master-codes/:id", authenticateToken, requireMerchantAccess, as
   }
 });
 
+/**
+ * PUT /api/master-codes/:id
+ * Update an existing master code (fix a mistake). Accepts a numeric id or the
+ * code string, mirroring GET/DELETE. Any subset of fields may be sent.
+ *
+ * Photo:
+ *   - send  photoKey   (from /api/master-codes/photo-upload-url) to replace it
+ *   - send  removePhoto: true   to clear it
+ *   - send neither to leave the current photo untouched
+ */
+app.put("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async (req, res) => {
+  const client = await pool.connect();
+  let newPhotoKey = null; // set if the caller uploaded a replacement photo
+  let oldPhotoKey = null; // deleted from S3 only after a successful swap/remove
+  try {
+    await setSchema(client);
+    await client.query("BEGIN");
+ 
+    const { id } = req.params;
+    const isNumeric = /^\d+$/.test(id);
+ 
+    // Load the current row first (we need its id + old photo key).
+    const currentRes = await client.query(
+      isNumeric
+        ? "SELECT id, code, photo_filename FROM master_codes WHERE id = $1"
+        : "SELECT id, code, photo_filename FROM master_codes WHERE code = $1",
+      [isNumeric ? parseInt(id, 10) : id]
+    );
+ 
+    if (currentRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Master code not found" });
+    }
+ 
+    const current = currentRes.rows[0];
+    const rowId = current.id;
+ 
+    const {
+      code,
+      type,
+      modelo,
+      correlativo,
+      talla,
+      cliente,
+      color,
+      estilo,
+      description,
+      sam,
+      photoKey,     // replacement image key (optional)
+      removePhoto,  // boolean, clear the image (optional)
+    } = req.body;
+ 
+    // If the code itself is being changed, make sure no OTHER row already uses it.
+    if (code && code !== current.code) {
+      const dup = await client.query(
+        "SELECT id FROM master_codes WHERE code = $1 AND id <> $2",
+        [code, rowId]
+      );
+      if (dup.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, error: "Master code already exists" });
+      }
+    }
+ 
+    // Build the UPDATE dynamically so partial edits work too.
+    const updates = [];
+    const values = [];
+    let i = 1;
+    const setField = (col, val) => {
+      updates.push(`${col} = $${i++}`);
+      values.push(val);
+    };
+ 
+    if (code !== undefined) setField("code", code);
+    if (type !== undefined) setField("type", type);
+    if (modelo !== undefined) setField("modelo", modelo);
+    if (correlativo !== undefined) setField("correlativo", correlativo);
+    if (talla !== undefined) setField("talla", talla);
+    if (cliente !== undefined) setField("cliente", cliente);
+    if (color !== undefined) setField("color", color);
+    if (estilo !== undefined) setField("estilo", estilo);
+    if (description !== undefined) setField("description", description);
+    if (sam !== undefined) setField("sam_minutes", parseFloat(sam) || 0);
+ 
+    if (photoKey) {
+      newPhotoKey = photoKey;
+      oldPhotoKey = current.photo_filename || null;
+      setField("photo_filename", photoKey);
+      setField("photo_url", generatePresignedGetUrl(photoKey, 3600));
+    } else if (removePhoto) {
+      oldPhotoKey = current.photo_filename || null;
+      setField("photo_filename", null);
+      setField("photo_url", null);
+    }
+ 
+    if (updates.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "No fields to update" });
+    }
+ 
+    updates.push(`updated_at = NOW()`);
+    values.push(rowId);
+ 
+    const result = await client.query(
+      `
+      UPDATE master_codes
+      SET ${updates.join(", ")}
+      WHERE id = $${i}
+      RETURNING
+        id, code, type, modelo, correlativo, talla, cliente, color, estilo,
+        description, sam_minutes AS sam, photo_filename,
+        created_at AS "createdAt"
+      `,
+      values
+    );
+ 
+    await client.query("COMMIT");
+ 
+    // The previous image is now unreferenced — clean it up (best effort).
+    if (oldPhotoKey && oldPhotoKey !== newPhotoKey) {
+      await deleteFromS3(oldPhotoKey);
+    }
+ 
+    const row = result.rows[0];
+    row.photoUrl = row.photo_filename ? generatePresignedGetUrl(row.photo_filename, 3600) : null;
+ 
+    res.json({
+      success: true,
+      message: "Master code updated successfully",
+      masterCode: row,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating master code:", err.message);
+    // Don't leak the object we just uploaded if the DB write failed.
+    if (newPhotoKey) await deleteFromS3(newPhotoKey);
+    if (err.code === "23505") {
+      return res.status(400).json({ success: false, error: "Master code already exists" });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 // ✅ Health check
 app.get("/api/health", async (req, res) => {

@@ -6,10 +6,10 @@ const bcrypt = require("bcrypt");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl } = require("./s3-raw");
 const { getCachedPresignedUrl } = require("./presignCache");
 
-
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "12mb" })); // photos travel as base64 JSON, ~33% bigger than raw bytes
+
 
 
 const pool = new Pool({
@@ -50,7 +50,7 @@ const createAllTables = async () => {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor',
-         'soporte_it','skyrina','planner','master', 'quality_inspector','corte')),
+         'soporte_it','skyrina','planner','master', 'quality_inspector','corte','finished_warehouse')),
         CONSTRAINT chk_line_number CHECK (line_number IS NULL OR (line_number >= 1 AND line_number <= 26))
       );
     `);
@@ -61,7 +61,8 @@ const createAllTables = async () => {
     await client.query(`
       ALTER TABLE users ADD CONSTRAINT chk_role CHECK (role IN (
         'engineer', 'line_leader', 'supervisor', 'soporte_it',
-        'skyrina', 'planner', 'master', 'quality_inspector', 'inspector','merchant','admin','corte'
+        'skyrina', 'planner', 'master', 'quality_inspector', 'inspector','merchant','admin','corte',
+        'finished_warehouse'
       ));
     `);
     console.log("✅ users table ready in prod_db_schema");
@@ -87,7 +88,8 @@ const createAllTables = async () => {
         CONSTRAINT chk_sam_positive CHECK (sam_minutes > 0)
       );
     `);
-    console.log("✅ line_runs table ready in prod_db_schema");
+   
+   
 
     // 2. Create shift_slots table
     await client.query(`
@@ -311,6 +313,8 @@ await client.query(`
 `);
 console.log("✅ line_assignments table ready in prod_db_schema");
 
+await client.query(`ALTER TABLE line_assignments ADD COLUMN IF NOT EXISTS color VARCHAR(50);`);
+
 // Add after the line_balancing_assignments table creation
 
 // 8. Create quality_inspections table
@@ -415,6 +419,8 @@ console.log("✅ work_orders.master_code_id linked to master_codes");
 
 await registerWorkOrders.initSchema({ pool, setSchema });
 await registerCutOrders.initSchema({ pool, setSchema });
+await registerFinishedWarehouse.initSchema({ pool, setSchema });
+await registerMerchantPlan.initSchema({ pool, setSchema });
 
 // 12. Create indexes for quality tables
 await client.query("CREATE INDEX IF NOT EXISTS idx_quality_inspections_line_date ON quality_inspections(line_no, inspection_date);");
@@ -944,6 +950,11 @@ app.get("/api/me", authenticateToken, async (req, res) => {
   });
 });
 
+const registerMerchantPlan = require("./merchant-plan");
+registerMerchantPlan(app, { authenticateToken, pool, setSchema });
+
+const registerFinishedWarehouse = require("./finished-warehouse");
+registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
 const registerCutOrders = require("./cut-orders");
 registerCutOrders(app, { authenticateToken, pool, setSchema });
 const registerWorkOrders = require("./work-orders");
@@ -2269,6 +2280,13 @@ app.patch("/api/line-runs/operators", authenticateToken, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) => {
   const client = await pool.connect();
+  // Add whole days to a YYYY-MM-DD string without any timezone drift.
+  const addDaysStr = (ymdStr, n) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  };
   try {
     await setSchema(client);
     const id = parseInt(req.params.id);
@@ -2278,63 +2296,104 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
       return res.status(400).json({ success: false, error: "lineNo y assignedDate son obligatorios" });
     }
 
+    await client.query("BEGIN");
+
     const cur = await client.query(
-      "SELECT id, assigned_quantity FROM line_assignments WHERE id = $1",
+      "SELECT id, work_order_id, assigned_quantity, color, status FROM line_assignments WHERE id = $1",
       [id]
     );
     if (cur.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ success: false, error: "Assignment not found" });
     }
-    const qty = parseFloat(cur.rows[0].assigned_quantity) || 0;
+    const original = cur.rows[0];
+    const totalQty = parseFloat(original.assigned_quantity) || 0;
+    const workOrderId = original.work_order_id;
+    const color = original.color || null;
+    const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
+      ? original.status
+      : "planned";
 
-    // Target capacity: exact run for that line+date, else the line's latest run.
-    let capRes = await client.query(
-      "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 AND run_date = $2 ORDER BY updated_at DESC LIMIT 1",
-      [String(lineNo), assignedDate]
+    // Prefer the work order's own SAM for the informational rate columns.
+    const woRes = await client.query(
+      "SELECT sam_minutes FROM work_orders WHERE id = $1",
+      [workOrderId]
     );
-    if (capRes.rows.length === 0) {
-      capRes = await client.query(
-        "SELECT id, target_pcs FROM line_runs WHERE line_no = $1 ORDER BY run_date DESC LIMIT 1",
-        [String(lineNo)]
+    const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+
+    // Free the original's capacity first so the re-flow can reuse its old slot.
+    // Everything happens in one transaction, so a shortfall rolls this back and
+    // leaves the assignment exactly where it was.
+    await client.query("DELETE FROM line_assignments WHERE id = $1", [id]);
+
+    // Walk the target line day by day from assignedDate, filling each day's
+    // remaining capacity and carrying the remainder forward — the same packing
+    // rule as a pool placement. Days with no run configured, or already full,
+    // are skipped. All-or-nothing: if the whole quantity can't fit within the
+    // horizon, roll back and report the shortfall.
+    const MAX_DAYS = 180;
+    let remaining = totalQty;
+    let dayStr = assignedDate;
+    let scanned = 0;
+    const createdRows = [];
+
+    while (remaining > 0 && scanned < MAX_DAYS) {
+      scanned++;
+      const { lines } = await getLineCapacityForDate(client, dayStr);
+      const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
+      if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
+
+      const usedRes = await client.query(
+        `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
+           FROM line_assignments
+          WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
+        [String(lineNo), dayStr]
       );
-    }
-    if (capRes.rows.length === 0) {
-      return res.status(400).json({ success: false, error: `Línea ${lineNo} sin capacidad configurada` });
-    }
-    const capacity = parseFloat(capRes.rows[0].target_pcs) || 0;
-    const runId = capRes.rows[0].id;
+      const used = parseFloat(usedRes.rows[0].used) || 0;
+      const capacity = parseFloat(lineData.target_pcs) || 0;
+      const available = Math.max(0, capacity - used);
+      if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
 
-    // Already assigned on the target line/day, excluding this assignment.
-    const usedRes = await client.query(
-      `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
-         FROM line_assignments
-        WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled') AND id <> $3`,
-      [String(lineNo), assignedDate, id]
-    );
-    const used = parseFloat(usedRes.rows[0].used) || 0;
-    const available = capacity - used;
+      const chunk = Math.min(remaining, available);
 
-    if (qty > available) {
+      const operators = parseInt(lineData.operators_count) || 20;
+      const workingHours = parseFloat(lineData.working_hours) || 8;
+      const efficiency = parseFloat(lineData.efficiency) || 0.85;
+      const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+      const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
+      const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
+
+      const ins = await client.query(
+        `INSERT INTO line_assignments
+           (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+            available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $9, $8)
+         RETURNING *`,
+        [workOrderId, lineData.id || null, String(lineNo), dayStr, chunk,
+         effectiveDailyMinutes, piecesPerDay, color, status]
+      );
+      createdRows.push(ins.rows[0]);
+      remaining -= chunk;
+      dayStr = addDaysStr(dayStr, 1);
+    }
+
+    if (remaining > 0) {
+      await client.query("ROLLBACK");
       return res.status(400).json({
         success: false,
-        error: `La línea ${lineNo} solo tiene ${Math.max(0, Math.round(available))} pzas disponibles el ${assignedDate}`,
+        error: `La línea ${lineNo} no tiene capacidad suficiente para mover ${Math.round(totalQty)} pzas desde el ${assignedDate} (faltan ${Math.round(remaining)}).`,
       });
     }
 
-    const upd = await client.query(
-      `UPDATE line_assignments
-          SET line_no = $1,
-              line_run_id = $2,
-              assigned_date = $3,
-              planned_start_date = $3,
-              planned_end_date = $3,
-              updated_at = now()
-        WHERE id = $4
-        RETURNING *`,
-      [String(lineNo), runId, assignedDate, id]
-    );
-    res.json({ success: true, assignment: upd.rows[0] });
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      assignment: createdRows[0] || null,
+      assignments: createdRows,
+      cells: createdRows.length,
+    });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Error moving line assignment:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
@@ -4425,7 +4484,7 @@ app.get("/api/fabrics", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
     await setSchema(client);
-    const result = await client.query("SELECT id, name, created_at FROM fabrics ORDER BY name");
+    const result = await client.query("SELECT id, name, code, created_at FROM fabrics ORDER BY name");
     res.json({ success: true, fabrics: result.rows });
   } catch (err) {
     console.error("❌ Error fetching fabrics:", err.message);
@@ -4444,8 +4503,8 @@ app.post("/api/fabrics", authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, error: "Fabric name is required" });
     }
     const result = await client.query(
-      "INSERT INTO fabrics (name) VALUES ($1) RETURNING id, name, created_at",
-      [name.trim()]
+      "INSERT INTO fabrics (name, code) VALUES ($1, $2) RETURNING id, name, code, created_at",
+      [name.trim(), null]
     );
     res.json({ success: true, fabric: result.rows[0] });
   } catch (err) {
@@ -4496,6 +4555,10 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       runDate,
       status,
       masterCodeId,
+      customerPo,
+      fabricName,        // ← add
+      fabricCode,        // ← add
+      yieldPerPiece,     // ← add
       samMinutes,
     } = req.body;
     
@@ -4518,6 +4581,37 @@ app.put("/api/work-orders/:id", authenticateToken, async (req, res) => {
       values.push(parseInt(customerId));
       updates.push(`customer_name = $${paramIndex++}`);
       values.push(customerResult.rows[0].name);
+    }
+
+    // ↓↓↓ ADD FROM HERE ↓↓↓
+    // Fabric, fabric code and yield are PO-header fields (captured once in
+    // step 2 of the wizard), not per size/color line.
+    if (fabricName !== undefined) {
+      updates.push(`fabric_name = $${paramIndex++}`);
+      values.push(fabricName || null);
+      // keep the legacy display column in sync
+      updates.push(`fabric_supplier = $${paramIndex++}`);
+      values.push(fabricName || null);
+    }
+
+    if (fabricCode !== undefined) {
+      updates.push(`fabric_code = $${paramIndex++}`);
+      values.push(fabricCode || null);
+    }
+
+    if (yieldPerPiece !== undefined) {
+      updates.push(`yield_per_piece = $${paramIndex++}`);
+      values.push(
+        yieldPerPiece === "" || yieldPerPiece === null || isNaN(parseFloat(yieldPerPiece))
+          ? null
+          : parseFloat(yieldPerPiece)
+      );
+    }
+
+
+    if (customerPo !== undefined) {
+      updates.push(`customer_po = $${paramIndex++}`);
+      values.push(customerPo || null);
     }
     
     if (styleDescription !== undefined) {
@@ -5085,7 +5179,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     await setSchema(client);
     await client.query("BEGIN");
 
-    const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate } = req.body;
+    const { workOrderId, lineNo, assignedDate, quantity, plannedStartDate,color } = req.body;
 
     if (!workOrderId || !lineNo || !assignedDate || !quantity || parseFloat(quantity) <= 0) {
       await client.query("ROLLBACK");
@@ -5147,9 +5241,9 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
     const result = await client.query(
       `INSERT INTO line_assignments (
         work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
-        available_minutes, required_production_rate, planned_start_date, planned_end_date, status
+        available_minutes, required_production_rate, planned_start_date, planned_end_date, status,color
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'planned')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'planned', $10)
       RETURNING *`,
       [
         parseInt(workOrderId),
@@ -5161,6 +5255,7 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
         piecesPerDay,
         startDate,
         plannedEndDate,
+        color || null,
       ]
     );
 
@@ -5238,6 +5333,9 @@ app.delete("/api/line-assignments/:id", authenticateToken, async (req, res) => {
     client.release();
   }
 });
+
+
+
 
 // ========== overview api endpoints ==========
 
@@ -5644,6 +5742,71 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Error fetching period summary:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/skyrina/daily-production?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
+ * Daily produced (packing sewn qty) vs target — feeds the bar + meta-line chart.
+ */
+app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const { startDate, endDate, style, lineNo } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ success: false, error: "startDate and endDate parameters required" });
+    }
+    if (!['master', 'skyrina', 'engineer', 'supervisor', 'soporte_it'].includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: "Access denied" });
+    }
+
+    const params = [startDate, endDate];
+    let paramIndex = 3;
+    let runFilters = "";
+    if (style && style !== 'all')  { runFilters += ` AND lr.style = $${paramIndex++}`;   params.push(style); }
+    if (lineNo && lineNo !== 'all') { runFilters += ` AND lr.line_no = $${paramIndex++}`; params.push(lineNo); }
+
+    const query = `
+      WITH filtered_runs AS (
+        SELECT lr.id AS run_id, lr.run_date, lr.target_pcs
+        FROM line_runs lr
+        WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
+      ),
+      run_packing_totals AS (
+        SELECT fr.run_id, fr.run_date,
+               COALESCE(SUM(se.sewed_qty), 0) AS packing_total
+        FROM filtered_runs fr
+        JOIN run_operators ro ON fr.run_id = ro.run_id
+        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
+        WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
+        GROUP BY fr.run_id, fr.run_date
+      )
+      SELECT
+        to_char(fr.run_date, 'YYYY-MM-DD') AS date,
+        COALESCE(SUM(rpt.packing_total), 0) AS produced,
+        COALESCE(SUM(fr.target_pcs), 0)     AS target
+      FROM filtered_runs fr
+      LEFT JOIN run_packing_totals rpt ON fr.run_id = rpt.run_id
+      GROUP BY fr.run_date
+      ORDER BY fr.run_date
+    `;
+
+    const result = await client.query(query, params);
+    const days = result.rows.map(r => ({
+      date: r.date,
+      produced: parseFloat(r.produced) || 0,
+      target: parseFloat(r.target) || 0,
+    }));
+
+    res.json({ success: true, period: { startDate, endDate }, days });
+  } catch (err) {
+    console.error("❌ Error fetching daily production:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
@@ -7459,6 +7622,15 @@ app.put("/api/master-codes/:id", authenticateToken, requireMerchantAccess, async
     client.release();
   }
 });
+
+// A garment counts as produced when it clears the packing/final operation.
+// Keep in sync with LineLeaderPage.jsx → finishedGarmentsTotal.
+const PACKING_OP_MATCH = `(
+     oo.operation_name ILIKE '%pack%'
+  OR oo.operation_name ILIKE '%emp%'
+  OR oo.operation_name ILIKE '%termin%'
+  OR oo.operation_name ILIKE '%finish%'
+)`;
 
 // ✅ Health check
 app.get("/api/health", async (req, res) => {

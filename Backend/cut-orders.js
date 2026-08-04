@@ -45,6 +45,14 @@ async function initSchema({ pool, setSchema }) {
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS panels INT;`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS amount_cut NUMERIC(12,2);`);
     await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS remaining_to_cut NUMERIC(12,2);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS color VARCHAR(50);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS fabric_code VARCHAR(60);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS sizes JSONB;`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS size_progress JSONB;`);
+    // marcadas / trazos: [{ id, name, panels, piecesPerPanel, totalPieces, lines:[{talla, perPanel, pieces}] }]
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS markers JSONB;`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS style_no VARCHAR(50);`);
+    await client.query(`ALTER TABLE cut_orders ADD COLUMN IF NOT EXISTS season VARCHAR(50);`);
     console.log("✅ cut_orders table ready in prod_db_schema");
   } finally {
     client.release();
@@ -69,6 +77,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
         SELECT co.id,
                co.work_order_id,
                co.fabric,
+               co.fabric_code,
                to_char(co.cut_date, 'YYYY-MM-DD') AS cut_date,
                co.quantity,
                co.yield_per_piece,
@@ -76,6 +85,9 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                co.panels,
                co.amount_cut,
                co.remaining_to_cut,
+               co.sizes,
+               co.size_progress,
+               co.markers,
                co.notes,
                co.status,
                co.created_at,
@@ -84,7 +96,9 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
                wo.style_description,
                wo.style_code,
                wo.estilo,
-               wo.color
+               COALESCE(co.color, wo.color) AS color,
+               COALESCE(co.style_no, wo.style_code) AS style_no,
+               COALESCE(co.season, wo.season) AS season
           FROM cut_orders co
           JOIN work_orders wo ON wo.id = co.work_order_id
          ORDER BY co.created_at DESC
@@ -103,7 +117,7 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { workOrderId, fabric, cutDate, quantity, notes, yieldPerPiece } = req.body;
+      const { workOrderId, fabric, fabricCode, cutDate, quantity, notes, yieldPerPiece, color, sizes, styleNo, season } = req.body;
 
       if (!workOrderId || !cutDate || !quantity || parseFloat(quantity) <= 0) {
         return res.status(400).json({
@@ -120,16 +134,19 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
       }
       const totalLength = y !== null ? y * parseFloat(quantity) : null;
 
-      const wo = await client.query("SELECT id FROM work_orders WHERE id = $1", [parseInt(workOrderId)]);
+      const wo = await client.query("SELECT id, style_code, season FROM work_orders WHERE id = $1", [parseInt(workOrderId)]);
       if (wo.rows.length === 0) {
         return res.status(404).json({ success: false, error: "Work order not found" });
       }
+      const styleNoFinal = styleNo || wo.rows[0].style_code || null;
+      const seasonFinal = season || wo.rows[0].season || null;
 
       const result = await client.query(
-        `INSERT INTO cut_orders (work_order_id, fabric, cut_date, quantity, notes, yield_per_piece, total_length)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO cut_orders (work_order_id, fabric, fabric_code, cut_date, quantity, notes, yield_per_piece, total_length, color, sizes, style_no, season)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
          RETURNING *`,
-        [parseInt(workOrderId), fabric || null, cutDate, parseFloat(quantity), notes || null, y, totalLength]
+        [parseInt(workOrderId), fabric || null, fabricCode || null, cutDate, parseFloat(quantity), notes || null, y, totalLength, color || null,
+         Array.isArray(sizes) && sizes.length ? JSON.stringify(sizes) : null, styleNoFinal, seasonFinal]
       );
       res.json({ success: true, cutOrder: result.rows[0] });
     } catch (err) {
@@ -146,11 +163,32 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
     const client = await pool.connect();
     try {
       await setSchema(client);
-      const { panels, amountCut, remainingToCut } = req.body;
+      const { panels, amountCut, remainingToCut, sizeProgress, markers } = req.body;
 
-      const p = panels === undefined || panels === null || panels === "" ? null : parseInt(panels);
-      const cut = amountCut === undefined || amountCut === null || amountCut === "" ? null : parseFloat(amountCut);
-      const rem = remainingToCut === undefined || remainingToCut === null || remainingToCut === "" ? null : parseFloat(remainingToCut);
+      // Marcadas (trazos): each groups sizes and carries its own panel count.
+      const mk = Array.isArray(markers) ? markers : null;
+
+      // Per-size progress (talla, quantity, panels, amountCut, remaining).
+      let sp = Array.isArray(sizeProgress) ? sizeProgress : null;
+      let p, cut, rem;
+      if (sp && sp.length > 0) {
+        // Panels: from the marcadas when present (a panel serves several sizes,
+        // so summing the per-size rows would double count it).
+        p = mk && mk.length
+          ? mk.reduce((s, m) => s + (parseInt(m.panels) || 0), 0)
+          : sp.reduce((s, r) => s + (parseInt(r.panels) || 0), 0);
+        cut = sp.reduce((s, r) => s + (parseFloat(r.amountCut) || 0), 0);
+        rem = sp.reduce((s, r) => {
+          const q = parseFloat(r.quantity) || 0;
+          const c = parseFloat(r.amountCut) || 0;
+          const rr = r.remaining != null && r.remaining !== "" ? parseFloat(r.remaining) : Math.max(q - c, 0);
+          return s + (isNaN(rr) ? 0 : rr);
+        }, 0);
+      } else {
+        p = panels === undefined || panels === null || panels === "" ? null : parseInt(panels);
+        cut = amountCut === undefined || amountCut === null || amountCut === "" ? null : parseFloat(amountCut);
+        rem = remainingToCut === undefined || remainingToCut === null || remainingToCut === "" ? null : parseFloat(remainingToCut);
+      }
 
       if (cut !== null && (isNaN(cut) || cut < 0)) {
         return res.status(400).json({ success: false, error: "Cantidad cortada inválida" });
@@ -170,11 +208,13 @@ function registerCutOrders(app, { authenticateToken, pool, setSchema }) {
             SET panels = COALESCE($1, panels),
                 amount_cut = COALESCE($2, amount_cut),
                 remaining_to_cut = COALESCE($3, remaining_to_cut),
-                status = $4,
+                size_progress = COALESCE($4::jsonb, size_progress),
+                markers = COALESCE($5::jsonb, markers),
+                status = $6,
                 updated_at = now()
-          WHERE id = $5
+          WHERE id = $7
           RETURNING *`,
-        [p, cut, rem, newStatus, parseInt(req.params.id)]
+        [p, cut, rem, sp ? JSON.stringify(sp) : null, mk ? JSON.stringify(mk) : null, newStatus, parseInt(req.params.id)]
       );
       if (result.rows.length === 0) {
         return res.status(404).json({ success: false, error: "Cut order not found" });

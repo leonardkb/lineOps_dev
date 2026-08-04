@@ -75,6 +75,35 @@ function ChipGrid({ options, value, onChange, cols = "grid-cols-3 sm:grid-cols-5
   );
 }
 
+// Drop blank entries and duplicates from a line's fabric list.
+function cleanFabrics(list) {
+  const out = [];
+  const seen = new Set();
+  for (const f of list || []) {
+    const name = (f.name || "").trim();
+    if (!name) continue;
+    const code = (f.code || "").trim() || null;
+    const yieldVal = (f.yield ?? "").toString().trim();
+    const key = `${name}|${code || ""}`.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ name, code, yield: yieldVal === "" ? null : yieldVal });
+  }
+  return out;
+}
+
+// One labelled input inside a color-row card (step 2).
+function RowField({ label, children, hint }) {
+  return (
+    <label className="block">
+      <span className="block text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1" title={hint}>
+        {label}
+      </span>
+      {children}
+    </label>
+  );
+}
+
 export default function NuevaOrdenWizard() {
   const [step, setStep] = useState(1);
 
@@ -89,9 +118,14 @@ export default function NuevaOrdenWizard() {
   const [correlativo, setCorrelativo] = useState("");
   const [autoFilling, setAutoFilling] = useState(false);
 
-  // step 2 — sizes + color/qty grid. Each color row carries its OWN estilo cliente.
+  // step 2 — one line per color + estilo cliente + PO cliente, each with its
+  // own delivery date, fabric, fabric code, yield and size quantities.
   const [sizes, setSizes] = useState([]); // array of talla codes
-  const [colorRows, setColorRows] = useState([{ color: "", estilo: "", qty: {} }]); // qty keyed by talla
+  // Each line may use SEVERAL fabrics, each with its own code:
+  //   fabrics: [{ name, code }, ...]
+  const [colorRows, setColorRows] = useState([
+    { color: "", estilo: "", qty: {}, customerPo: "", deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }] },
+  ]); // qty keyed by talla; yield is captured per tela
 
   // step 3 — customer
   const [customerId, setCustomerId] = useState("");
@@ -101,15 +135,13 @@ export default function NuevaOrdenWizard() {
   const [description, setDescription] = useState("");
   const [sam, setSam] = useState("");
   const [photo, setPhoto] = useState(null);
-  const [commitmentDate, setCommitmentDate] = useState("");
   const [seasonCode, setSeasonCode] = useState("");
   const [seasonYear, setSeasonYear] = useState(String(new Date().getFullYear()).slice(-2));
-  const [selectedFabrics, setSelectedFabrics] = useState([]);
-  const [newFabric, setNewFabric] = useState("");
   const [warehouseStock, setWarehouseStock] = useState("");
   const [extraQuantity, setExtraQuantity] = useState("");
 
   const [saving, setSaving] = useState(false);
+  const [savingFabric, setSavingFabric] = useState(null); // name being added to the catalog
   const [toast, setToast] = useState(null);
   const fileRef = useRef(null);
 
@@ -165,9 +197,13 @@ export default function NuevaOrdenWizard() {
       const color = row.color.trim();
       const est = (row.estilo || "").trim();
       if (!color) continue;
+      const meta = {
+        estilo: est,
+        customerPo: (row.customerPo || "").trim() || null,
+      };
       for (const talla of sizes) {
         const q = parseFloat(row.qty[talla]);
-        if (!isNaN(q) && q > 0) out.push({ talla, color, estilo: est, quantity: q });
+        if (!isNaN(q) && q > 0) out.push({ talla, color, ...meta, quantity: q });
       }
     }
     return out;
@@ -176,20 +212,107 @@ export default function NuevaOrdenWizard() {
   // Per-color estilo checks (step 2)
   const activeColorRows = colorRows.filter((r) => r.color.trim());
   const colorList = activeColorRows.map((r) => r.color.trim());
-  const dupColors = colorList.length !== new Set(colorList).size;
+  // Same color+estilo may repeat — each repeat becomes its own PO (see poPlan).
   const allEstiloValid =
     activeColorRows.length > 0 && activeColorRows.every((r) => (r.estilo || "").trim().length === 6);
+
+  // Build the PO buckets:
+  //   • every distinct (color+estilo) line goes into ONE PO
+  //   • a REPEATED (color+estilo) line opens a second PO — a PO can't hold the
+  //     same color+estilo twice (unique index on work_order_id, talla, color, estilo)
+  //
+  // PO cliente, entrega, tela, código de tela and rendimiento travel WITH the
+  // line (work_order_lines), so a single PO may hold lines with different
+  // fabrics or dates. The header keeps the first line's values as a summary.
+  const poPlan = useMemo(() => {
+    const seen = new Set();
+    let mainIdx = -1;
+    const buckets = [];
+    for (const row of colorRows) {
+      const color = row.color.trim();
+      const est = (row.estilo || "").trim();
+      if (!color || est.length !== 6) continue;
+
+      const meta = {
+        estilo: est,
+        customerPo: (row.customerPo || "").trim() || null,
+        commitmentDate: row.deliveryDate || null,
+        fabrics: cleanFabrics(row.fabrics),
+      };
+      const rowCells = [];
+      for (const talla of sizes) {
+        const q = parseFloat(row.qty[talla]);
+        if (!isNaN(q) && q > 0) rowCells.push({ talla, color, ...meta, quantity: q });
+      }
+      if (rowCells.length === 0) continue;
+
+      const key = `${color}|${est}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        if (mainIdx === -1) { buckets.push({ cells: [], main: true }); mainIdx = buckets.length - 1; }
+        buckets[mainIdx].cells.push(...rowCells);
+      } else {
+        buckets.push({ cells: rowCells, main: false });
+      }
+    }
+    const firstOf = (cells, k) => cells.find((c) => c[k])?.[k] || null;
+    // Distinct name+code pairs across the PO's lines.
+    const mergeFabrics = (cells) => {
+      const out = [];
+      const seen = new Set();
+      for (const c of cells) {
+        for (const f of c.fabrics || []) {
+          const key = `${f.name}|${f.code || ""}`.toUpperCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(f);
+        }
+      }
+      return out;
+    };
+    return buckets
+      .filter((b) => b.cells.length > 0)
+      .map((b) => {
+        const fabricList = mergeFabrics(b.cells);
+        return {
+          cells: b.cells,
+          main: b.main,
+          // header summary = first line that has a value
+          date: firstOf(b.cells, "commitmentDate"),
+          fabricList,
+          fabricName: fabricList[0]?.name || null,
+          fabricCode: fabricList[0]?.code || null,
+          yield: fabricList[0]?.yield ?? null,
+          customerPos: [...new Set(b.cells.map((c) => c.customerPo).filter(Boolean))].join(", ") || null,
+          fabrics: fabricList
+            .map((f) => `${f.name}${f.code ? ` (${f.code})` : ""}${f.yield ? ` · rend ${f.yield}` : ""}`)
+            .join(", ") || null,
+          pieces: b.cells.reduce((s, c) => s + c.quantity, 0),
+          colors: [...new Set(b.cells.map((c) => c.color))].join(", "),
+          estilos: [...new Set(b.cells.map((c) => c.estilo))].join(", "),
+        };
+      });
+  }, [colorRows, sizes]);
 
   const orderedQty = cells.reduce((s, c) => s + c.quantity, 0);
   const totalToProduce = Math.max(
     orderedQty - (parseFloat(warehouseStock) || 0) + (parseFloat(extraQuantity) || 0), 0
   );
-  const poNumber = skmSeq && clienteCode && styleBase ? `${skmSeq}-${clienteCode}-${styleBase}` : "";
   const season = seasonCode ? `${seasonCode}${seasonYear}` : "";
 
   // ------- step handlers ----------------------------------------------
+  // Order selected sizes by their position in the TALLAS catalog (smallest →
+  // largest), not by click order, so the grid columns and review read naturally.
+  const sizeOrder = (code) => {
+    const i = TALLAS.findIndex((t) => t.code === code);
+    return i === -1 ? 999 : i;
+  };
   const toggleSize = (code) =>
-    setSizes((s) => (s.includes(code) ? s.filter((x) => x !== code) : [...s, code]));
+    setSizes((s) =>
+      s.includes(code)
+        ? s.filter((x) => x !== code)
+        : [...s, code].sort((a, b) => sizeOrder(a) - sizeOrder(b))
+    );
 
   const setColor = (i, val) =>
     setColorRows((rows) => rows.map((r, idx) =>
@@ -200,7 +323,66 @@ export default function NuevaOrdenWizard() {
   const setQty = (i, talla, val) =>
     setColorRows((rows) => rows.map((r, idx) =>
       idx === i ? { ...r, qty: { ...r.qty, [talla]: val.replace(/[^0-9.]/g, "") } } : r));
-  const addColor = () => setColorRows((r) => [...r, { color: "", estilo: "", qty: {} }]);
+  // Generic per-line setter for the non-normalised fields (PO cliente, entrega,
+  // tela, código de tela, rendimiento).
+  const setRowField = (i, key, val) =>
+    setColorRows((rows) => rows.map((r, idx) => (idx === i ? { ...r, [key]: val } : r)));
+  const newRow = () => ({
+    color: "", estilo: "", qty: {}, customerPo: "",
+    deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }],
+  });
+
+  // Register a fabric name in the catalog (POST /api/fabrics) so it shows up in
+  // the suggestions from now on. The per-line CODE stays on the work order —
+  // the catalog only stores names.
+  const saveFabricToCatalog = async (rawName, rawCode) => {
+    const name = (rawName || "").trim();
+    if (!name || savingFabric) return;
+    setSavingFabric(name);
+    try {
+      const res = await fetch(`${API_URL}/api/fabrics`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ name, code: (rawCode || "").trim() || null }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "No se pudo guardar la tela");
+      setFabrics((f) => [...f, data.fabric].sort((a, b) => a.name.localeCompare(b.name)));
+      showToast(`✅ Tela "${name}" agregada al catálogo`);
+    } catch (err) {
+      showToast(`⚠️ ${err.message}`, true);
+    } finally {
+      setSavingFabric(null);
+    }
+  };
+
+  // ---- per-line fabric list -------------------------------------------
+  const setFabricField = (i, j, key, val) =>
+    setColorRows((rows) => rows.map((r, idx) => {
+      if (idx !== i) return r;
+      return {
+        ...r,
+        fabrics: r.fabrics.map((f, fi) => {
+          if (fi !== j) return f;
+          const next = { ...f, [key]: val };
+          // Picking a catalogued fabric fills its code, unless one was typed.
+          if (key === "name" && !(f.code || "").trim()) {
+            const hit = fabrics.find((c) => (c.name || "").toLowerCase() === val.trim().toLowerCase());
+            if (hit?.code) next.code = hit.code;
+          }
+          return next;
+        }),
+      };
+    }));
+  const addFabric = (i) =>
+    setColorRows((rows) => rows.map((r, idx) =>
+      idx === i ? { ...r, fabrics: [...r.fabrics, { name: "", code: "", yield: "" }] } : r));
+  const removeFabric = (i, j) =>
+    setColorRows((rows) => rows.map((r, idx) =>
+      idx === i && r.fabrics.length > 1
+        ? { ...r, fabrics: r.fabrics.filter((_, fi) => fi !== j) }
+        : r));
+  const addColor = () => setColorRows((r) => [...r, newRow()]);
   const removeColor = (i) =>
     setColorRows((r) => (r.length === 1 ? r : r.filter((_, idx) => idx !== i)));
 
@@ -210,27 +392,11 @@ export default function NuevaOrdenWizard() {
     if (c?.code) setClienteCode(c.code.toUpperCase());
   };
 
-  const toggleFabric = (name) =>
-    setSelectedFabrics((f) => (f.includes(name) ? f.filter((x) => x !== name) : [...f, name]));
-  const addFabric = async () => {
-    const name = newFabric.trim();
-    if (!name) return;
-    try {
-      const res = await fetch(`${API_URL}/api/fabrics`, {
-        method: "POST", headers: authHeaders(), body: JSON.stringify({ name }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setFabrics((f) => [...f, data.fabric].sort((a, b) => a.name.localeCompare(b.name)));
-        setSelectedFabrics((s) => [...s, data.fabric.name]);
-        setNewFabric("");
-      } else showToast(`❌ ${data.error || "No se pudo agregar la tela"}`, true);
-    } catch { showToast("❌ Error al agregar tela", true); }
-  };
-
   const handlePhoto = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    // Keep the File for the presigned S3 upload at submit time; the base64 is
+    // only used for the on-screen preview thumbnail (not sent in the JSON body).
     const reader = new FileReader();
     reader.onload = () => setPhoto({ file, url: URL.createObjectURL(file), base64: reader.result });
     reader.readAsDataURL(file);
@@ -239,7 +405,7 @@ export default function NuevaOrdenWizard() {
   // ------- validation per step ----------------------------------------
   const stepValid = (s) => {
     if (s === 1) return tipo && modelo && correlativo.length === 2;
-    if (s === 2) return sizes.length > 0 && cells.length > 0 && allEstiloValid && !dupColors;
+    if (s === 2) return sizes.length > 0 && cells.length > 0 && allEstiloValid;
     if (s === 3) return customerId && clienteCode.length === 3;
     if (s === 4) return description.trim() && sam && Number(sam) > 0;
     return true;
@@ -254,7 +420,6 @@ export default function NuevaOrdenWizard() {
     sizes.length === 0 && "Al menos una talla (paso 2)",
     cells.length === 0 && "Cantidad en al menos una celda color × talla (paso 2)",
     !allEstiloValid && "Estilo cliente (6 caracteres) por cada color (paso 2)",
-    dupColors && "Colores duplicados: usa un color distinto por estilo (paso 2)",
     !customerId && "Cliente (paso 3)",
     clienteCode.length !== 3 && "Código de cliente de 3 letras (paso 3)",
     !description.trim() && "Descripción (paso 4)",
@@ -269,20 +434,47 @@ export default function NuevaOrdenWizard() {
     if (!canCreate) return;
     setSaving(true);
     try {
+      // Upload the photo straight to S3 first (presigned PUT), so only a small
+      // key travels in the JSON body — this avoids Lambda's ~6MB request limit
+      // (base64 in the body was hitting a 413). One image, shared by all POs.
+      let photoKey = null;
+      if (photo?.file) {
+        const presRes = await fetch(`${API_URL}/api/master-codes/photo-upload-url`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({
+            filename: photo.file.name,
+            contentType: photo.file.type || "image/jpeg",
+          }),
+        });
+        const pres = await presRes.json();
+        if (!presRes.ok || !pres.uploadUrl) throw new Error(pres.error || "No se pudo preparar la subida de la foto");
+        const putRes = await fetch(pres.uploadUrl, { method: "PUT", body: photo.file });
+        if (!putRes.ok) throw new Error("No se pudo subir la foto a S3");
+        photoKey = pres.photoKey;
+      }
+
+      // One atomic request. The backend creates one PO per bucket in poPlan
+      // (distinct color+estilo rows share the first PO; each repeat is its own PO)
+      // and auto-numbers them (SKM####).
       const payload = {
         tipo, modelo, correlativo,
         clienteCode, customerId: Number(customerId),
-        // Fallback/primary estilo; the real per-color estilo travels inside `lines`.
-        estilo: cells[0]?.estilo || "",
         description: description.trim(), sam: Number(sam),
-        // This backend accepts the image inline as a base64 data URL.
-        photoBase64: photo?.base64 || null,
-        photoFilename: photo?.file?.name || null,
-        lines: cells, // each { talla, color, estilo, quantity }
-        workOrderNo: poNumber,
-        commitmentDate: commitmentDate || null,
+        photoKey,
+        orders: poPlan.map((p) => ({
+          // Each cell carries its own customerPo, commitmentDate, fabricName,
+          // fabricCode and yield -> work_order_lines. The order-level values
+          // below are the header summary (and the fallback for blank lines).
+          lines: p.cells,
+          commitmentDate: p.date,
+          fabrics: p.fabricList,
+          fabricName: p.fabricName,
+          fabricCode: p.fabricCode,
+          yield: p.yield,
+        })),
         season: season || null,
-        fabrics: selectedFabrics,
+        // Stock/extras count once — the backend applies them to the first PO only.
         warehouseStock: parseFloat(warehouseStock) || 0,
         extraQuantity: parseFloat(extraQuantity) || 0,
       };
@@ -290,16 +482,17 @@ export default function NuevaOrdenWizard() {
         method: "POST", headers: authHeaders(), body: JSON.stringify(payload),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "No se pudo crear la orden");
-      const mc = data.masterCodes;
-      showToast(`✅ Orden ${data.workOrder.work_order_no} creada · ${mc.created} código(s) nuevo(s), ${mc.reused} reusado(s)`);
+      if (!res.ok) throw new Error(data.error || "No se pudieron crear las órdenes");
+
+      const nos = (data.workOrders || [data.workOrder]).filter(Boolean).map((w) => w.work_order_no);
+      showToast(`✅ ${nos.length} orden(es) creada(s): ${nos.join(", ")}`);
       // reset
       setStep(1);
       setTipo(""); setModelo(""); setCorrelativo("");
-      setSizes([]); setColorRows([{ color: "", estilo: "", qty: {} }]);
+      setSizes([]); setColorRows([newRow()]);
       setCustomerId(""); setClienteCode("");
       setDescription(""); setSam(""); setPhoto(null);
-      setCommitmentDate(""); setSeasonCode(""); setSelectedFabrics([]); setWarehouseStock(""); setExtraQuantity("");
+      setSeasonCode(""); setWarehouseStock(""); setExtraQuantity("");
       if (fileRef.current) fileRef.current.value = "";
       const seqRes = await fetch(`${API_URL}/api/production-orders/next-number`, { headers: authHeaders() });
       if (seqRes.ok) setSkmSeq((await seqRes.json()).sequence || "");
@@ -381,7 +574,7 @@ export default function NuevaOrdenWizard() {
 
         {/* Step 2 — Sizes + colors grid */}
         {step === 2 && (
-          <SectionCard icon={Palette} title="2 · Tallas, colores y cantidades" subtitle="Cada color lleva su propio estilo cliente y sus cantidades por talla">
+          <SectionCard icon={Palette} title="2 · Tallas, colores y cantidades" subtitle="Cada línea lleva su propio estilo cliente, PO, entrega, tela, rendimiento y cantidades por talla">
             <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide mb-2">Tallas</p>
             <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
               {TALLAS.map((t) => {
@@ -401,67 +594,140 @@ export default function NuevaOrdenWizard() {
             {sizes.length === 0 ? (
               <p className="text-sm text-slate-400 mt-4">Selecciona al menos una talla para capturar cantidades.</p>
             ) : (
-              <div className="mt-5 overflow-x-auto">
-                <table className="text-sm border-separate border-spacing-1">
-                  <thead>
-                    <tr>
-                      <th className="text-left text-[11px] uppercase tracking-wide text-slate-500 px-2">Color</th>
-                      <th className="text-left text-[11px] uppercase tracking-wide text-slate-500 px-2">Estilo cliente</th>
-                      {sizes.map((s) => (
-                        <th key={s} className="text-center text-[11px] text-slate-500 px-1 min-w-16">
-                          <span className="font-mono font-bold text-slate-700">{s}</span>
-                          <span className="block text-[10px] text-slate-400">{sizeLabel(s)}</span>
-                        </th>
-                      ))}
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {colorRows.map((row, i) => (
-                      <tr key={i}>
-                        <td className="px-1">
+              <>
+              <div className="mt-5 space-y-3">
+                {colorRows.map((row, i) => {
+                  const rowPieces = sizes.reduce((sum, t) => sum + (parseFloat(row.qty[t]) || 0), 0);
+                  const estiloBad = row.color.trim() && (row.estilo || "").trim().length !== 6;
+                  return (
+                    <div key={i} className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                          Línea {i + 1}
+                          <span className="ml-2 font-mono text-slate-400 normal-case">
+                            {rowPieces.toLocaleString()} pzs
+                          </span>
+                        </span>
+                        <button type="button" onClick={() => removeColor(i)} disabled={colorRows.length === 1}
+                          className="p-1.5 rounded hover:bg-rose-100 text-rose-500 disabled:opacity-30">
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+
+                      {/* Identity + logistics for this line */}
+                      <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                        <RowField label="Color">
                           <input value={row.color} onChange={(e) => setColor(i, e.target.value)} placeholder="NEG"
-                            className="w-20 rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm uppercase tracking-widest
+                            className="w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm uppercase tracking-widest
                                        focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                        </td>
-                        <td className="px-1">
+                        </RowField>
+                        <RowField label="Estilo cliente">
                           <input value={row.estilo || ""} onChange={(e) => setEstiloRow(i, e.target.value)} placeholder="FN2808"
-                            className={`w-24 rounded-lg border px-2 py-1.5 font-mono text-sm uppercase tracking-widest
+                            className={`w-full rounded-lg border px-2 py-1.5 font-mono text-sm uppercase tracking-widest
                                        focus:outline-none focus:ring-2 focus:ring-slate-900
-                                       ${row.color.trim() && (row.estilo || "").trim().length !== 6
-                                         ? "border-rose-300 bg-rose-50" : "border-slate-300"}`} />
-                        </td>
+                                       ${estiloBad ? "border-rose-300 bg-rose-50" : "border-slate-300"}`} />
+                        </RowField>
+                        <RowField label="PO cliente" hint="PO del cliente para esta línea">
+                          <input value={row.customerPo || ""} onChange={(e) => setRowField(i, "customerPo", e.target.value)}
+                            placeholder="PO cliente"
+                            className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm
+                                       focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                        </RowField>
+                        <RowField label="Entrega">
+                          <input type="date" value={row.deliveryDate || ""} onChange={(e) => setRowField(i, "deliveryDate", e.target.value)}
+                            className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm
+                                       focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                        </RowField>
+                      </div>
+
+                      {/* Telas: one or more per line, each with its own code and rendimiento */}
+                      <div className="mt-3 rounded-lg border border-slate-200 bg-white p-2">
+                        <div className="grid grid-cols-[minmax(0,1fr)_8rem_6rem_2rem] gap-2 px-0.5 pb-1">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Tela</span>
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Código</span>
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Rend.</span>
+                          <span />
+                        </div>
+                        <div className="space-y-1.5">
+                          {row.fabrics.map((f, j) => {
+                            const typed = (f.name || "").trim();
+                            const isNew = typed && !fabricNames.some((n) => n.toLowerCase() === typed.toLowerCase());
+                            return (
+                              <div key={j} className="space-y-1">
+                                <div className="grid grid-cols-[minmax(0,1fr)_8rem_6rem_2rem] gap-2 items-center">
+                                  <input value={f.name} onChange={(e) => setFabricField(i, j, "name", e.target.value)}
+                                    list="fabric-names" placeholder="Nombre de la tela"
+                                    className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                  <input value={f.code} onChange={(e) => setFabricField(i, j, "code", e.target.value.toUpperCase())}
+                                    placeholder="Código"
+                                    className="w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm uppercase
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                  <input value={f.yield || ""} onChange={(e) => setFabricField(i, j, "yield", e.target.value.replace(/[^0-9.]/g, ""))}
+                                    inputMode="decimal" placeholder="0.00" title="Rendimiento de esta tela"
+                                    className="w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm text-right
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                  <button type="button" onClick={() => removeFabric(i, j)} disabled={row.fabrics.length === 1}
+                                    title="Quitar tela"
+                                    className="h-8 w-8 flex items-center justify-center rounded hover:bg-rose-100 text-rose-500 disabled:opacity-30">
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                                {isNew && (
+                                  <button type="button" disabled={savingFabric === typed}
+                                    onClick={() => saveFabricToCatalog(typed, f.code)}
+                                    className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 hover:underline disabled:opacity-50">
+                                    <Plus size={11} />
+                                    {savingFabric === typed ? "Guardando…" : `Guardar "${typed}" en el catálogo`}
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <button type="button" onClick={() => addFabric(i)}
+                          className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900">
+                          <Plus size={12} /> Agregar tela
+                        </button>
+                      </div>
+
+                      {/* Quantities per size for this line */}
+                      <div className="mt-3 flex flex-wrap gap-2">
                         {sizes.map((s) => (
-                          <td key={s} className="px-1">
+                          <div key={s} className="w-16">
+                            <span className="block text-center text-[10px] text-slate-400">
+                              <span className="block font-mono text-[11px] font-bold text-slate-700">{s}</span>
+                              {sizeLabel(s)}
+                            </span>
                             <input value={row.qty[s] || ""} onChange={(e) => setQty(i, s, e.target.value)}
                               inputMode="numeric" placeholder="0"
-                              className="w-16 rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm text-center
+                              className="mt-0.5 w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm text-center
                                          focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                          </td>
+                          </div>
                         ))}
-                        <td className="px-1">
-                          <button type="button" onClick={() => removeColor(i)} disabled={colorRows.length === 1}
-                            className="p-1.5 rounded hover:bg-rose-100 text-rose-500 disabled:opacity-30">
-                            <Trash2 size={15} />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <datalist id="fabric-names">
+                  {fabricNames.map((n) => <option key={n} value={n} />)}
+                </datalist>
                 <button type="button" onClick={addColor}
-                  className="mt-3 inline-flex items-center gap-1 text-sm font-medium text-slate-700 hover:text-slate-900">
-                  <Plus size={14} /> Agregar color
+                  className="mt-1 inline-flex items-center gap-1 text-sm font-medium text-slate-700 hover:text-slate-900">
+                  <Plus size={14} /> Agregar línea
                 </button>
                 <p className="text-xs text-slate-500 mt-3">
-                  {cells.length} combinación(es) · {orderedQty.toLocaleString()} piezas · se crearán {cells.length} código(s) maestro(s)
+                  {cells.length} combinación(es) · {orderedQty.toLocaleString()} piezas · {poPlan.length} orden(es) de producción · {new Set(cells.map((c) => `${c.talla}|${c.color}|${c.estilo}`)).size} código(s) maestro(s)
                 </p>
-                {dupColors && (
-                  <p className="text-xs text-rose-600 mt-1 flex items-center gap-1">
-                    <AlertCircle size={12} /> Hay colores repetidos. Usa un color distinto por estilo.
+                {poPlan.length > 1 && (
+                  <p className="text-xs text-slate-500 mt-1 flex items-start gap-1">
+                    <AlertCircle size={12} className="mt-0.5 shrink-0" />
+                    Se crearán {poPlan.length} órdenes (números automáticos): todas las líneas van en una sola orden, y cada color+estilo repetido abre una orden aparte.
                   </p>
                 )}
               </div>
+              </>
             )}
           </SectionCard>
         )}
@@ -518,13 +784,8 @@ export default function NuevaOrdenWizard() {
               </div>
             </SectionCard>
 
-            <SectionCard icon={CalendarClock} title="Logística" subtitle="Entrega, tela, stock y extras">
+            <SectionCard icon={CalendarClock} title="Logística" subtitle="Temporada, stock y extras (entrega y tela se capturan por línea en el paso 2)">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Fecha de entrega comprometida</label>
-                  <input type="date" value={commitmentDate} onChange={(e) => setCommitmentDate(e.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Temporada</label>
                   <div className="flex gap-2">
@@ -553,41 +814,39 @@ export default function NuevaOrdenWizard() {
                   </div>
                 </div>
               </div>
-              <div className="mt-4">
-                <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide"><Scissors size={12} className="inline mr-1" />Tela</label>
-                <div className="flex flex-wrap gap-2">
-                  {fabricNames.map((name) => {
-                    const active = selectedFabrics.includes(name);
-                    return (
-                      <button key={name} type="button" onClick={() => toggleFabric(name)}
-                        className={`rounded-full border px-3 py-1.5 text-sm transition-all
-                          ${active ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:border-slate-400"}`}>
-                        {name}
-                      </button>
-                    );
-                  })}
-                </div>
-                <div className="mt-2 flex gap-2">
-                  <input value={newFabric} onChange={(e) => setNewFabric(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addFabric())}
-                    placeholder="Agregar nueva tela…"
-                    className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                  <button type="button" onClick={addFabric}
-                    className="inline-flex items-center gap-1 rounded-lg bg-slate-100 border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200">
-                    <Plus size={14} /> Agregar
-                  </button>
-                </div>
-              </div>
             </SectionCard>
           </div>
         )}
 
         {/* Step 5 — Review */}
         {step === 5 && (
-          <SectionCard icon={ClipboardList} title="5 · Revisar y crear" subtitle="Se crearán los códigos maestros y la orden de producción">
+          <SectionCard icon={ClipboardList} title="5 · Revisar y crear" subtitle={`Se creará${poPlan.length === 1 ? "" : "n"} ${poPlan.length} orden(es) de producción — una por color+estilo repetido`}>
             <div className="rounded-lg bg-slate-900 text-white px-4 py-3 mb-4">
-              <span className="text-[11px] uppercase tracking-widest text-slate-400">N° de orden</span>
-              <p className="font-mono text-lg font-bold">{poNumber || "—"}</p>
+              <span className="text-[11px] uppercase tracking-widest text-slate-400">
+                {poPlan.length === 1 ? "N° de orden" : `${poPlan.length} órdenes de producción`}
+              </span>
+              <div className="mt-1 space-y-1.5">
+                {poPlan.length === 0 ? (
+                  <p className="font-mono text-lg font-bold">—</p>
+                ) : (
+                  poPlan.map((p, i) => (
+                    <div key={i} className="flex items-center justify-between gap-3">
+                      <p className="font-mono text-sm font-bold">
+                        PO {i + 1} <span className="text-slate-400 font-normal">· N° automático</span>
+                      </p>
+                      <span className="text-xs text-slate-300">
+                        <b className="font-mono text-white">{p.colors}</b> · {p.estilos} · {p.pieces.toLocaleString()} pzs
+                        {" · "}
+                        <span className="text-slate-400">
+                          entrega {p.date || "—"}
+                          {" · PO "}{p.customerPos || "—"}
+                          {" · tela "}{p.fabrics || "—"}
+                        </span>
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
               <Info label="Estilo" value={styleBase} />
@@ -595,7 +854,7 @@ export default function NuevaOrdenWizard() {
               <Info label="Estilos cliente" value={[...new Set(cells.map((c) => c.estilo))].join(", ") || "—"} />
               <Info label="Tallas" value={sizes.join(", ") || "—"} />
               <Info label="Colores" value={[...new Set(cells.map((c) => c.color))].join(", ") || "—"} />
-              <Info label="Códigos maestros" value={String(cells.length)} />
+              <Info label="Códigos maestros" value={String(new Set(cells.map((c) => `${c.talla}|${c.color}|${c.estilo}`)).size)} />
               <Info label="Cantidad pedida" value={orderedQty.toLocaleString()} />
               <Info label="SAM" value={sam ? `${sam} min` : "—"} />
               <Info label="Temporada" value={season || "—"} />
@@ -607,8 +866,8 @@ export default function NuevaOrdenWizard() {
               <div className="mt-4">
                 <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide mb-2">Estilo por color</p>
                 <div className="flex flex-wrap gap-2">
-                  {activeColorRows.map((r) => (
-                    <span key={r.color} className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5">
+                  {activeColorRows.map((r, i) => (
+                    <span key={`${r.color}|${r.estilo}|${i}`} className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5">
                       <span className="font-mono text-sm font-bold text-slate-800">{r.color}</span>
                       <span className="text-slate-300">→</span>
                       <span className={`font-mono text-sm font-bold ${(r.estilo || "").length === 6 ? "text-slate-800" : "text-rose-500"}`}>
@@ -650,7 +909,7 @@ export default function NuevaOrdenWizard() {
             <button type="button" onClick={handleCreate} disabled={!canCreate}
               className={`inline-flex items-center gap-2 rounded-lg px-5 py-2 text-sm font-semibold transition-all
                 ${canCreate ? "bg-slate-900 text-white hover:bg-slate-700 shadow-lg" : "bg-slate-200 text-slate-400 cursor-not-allowed"}`}>
-              {saving ? (<><RefreshCw size={16} className="animate-spin" /> Creando…</>) : (<><Plus size={16} /> Crear código maestro y PO</>)}
+              {saving ? (<><RefreshCw size={16} className="animate-spin" /> Creando…</>) : (<><Plus size={16} /> {poPlan.length > 1 ? `Crear ${poPlan.length} órdenes` : "Crear código maestro y PO"}</>)}
             </button>
           )}
         </div>

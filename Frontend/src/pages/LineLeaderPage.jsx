@@ -266,6 +266,9 @@ const calculateRealtimeEfficiency = (finishedGarments, operatorsCount, workingHo
   return Math.round(realtimeEfficiency * 100) / 100;
 };
 
+// Operaciones que cuentan como prenda terminada (empaque)
+const PACKING_KEYWORDS = ['pack', 'emp', 'empaque', 'packing', 'finished', 'terminado'];
+
 export default function LineLeaderPage() {
   const navigate = useNavigate();
 
@@ -275,6 +278,11 @@ export default function LineLeaderPage() {
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
   const [ticket, setTicket] = useState(null);
+  // Cantidad realmente guardada en el ultimo "Guardar produccion"
+  const [lastSavedQty, setLastSavedQty] = useState(null);
+  // Borrador editable de la cantidad que se va a imprimir en el ticket
+  const [qtyDraft, setQtyDraft] = useState("");
+  const [qtyBusy, setQtyBusy] = useState(false);
 
   // Multi-style state
   const [styles, setStyles] = useState([]);
@@ -523,21 +531,19 @@ export default function LineLeaderPage() {
 
     try {
       // First, try to get runs grouped by style_group_id
-      const res = await fetch(
+      const json = await fetchJson(
         `http://localhost:5000/api/multi-style/latest-group?line=${encodeURIComponent(lineNo)}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      const json = await res.json();
 
       if (json.success && json.styles && json.styles.length > 0) {
         // Load complete data for each style
         const stylesData = [];
         for (const style of json.styles) {
-          const runDataRes = await fetch(
+          const runDataJson = await fetchJson(
             `http://localhost:5000/api/get-run-data/${style.run.id}`,
             { headers: { Authorization: `Bearer ${token}` } }
           );
-          const runDataJson = await runDataRes.json();
           
           if (runDataJson.success) {
             stylesData.push({
@@ -575,11 +581,10 @@ export default function LineLeaderPage() {
   async function fetchSingleStyleRuns(lineNo) {
     const token = getToken();
     try {
-      const res = await fetch(
+      const json = await fetchJson(
         `http://localhost:5000/api/lineleader/latest-run?line=${encodeURIComponent(lineNo)}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      const json = await res.json();
       
       if (!json.success) {
         setErrMsg(json.error || "No se encontraron corridas para esta línea");
@@ -587,11 +592,10 @@ export default function LineLeaderPage() {
         return;
       }
       
-      const runDataRes = await fetch(
+      const runDataJson = await fetchJson(
         `http://localhost:5000/api/get-run-data/${json.run.id}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      const runDataJson = await runDataRes.json();
       
       if (runDataJson.success) {
         const stylesData = [{
@@ -654,10 +658,9 @@ export default function LineLeaderPage() {
     if (!token) return;
 
     try {
-      const res = await fetch(`http://localhost:5000/api/lineleader/assignments/${runId}`, {
+      const json = await fetchJson(`http://localhost:5000/api/lineleader/assignments/${runId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const json = await res.json();
       if (json.success) setAssignments(json.assignments);
     } catch (e) {
       console.error("Error fetching assignments:", e);
@@ -783,17 +786,16 @@ export default function LineLeaderPage() {
     return sum;
   }, [sewedInputs]);
 
-  // ========== FINISHED GARMENTS TOTAL ==========
+  // ========== FINISHED GARMENTS TOTAL (incluye lo NO guardado) ==========
   const finishedGarmentsTotal = useMemo(() => {
     let total = 0;
-    const packingKeywords = ['pack', 'emp', 'empaque', 'packing', 'finished', 'terminado'];
-    
+
     for (let i = 0; i < styles.length; i++) {
       const style = styles[i];
       for (const block of style.operations || []) {
         for (const op of block.operations || []) {
           const opName = (op.operation_name || '').toLowerCase();
-          if (packingKeywords.some(keyword => opName.includes(keyword))) {
+          if (PACKING_KEYWORDS.some(keyword => opName.includes(keyword))) {
             const sewedData = sewedInputs[i]?.[op.id] || {};
             for (const qty of Object.values(sewedData)) {
               total += safeNum(qty);
@@ -804,6 +806,62 @@ export default function LineLeaderPage() {
     }
     return total;
   }, [styles, sewedInputs]);
+
+  // ========== SOLO LO GUARDADO (slots bloqueados = ya persistidos) ==========
+  // Se usa como respaldo del ticket cuando se abre sin haber guardado en esta sesion.
+  const savedFinishedTotal = useMemo(() => {
+    let total = 0;
+
+    for (let i = 0; i < styles.length; i++) {
+      const style = styles[i];
+      for (const block of style.operations || []) {
+        for (const op of block.operations || []) {
+          const opName = (op.operation_name || '').toLowerCase();
+          if (!PACKING_KEYWORDS.some(keyword => opName.includes(keyword))) continue;
+
+          const sewedData = sewedInputs[i]?.[op.id] || {};
+          for (const [slotLabel, qty] of Object.entries(sewedData)) {
+            if (lockedSlots[i]?.[`${op.id}-${slotLabel}`]) total += safeNum(qty);
+          }
+        }
+      }
+    }
+    return total;
+  }, [styles, sewedInputs, lockedSlots]);
+
+  // Un fetch que NO revisa res.ok convierte un 404 en "guardado con exito":
+  // res.json() sobre una respuesta de error devuelve un objeto sin `success`,
+  // y el flujo sigue como si todo hubiera salido bien. Este helper obliga a
+  // que cualquier respuesta que no sea 2xx truene con un mensaje util.
+  async function fetchJson(url, options = {}) {
+    const res = await fetch(url, options);
+
+    if (res.status === 401 || res.status === 403) {
+      throw new Error("Tu sesion expiro. Inicia sesion de nuevo.");
+    }
+    if (res.status === 404) {
+      throw new Error(`La ruta ${url} no existe en el servidor (404).`);
+    }
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.error || `El servidor respondio ${res.status}`);
+    }
+
+    // El dev server de Vite responde index.html (200) a cualquier ruta que no
+    // reconoce. Si eso pasa con /api/... es que la peticion nunca llego al
+    // backend: falta el proxy en vite.config.js o la ruta no existe en el
+    // servidor. Sin esta revision el error real se disfraza de "Unexpected
+    // token '<'", que no dice nada sobre la causa.
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      throw new Error(
+        `${url} devolvio HTML en vez de JSON. La peticion no llego al backend: ` +
+        `revisa el proxy de /api en vite.config.js o que la ruta exista en el servidor.`
+      );
+    }
+
+    return res.json();
+  }
 
   // ========== SAVE FUNCTION ==========
   async function handleSave() {
@@ -839,7 +897,7 @@ export default function LineLeaderPage() {
         }
       }
 
-      const res = await fetch(`http://localhost:5000/api/lineleader/update-sewed/${runId}`, {
+      const json = await fetchJson(`http://localhost:5000/api/lineleader/update-sewed/${runId}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -848,11 +906,26 @@ export default function LineLeaderPage() {
         body: JSON.stringify({ entries }),
       });
 
-      const json = await res.json();
       if (!json.success) {
         setErrMsg(json.error || "No se pudieron guardar los datos cosidos.");
         return;
       }
+
+      // Cantidad de ESTE guardado: solo los slots de empaque que aun no estaban
+      // bloqueados (es decir, lo que se acaba de mandar al servidor).
+      const prevLocked = lockedSlots[selectedStyleIndex] || {};
+      let savedQtyNow = 0;
+      for (const block of currentStyle.operations || []) {
+        for (const op of block.operations || []) {
+          const opName = (op.operation_name || "").toLowerCase();
+          if (!PACKING_KEYWORDS.some((k) => opName.includes(k))) continue;
+          for (const s of slots) {
+            if (prevLocked[`${op.id}-${s.slot_label}`]) continue;
+            savedQtyNow += safeNum(sewedInputs[selectedStyleIndex]?.[op.id]?.[s.slot_label]);
+          }
+        }
+      }
+      setLastSavedQty(savedQtyNow);
 
       // Lock saved values
       const newLockedState = { ...lockedSlots };
@@ -876,7 +949,7 @@ export default function LineLeaderPage() {
       setAlarmVisible(false);
       setSaveMsg(`✅ Actualizaciones por hora guardadas para ${currentStyle.run.style}`);
 
-      await openTicket();
+      await openTicket(savedQtyNow);
 
       // Refresh data
       await fetchLatestStyleGroup(user.line_number);
@@ -888,6 +961,8 @@ export default function LineLeaderPage() {
   }
 
   // ========== EXPORT TICKET AS JPEG ==========
+ // ⬇️ ADD THESE THREE FUNCTIONS RIGHT HERE ⬇️
+
   async function downloadTicketImage() {
     const el = document.getElementById("print-ticket");
     if (!el) return;
@@ -917,69 +992,92 @@ export default function LineLeaderPage() {
     }, "image/jpeg", 0.95);
   }
 
-  // ========== EXPORT TICKET AS ZPL ==========
-  function downloadTicketZPL() {
-    const qrData = JSON.stringify({
-      wo: ticket.workOrderNo,
-      style: ticket.style,
-      qty: ticket.qty,
-      runId: ticket.runId,
-      date: ticket.date,
-    });
+  
 
-    const zpl = `
+function downloadTicketZPL() {
+  const qrData = `WO:${ticket.workOrderNo}|RUN:${ticket.runId}`;
+
+  const zpl = `
 ^XA
+^PW812
+^LL609
 ^CI28
-^FO40,30^A0N,40,40^FD${ticket.workOrderNo}^FS
-^FO40,90^A0N,25,25^FDEstilo: ${ticket.style}^FS
-^FO40,125^A0N,25,25^FDLinea: ${ticket.line}^FS
-^FO40,160^A0N,25,25^FDFecha: ${ticket.date}^FS
-^FO40,210^A0N,28,28^FDCANTIDAD PRODUCIDA^FS
-^FO40,250^A0N,90,90^FD${ticket.qty}^FS
-^FO40,360^BQN,2,6
-^FDLA,${qrData}^FS
-^FO40,620^A0N,20,20^FDCorrida #${ticket.runId}^FS
+^MD25
+
+^FO30,30^A0N,44,44^FD${ticket.workOrderNo}^FS
+^FO30,84^GB760,3,3^FS
+
+^FO30,110^A0N,32,32^FDEstilo: ${ticket.style}^FS
+^FO30,152^A0N,32,32^FDLinea: ${ticket.line}^FS
+^FO30,194^A0N,32,32^FDFecha: ${ticket.date}^FS
+
+^FO30,270^A0N,28,28^FDCANTIDAD PRODUCIDA^FS
+^FO30,308^A0N,64,64^FD${ticket.qty}^FS
+^FO30,382^A0N,24,24^FDpiezas^FS
+
+^FO540,110^BQN,2,6
+^FDQA,${qrData}^FS
+^FO540,330^A0N,20,20^FDCorrida #${ticket.runId}^FS
+
 ^XZ
 `.trim();
 
-    const blob = new Blob([zpl], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `ticket_${ticket.runId}.zpl`;
-    link.click();
-    URL.revokeObjectURL(url);
-  }
+  const blob = new Blob([zpl], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `ticket_${ticket.runId}.zpl`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
 
   // ========== TICKET (QR) ==========
-  async function openTicket() {
+  // El QR guarda exactamente la misma cantidad que se ve impresa, asi que hay
+  // que regenerarlo cada vez que se edita la cantidad.
+  async function buildQrDataUrl({ workOrderNo, style, qty, runId, date }) {
+    const qrPayload = JSON.stringify({ wo: workOrderNo, style, qty, runId, date });
+    try {
+      return await QRCode.toDataURL(qrPayload, { margin: 1, width: 300 });
+    } catch (e) {
+      console.error("Error generando QR:", e);
+      return "";
+    }
+  }
+
+  async function openTicket(qtyOverride) {
     if (!currentStyle?.run) return;
 
     const workOrderNo = header.workOrderNo || "—";
     const style = header.style || "—";
-    const qty = finishedGarmentsTotal || 0;
     const runId = currentStyle.run.id;
     const dateStr = header.date ? header.date.split("T")[0] : "";
 
-    // What the QR encodes (scannable for traceability)
-    const qrPayload = JSON.stringify({ wo: workOrderNo, style, qty, runId, date: dateStr });
+    // Solo lo guardado: lo de este guardado si viene, si no lo ya persistido.
+    const qty = safeNum(
+      qtyOverride != null ? qtyOverride : lastSavedQty != null ? lastSavedQty : savedFinishedTotal
+    );
 
-    let qrDataUrl = "";
+    const base = { workOrderNo, style, line: header.line || "—", date: dateStr, qty, runId };
+    const qrDataUrl = await buildQrDataUrl(base);
+
+    setQtyDraft(String(qty));
+    setTicket({ ...base, qrDataUrl });
+  }
+
+  // Aplica la cantidad editada al ticket (solo afecta la impresion, no la BD)
+  async function applyTicketQty() {
+    if (!ticket) return;
+    const qty = Math.max(0, Math.round(safeNum(qtyDraft)));
+
+    setQtyBusy(true);
     try {
-      qrDataUrl = await QRCode.toDataURL(qrPayload, { margin: 1, width: 300 });
-    } catch (e) {
-      console.error("Error generando QR:", e);
+      const next = { ...ticket, qty };
+      next.qrDataUrl = await buildQrDataUrl(next);
+      setTicket(next);
+      setQtyDraft(String(qty));
+    } finally {
+      setQtyBusy(false);
     }
-
-    setTicket({
-      workOrderNo,
-      style,
-      line: header.line || "—",
-      date: dateStr,
-      qty,
-      runId,
-      qrDataUrl,
-    });
   }
 
   // ========== REAL-TIME CALCULATIONS ==========
@@ -1539,7 +1637,7 @@ export default function LineLeaderPage() {
                         )}
                       </button>
                       <button
-                        onClick={openTicket}
+                        onClick={() => openTicket()}
                         disabled={!currentStyle}
                         className="rounded-xl bg-gray-900 text-white px-6 py-3 text-base font-semibold
                                  hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed
@@ -1623,6 +1721,67 @@ export default function LineLeaderPage() {
                     Escanea para verificar · Corrida #{ticket.runId}
                   </div>
                 </div>
+              </div>
+            </div>
+
+            {/* Editar cantidad: fuera de #print-ticket para que no salga en el JPG/impresion */}
+            <div
+              className="no-print"
+              style={{
+                marginTop: 12,
+                background: "#fff",
+                border: "1px solid #d8d8d2",
+                borderRadius: 10,
+                padding: 12,
+              }}
+            >
+              <div style={{ fontSize: 12, color: "#6b6b64", marginBottom: 6 }}>
+                Cantidad a imprimir
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  inputMode="numeric"
+                  value={qtyDraft}
+                  onChange={(e) => setQtyDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") applyTicketQty();
+                  }}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    border: "1px solid #d8d8d2",
+                    borderRadius: 8,
+                    padding: "10px 12px",
+                    fontSize: 18,
+                    fontWeight: 600,
+                    color: "#1a1a18",
+                  }}
+                />
+                <button
+                  onClick={applyTicketQty}
+                  disabled={qtyBusy || String(ticket.qty) === String(safeNum(qtyDraft))}
+                  style={{
+                    background: "#1a1a18",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 8,
+                    padding: "0 16px",
+                    fontSize: 14,
+                    fontWeight: 600,
+                    opacity: qtyBusy || String(ticket.qty) === String(safeNum(qtyDraft)) ? 0.45 : 1,
+                  }}
+                >
+                  {qtyBusy ? "..." : "Aplicar"}
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: "#9a9a92", marginTop: 6 }}>
+                {lastSavedQty != null
+                  ? `Guardado: ${lastSavedQty} piezas`
+                  : `Guardado: ${savedFinishedTotal} piezas`}
+                {" · "}editar solo cambia el ticket, no la produccion
               </div>
             </div>
 

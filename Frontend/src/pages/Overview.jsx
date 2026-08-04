@@ -59,6 +59,14 @@ export default function Overview() {
   const navigate = useNavigate();
   const [user, setUser] = useState(null);
 
+  // ---------- sidebar collapse (persisted) ----------
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem('sidebarCollapsed') === '1'
+  );
+  useEffect(() => {
+    localStorage.setItem('sidebarCollapsed', sidebarCollapsed ? '1' : '0');
+  }, [sidebarCollapsed]);
+
   // ---------- filters ----------
   const today = useMemo(() => new Date(), []);
   const [startDate, setStartDate] = useState(toYMD(addDays(today, -29)));
@@ -241,9 +249,12 @@ export default function Overview() {
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg }}>
-      <NavCeo />
+      <NavCeo collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} />
 
-      <div style={{ color: C.text, fontFamily: 'Inter, system-ui, sans-serif', padding: 16 }}>
+      <div
+        className={`transition-[margin] duration-300 ${sidebarCollapsed ? 'md:ml-16' : 'md:ml-64'}`}
+        style={{ color: C.text, fontFamily: 'Inter, system-ui, sans-serif', padding: 16 }}
+      >
         {/* ── Top filter bar ── */}
         <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', marginBottom: 4, flexWrap: 'wrap' }}>
           <div style={{ background: '#fff', color: '#111', fontWeight: 800, fontStyle: 'italic',

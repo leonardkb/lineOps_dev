@@ -8,6 +8,7 @@ import MasterCodeDetailModal from "../../components/merchant/MasterCodeDetailMod
 import MasterCodeEditModal from "../../components/merchant/MasterCodeEditModal";
 import WorkOrderTable from "../../components/merchant/WorkOrderTable";
 import WorkOrderEditModal from "../../components/merchant/WorkOrderEditModal";
+import MerchantPlanner from "../../components/merchant/MerchantPlanner";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import MerchantNavbar from "../../components/merchant/MerchantNavbar";
 
@@ -52,7 +53,7 @@ const DEMO_ORDERS = [
 ];
 
 export default function MerchantDashboard() {
-  const [tab, setTab] = useState("master"); // "master" | "po"
+  const [tab, setTab] = useState("master"); // "master" | "po" | "plan"
 
   const [records, setRecords] = useState([]);
   const [orders, setOrders] = useState([]);
@@ -288,6 +289,7 @@ export default function MerchantDashboard() {
         <div className="flex gap-2">
           <TabButton id="master" label="Códigos maestros" count={records.length} />
           <TabButton id="po" label="Órdenes de producción" count={orders.length} />
+          <TabButton id="plan" label="Planeación" count={orders.length} />
         </div>
 
         {/* ---------------- MASTER CODES ---------------- */}
@@ -375,6 +377,16 @@ export default function MerchantDashboard() {
               {apiOnline && ` · Conectado a ${API_URL}`}
             </p>
           </>
+        )}
+
+        {/* ---------------- PLANNING BOARD ---------------- */}
+        {tab === "plan" && (
+          <MerchantPlanner
+            orders={orders}
+            loading={ordersLoading}
+            apiOnline={apiOnline}
+            onRefresh={fetchOrders}
+          />
         )}
       </main>
 

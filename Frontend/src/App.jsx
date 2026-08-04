@@ -19,6 +19,8 @@ import MerchantPage from "./pages/merchant/MerchantPage";
 import WorkOrderForm from "./components/merchant/WorkOrderForm";
 import NuevaOrdenWizard from "./components/merchant/NuevaOrdenWizard";
 import CuttingApp from "./pages/Corte/CuttingApp";
+import FinishedWarehouse from "./pages/FWHS/FinishedWarehouse";
+import AdminUsers from "./pages/AdminUsers";
 export default function App() {
   return (
     <Router>
@@ -43,6 +45,8 @@ export default function App() {
         <Route path="/work-order-form" element={<WorkOrderForm />} /> {/*work order form route */}
         <Route path="/nuevo-orden-wizard"  element={<NuevaOrdenWizard/>} /> {/*new work order wizard route */}
         <Route path="/cutting" element={<CuttingApp />} /> {/*cutting app route */}
+        <Route path="/users" element={<AdminUsers />} /> {/*users route */}
+        <Route path="/fws" element={<FinishedWarehouse />} /> {/*finished warehouse route */}
       </Routes>
     </Router>
   );

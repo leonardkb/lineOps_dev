@@ -1,9 +1,10 @@
 // components/planner/PlanBoard.jsx
 import { useState, useEffect, useMemo } from "react";
-import { format, addDays, differenceInDays, startOfWeek, endOfWeek, eachDayOfInterval, isSameDay, startOfMonth, endOfMonth, startOfYear, addMonths, eachWeekOfInterval, eachMonthOfInterval } from "date-fns";
+import { format, addDays, differenceInDays, startOfWeek, endOfWeek, eachDayOfInterval, isSameDay, startOfMonth, endOfMonth, startOfYear, addMonths, eachWeekOfInterval, eachMonthOfInterval, getWeek } from "date-fns";
+import { es } from "date-fns/locale";
 import { ChevronLeft, ChevronRight, Package, GripVertical, Loader2, Check, AlertCircle } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
-import { colorForWO } from "../../lib/workOrderColors";
+import { colorForWO, WO_PALETTE } from "../../lib/workOrderColors";
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
@@ -39,6 +40,24 @@ export default function PlanBoard() {
   const [showPool, setShowPool] = useState(true);
   const [editLine, setEditLine] = useState(null); // { lineNo, operators, run }
   const [savingOps, setSavingOps] = useState(false);
+
+  // User-chosen block colors (per work-order+color key), persisted per browser.
+  const [colorOverrides, setColorOverrides] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("planboard_color_overrides") || "{}"); } catch { return {}; }
+  });
+  const blockColor = (key) => {
+    const idx = colorOverrides[key];
+    return idx != null && WO_PALETTE[idx] ? WO_PALETTE[idx] : colorForWO(key);
+  };
+  const setBlockColor = (key, idx) => {
+    setColorOverrides((prev) => {
+      const next = { ...prev };
+      if (idx == null) delete next[key];
+      else next[key] = idx;
+      try { localStorage.setItem("planboard_color_overrides", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
   const [aggModal, setAggModal] = useState(null); // { lineNo, label, orders, total }
 
   // The PO currently ready to place (drag takes priority over tap).
@@ -88,39 +107,122 @@ export default function PlanBoard() {
       return da - db;
     });
 
-  const getDateRange = () => {
-    if (viewMode === "day") return [currentDate];
-    if (viewMode === "week") {
-      return eachDayOfInterval({
-        start: startOfWeek(currentDate, { weekStartsOn: 1 }),
-        end: endOfWeek(currentDate, { weekStartsOn: 1 }),
+  // Color key so each work-order + color gets its own color and is tracked apart.
+  const keyOf = (woId, color) => `${woId}:${color || ""}`;
+
+  // Pieces already assigned for a given work order + color (active only).
+  const assignedForColor = (woId, color) =>
+    assignments
+      .filter(
+        (a) =>
+          a.work_order_id === woId &&
+          String(a.color || "") === String(color || "") &&
+          !["cancelled", "rejected"].includes(a.status)
+      )
+      .reduce((s, a) => s + (parseFloat(a.assigned_quantity) || 0), 0);
+
+  // The pool: one draggable "job" per work order + color, with remaining qty
+  // and (when available) the size breakdown for that color.
+  const poolJobs = useMemo(() => {
+    const mkJob = (wo, color, colorQty, sizes, estilo, customerPo) => ({
+      key: keyOf(wo.id, color),
+      workOrderId: wo.id,
+      work_order_no: wo.work_order_no,
+      customer_po: customerPo || wo.customer_po || "",
+      color: color || null,
+      remaining: Math.max(colorQty - assignedForColor(wo.id, color), 0),
+      sizes: sizes || [],
+      estilo: estilo || wo.estilo || wo.style_code || "",
+      customer_name: wo.customer_name,
+      style_code: wo.style_code,
+      sam_minutes: wo.sam_minutes,
+      commitment_date: wo.commitment_date,
+    });
+
+    // Group work_order_lines by color → { color, qty, sizes, estilos, customerPos }.
+    const groupsFromLines = (lines) => {
+      const byColor = new Map();
+      lines.forEach((l) => {
+        if (!l || l.color == null) return;
+        const cur = byColor.get(l.color) || { color: l.color, qty: 0, sizeMap: new Map(), estilos: new Set(), pos: new Set() };
+        const q = Number(l.quantity) || 0;
+        cur.qty += q;
+        if (l.talla) cur.sizeMap.set(l.talla, (cur.sizeMap.get(l.talla) || 0) + q);
+        if (l.estilo) cur.estilos.add(l.estilo);
+        if (l.customerPo) cur.pos.add(l.customerPo);
+        byColor.set(l.color, cur);
       });
+      return [...byColor.values()].map((c) => ({
+        color: c.color,
+        qty: c.qty,
+        sizes: [...c.sizeMap.entries()].map(([talla, quantity]) => ({ talla, quantity })),
+        estilo: [...c.estilos].join(", "),
+        customerPo: [...c.pos].join(", "),
+      }));
+    };
+
+    const jobs = [];
+    workOrders.forEach((wo) => {
+      if (["completed", "cancelled"].includes(wo.status)) return;
+      const lines = Array.isArray(wo.lines) ? wo.lines : [];
+      const colors = Array.isArray(wo.colors) ? wo.colors.filter((c) => c && c.color != null) : [];
+
+      if (lines.length > 0) {
+        groupsFromLines(lines).forEach((g) => {
+          const job = mkJob(wo, g.color, g.qty, g.sizes, g.estilo, g.customerPo);
+          if (job.remaining > 0) jobs.push(job);
+        });
+      } else if (colors.length > 0) {
+        colors.forEach((c) => {
+          const job = mkJob(wo, c.color, Number(c.quantity) || 0, [], wo.estilo, wo.customer_po);
+          if (job.remaining > 0) jobs.push(job);
+        });
+      } else {
+        const job = mkJob(wo, wo.color || null, targetOf(wo), [], wo.estilo, wo.customer_po);
+        if (job.remaining > 0) jobs.push(job);
+      }
+    });
+
+    return jobs.sort((a, b) => {
+      const da = a.commitment_date ? new Date(a.commitment_date).getTime() : Infinity;
+      const db = b.commitment_date ? new Date(b.commitment_date).getTime() : Infinity;
+      if (da !== db) return da - db;
+      const c = String(a.work_order_no).localeCompare(String(b.work_order_no));
+      return c !== 0 ? c : String(a.color || "").localeCompare(String(b.color || ""));
+    });
+  }, [workOrders, assignments]);
+
+  const getDateRange = () => {
+    // Daily view: individual days up to ~6 months ahead (scroll right for more).
+    if (viewMode === "day") {
+      return eachDayOfInterval({ start: currentDate, end: addDays(currentDate, 182) });
     }
-    const start = startOfWeek(currentDate, { weekStartsOn: 1 });
-    return eachDayOfInterval({ start, end: addDays(start, 34) });
+    // week/month are aggregated (handled by `periods`), no day range needed.
+    return [];
   };
   const dateRange = getDateRange();
 
-  const aggregated = viewMode === "month" || viewMode === "year";
+  const aggregated = viewMode === "week" || viewMode === "month" || viewMode === "year";
   const MES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
 
-  // Aggregated columns: month → weekly blocks of the month; year → 12 monthly blocks.
+  // Aggregated columns: week → weekly blocks of the current month; month → 12 monthly blocks of the year.
   const periods = useMemo(() => {
-    if (viewMode === "month") {
-      const s = startOfMonth(currentDate);
-      const e = endOfMonth(currentDate);
-      return eachWeekOfInterval({ start: s, end: e }, { weekStartsOn: 1 }).map((wStart) => {
+    if (viewMode === "week") {
+      // 26 rolling weeks from the current week; scroll right for future weeks.
+      const first = startOfWeek(currentDate, { weekStartsOn: 1 });
+      return Array.from({ length: 26 }, (_, i) => {
+        const wStart = addDays(first, i * 7);
         const wEnd = addDays(wStart, 6);
         return {
           key: format(wStart, "yyyy-MM-dd"),
-          top: "Sem",
+          top: `Sem ${getWeek(wStart, { weekStartsOn: 1 })}`,
           bottom: format(wStart, "dd/MM"),
           start: format(wStart, "yyyy-MM-dd"),
           end: format(wEnd, "yyyy-MM-dd"),
         };
       });
     }
-    if (viewMode === "year") {
+    if (viewMode === "month") {
       const s = startOfYear(currentDate);
       return eachMonthOfInterval({ start: s, end: endOfMonth(addMonths(s, 11)) }).map((mStart) => ({
         key: format(mStart, "yyyy-MM"),
@@ -129,6 +231,19 @@ export default function PlanBoard() {
         start: format(startOfMonth(mStart), "yyyy-MM-dd"),
         end: format(endOfMonth(mStart), "yyyy-MM-dd"),
       }));
+    }
+    if (viewMode === "year") {
+      const y0 = currentDate.getFullYear();
+      return Array.from({ length: 6 }, (_, i) => {
+        const y = y0 + i;
+        return {
+          key: String(y),
+          top: "Año",
+          bottom: String(y),
+          start: `${y}-01-01`,
+          end: `${y}-12-31`,
+        };
+      });
     }
     return [];
   }, [viewMode, currentDate]);
@@ -148,9 +263,10 @@ export default function PlanBoard() {
     rows.forEach((a) => {
       const q = parseFloat(a.assigned_quantity) || 0;
       total += q;
-      const cur = orders.get(a.work_order_id) || { id: a.work_order_id, no: woNo(a), qty: 0 };
+      const k = keyOf(a.work_order_id, a.color);
+      const cur = orders.get(k) || { id: k, no: `${woNo(a)}${a.color ? " · " + a.color : ""}`, qty: 0 };
       cur.qty += q;
-      orders.set(a.work_order_id, cur);
+      orders.set(k, cur);
     });
     return { total, orders: [...orders.values()] };
   };
@@ -171,13 +287,19 @@ export default function PlanBoard() {
   };
 
   // Each assignment is one day (one assigned_date), matched by calendar day.
-  const getAssignmentForLineAndDate = (lineNo, date) => {
+  const cellMatches = (a, lineNo, key) => {
+    if (String(a.line_no) !== String(lineNo)) return false;
+    if (a.assigned_date) return ymd(a.assigned_date) === key;
+    return ymd(a.planned_start_date) <= key && key <= ymd(a.planned_end_date);
+  };
+  const getAssignmentForLineAndDate = (lineNo, date) =>
+    assignments.find((a) => cellMatches(a, lineNo, format(date, "yyyy-MM-dd")));
+  // All POs sharing a line-day (a cell can now hold several, packed to capacity).
+  const getAssignmentsForLineAndDate = (lineNo, date) => {
     const key = format(date, "yyyy-MM-dd");
-    return assignments.find((a) => {
-      if (String(a.line_no) !== String(lineNo)) return false;
-      if (a.assigned_date) return ymd(a.assigned_date) === key;
-      return ymd(a.planned_start_date) <= key && key <= ymd(a.planned_end_date);
-    });
+    return assignments
+      .filter((a) => cellMatches(a, lineNo, key) && !["cancelled", "rejected"].includes(a.status))
+      .sort((x, y) => (parseFloat(y.assigned_quantity) || 0) - (parseFloat(x.assigned_quantity) || 0));
   };
 
   const getDaysRemaining = (assignment) => {
@@ -202,10 +324,10 @@ export default function PlanBoard() {
   const woStyle = (a) => a.style_description || woOf(a.work_order_id)?.style_description || "";
 
   const step = (dir) => {
-    if (viewMode === "day") return setCurrentDate(addDays(currentDate, dir));
-    if (viewMode === "week") return setCurrentDate(addDays(currentDate, dir * 7));
-    if (viewMode === "month") return setCurrentDate(addMonths(currentDate, dir));
-    return setCurrentDate(addMonths(currentDate, dir * 12)); // year
+    if (viewMode === "day") return setCurrentDate(addDays(currentDate, dir * 7));
+    if (viewMode === "week") return setCurrentDate(addDays(currentDate, dir * 28));
+    if (viewMode === "month") return setCurrentDate(addMonths(currentDate, dir * 12)); // whole year
+    return setCurrentDate(addMonths(currentDate, dir * 12 * 6)); // year view = 6-year window
   };
   const goPrevious = () => step(-1);
   const goNext = () => step(1);
@@ -270,7 +392,6 @@ export default function PlanBoard() {
     }
   };
 
-  // Authoritative daily availability for a line on a date, straight from the
   // backend (same numbers the server validates against — avoids 400s).
   const fetchAvailableForDate = async (dateStr) => {
     const r = await fetch(`${API_URL}/api/planning/available-lines?date=${dateStr}`, { headers: authHeaders() });
@@ -280,15 +401,17 @@ export default function PlanBoard() {
 
   // ---- DROP: fill the line day by day, carrying the remainder forward ----
   const assignPOAcrossDays = async (po, lineNo, startDate) => {
-    let remaining = remainingOf(po);
+    let remaining = po.remaining != null ? po.remaining : remainingOf(po);
     if (remaining <= 0) return showToast("Esta PO ya está totalmente asignada.", true);
+    const label = `${po.work_order_no}${po.color ? " " + po.color : ""}`;
 
     setDropBusy(true);
     let day = new Date(startDate);
     let created = 0, assignedTotal = 0;
     let daysScanned = 0, failures = 0;
-    const MAX_DAYS = 90;         // don't scan forever
-    const MAX_FAILURES = 3;      // stop hammering if the server keeps rejecting
+    let skippedNoCap = 0, skippedFull = 0;
+    const MAX_DAYS = 180;        // scan up to ~6 months (matches the day-view horizon)
+    const MAX_FAILURES = 3;      // stop only on real server errors, not skipped days
     const errors = [];
     const capCache = {};         // dateStr -> lines[] (fetched once per day)
 
@@ -297,30 +420,33 @@ export default function PlanBoard() {
         daysScanned++;
         const dateStr = format(day, "yyyy-MM-dd");
 
+        // A day may already carry other POs; available_capacity is the line's
+        // daily target minus everything already assigned, so packing here just
+        // fills whatever room is left before spilling to the next day.
         if (!capCache[dateStr]) capCache[dateStr] = await fetchAvailableForDate(dateStr);
         const lineInfo = capCache[dateStr].find((l) => String(l.line_no) === String(lineNo));
 
-        // No capacity configured for this line/date at all.
+        // No capacity configured for this line/date → skip the day (not a failure).
         if (!lineInfo) {
-          failures++;
-          errors.push(`Sin configuración de capacidad para la línea ${lineNo} el ${dateStr}`);
+          skippedNoCap++;
           day = addDays(day, 1);
           continue;
         }
 
         const available = Math.floor(Number(lineInfo.available_capacity) || 0);
-        if (available <= 0) { day = addDays(day, 1); continue; } // day full → next day
+        if (available <= 0) { skippedFull++; day = addDays(day, 1); continue; } // day full → next day
 
         const qty = Math.min(remaining, available);
         const res = await fetch(`${API_URL}/api/line-assignments`, {
           method: "POST",
           headers: authHeaders(),
           body: JSON.stringify({
-            workOrderId: po.id,
+            workOrderId: po.workOrderId != null ? po.workOrderId : po.id,
             lineNo: lineInfo.line_no,           // exact value the backend expects
             assignedDate: dateStr,
             quantity: qty,
             plannedStartDate: dateStr,
+            color: po.color || null,
           }),
         });
         const data = await res.json();
@@ -340,12 +466,18 @@ export default function PlanBoard() {
 
       await fetchData();
 
+      // Reason the split couldn't finish, when something is still pending.
+      const shortfallReason = errors[0]
+        || (created === 0 && skippedNoCap > 0 && skippedFull === 0
+              ? `La línea ${lineNo} no tiene capacidad configurada en el horizonte.`
+              : "No hay más días con capacidad disponible en el horizonte.");
+
       if (created > 0 && remaining <= 0) {
-        showToast(`✅ ${po.work_order_no}: ${Math.round(assignedTotal).toLocaleString()} pzas en ${created} día(s).`);
+        showToast(`✅ ${label}: ${Math.round(assignedTotal).toLocaleString()} pzas repartidas en ${created} celda(s).`);
       } else if (created > 0) {
-        showToast(`⚠️ ${po.work_order_no}: asignadas ${Math.round(assignedTotal).toLocaleString()} pzas; faltan ${Math.round(remaining).toLocaleString()}. ${errors[0] || "Sin capacidad disponible en las próximas fechas."}`, true);
+        showToast(`⚠️ ${label}: asignadas ${Math.round(assignedTotal).toLocaleString()} pzas en ${created} celda(s); faltan ${Math.round(remaining).toLocaleString()}. ${shortfallReason}`, true);
       } else {
-        showToast(`No se pudo asignar ${po.work_order_no}. ${errors[0] || ""}`, true);
+        showToast(`No se pudo asignar ${label}. ${shortfallReason}`, true);
       }
     } catch (err) {
       showToast(`Error al asignar: ${err.message}`, true);
@@ -371,10 +503,10 @@ export default function PlanBoard() {
       return;
     }
 
-    // Placing a new PO from the pool.
+    // Placing a new PO from the pool. A cell may already hold other POs; the
+    // walk packs into each day's remaining capacity before spilling forward.
     const po = draggedPO || armedPO;
     if (!po) return;
-    if (getAssignmentForLineAndDate(lineNo, date)) return showToast("Ese día ya está ocupado. Elija un día libre.", true);
     assignPOAcrossDays(po, lineNo, date);
   };
 
@@ -403,9 +535,9 @@ export default function PlanBoard() {
     }
   };
 
-  // Click on a cell: open details if occupied, or place the armed PO if free.
-  const handleCellClick = (lineNo, date, assignment) => {
-    if (assignment) return setSelectedAssignment(assignment);
+  // Tap a cell: if a PO is armed, pack it here (into any remaining capacity);
+  // otherwise do nothing — individual blocks open their own detail on click.
+  const handleCellClick = (lineNo, date) => {
     if (armedPO && !dropBusy) assignPOAcrossDays(armedPO, lineNo, date);
   };
 
@@ -460,7 +592,7 @@ export default function PlanBoard() {
               {["day", "week", "month", "year"].map((m) => (
                 <button key={m} onClick={() => setViewMode(m)}
                   className={`px-3 py-1.5 text-sm rounded-md transition ${viewMode === m ? "bg-white shadow-sm text-gray-900" : "text-gray-600 hover:text-gray-800"}`}>
-                  {m === "day" ? "Día" : m === "week" ? "Semana" : m === "month" ? "Mes" : "Año"}
+                  {m === "day" ? "Diario" : m === "week" ? "Semanal" : m === "month" ? "Mensual" : "Año"}
                 </button>
               ))}
             </div>
@@ -472,53 +604,70 @@ export default function PlanBoard() {
           </div>
         </div>
         <div className="mt-3 text-sm text-gray-500">
-          {viewMode === "day" && format(currentDate, "EEEE, d MMMM yyyy")}
-          {viewMode === "week" && `${format(dateRange[0], "d MMM")} - ${format(dateRange[dateRange.length - 1], "d MMM yyyy")}`}
-          {viewMode === "month" && format(currentDate, "MMMM yyyy")}
-          {viewMode === "year" && format(currentDate, "yyyy")}
+          {viewMode === "day" && dateRange.length > 0 && `${format(dateRange[0], "d MMM", { locale: es })} – ${format(dateRange[dateRange.length - 1], "d MMM yyyy", { locale: es })}`}
+          {viewMode === "week" && periods.length > 0 && `${format(new Date(`${periods[0].start}T00:00:00`), "d MMM")} – ${format(new Date(`${periods[periods.length - 1].end}T00:00:00`), "d MMM yyyy")}`}
+          {viewMode === "month" && format(currentDate, "yyyy")}
+          {viewMode === "year" && periods.length > 0 && `${periods[0].bottom} – ${periods[periods.length - 1].bottom}`}
         </div>
       </div>
 
-      {/* Unassigned PO pool */}
+      {/* Unassigned PO pool — assigning/dragging only in Diario */}
+      {viewMode === "day" && (
       <div className="border-b bg-amber-50/60">
         <button onClick={() => setShowPool((v) => !v)} className="w-full flex items-center justify-between px-5 py-2.5 text-left">
           <span className="flex items-center gap-2 text-sm font-semibold text-gray-800">
-            <Package className="w-4 h-4 text-amber-600" /> Órdenes por asignar ({unassignedPOs.length})
+            <Package className="w-4 h-4 text-amber-600" /> Órdenes por asignar ({poolJobs.length})
           </span>
           <span className="text-xs text-gray-500">{showPool ? "Ocultar" : "Mostrar"}</span>
         </button>
         {showPool && (
           <div className="px-5 pb-3">
-            {unassignedPOs.length === 0 ? (
+            {poolJobs.length === 0 ? (
               <p className="text-sm text-gray-500 py-1">No hay órdenes pendientes.</p>
             ) : (
               <div className="flex gap-2 overflow-x-auto pb-1">
-                {unassignedPOs.map((po) => {
-                  const isActive = activePO?.id === po.id;
+                {poolJobs.map((job) => {
+                  const isActive = activePO?.key === job.key;
                   return (
-                    <div key={po.id} draggable={!dropBusy}
+                    <div key={job.key} draggable={!dropBusy}
                       onDragStart={(e) => {
                         // Required for the drag to actually start in Firefox / some browsers.
                         e.dataTransfer.effectAllowed = "move";
-                        e.dataTransfer.setData("text/plain", String(po.id));
+                        e.dataTransfer.setData("text/plain", job.key);
                         setArmedPO(null);      // dragging supersedes a tapped selection
-                        setDraggedPO(po);
+                        setDraggedPO(job);
                       }}
                       onDragEnd={() => { setDraggedPO(null); setDropTarget(null); }}
-                      onClick={() => setArmedPO((cur) => (cur?.id === po.id ? null : po))}
+                      onClick={() => setArmedPO((cur) => (cur?.key === job.key ? null : job))}
                       title="Arrástrela a una línea, o tóquela y luego toque una casilla libre"
-                      className={`shrink-0 w-52 rounded-xl border bg-white p-2.5 cursor-grab active:cursor-grabbing shadow-sm hover:shadow transition ${isActive ? "ring-2 ring-amber-500 border-amber-400" : "border-gray-200"}`}>
+                      className={`shrink-0 w-64 rounded-xl border bg-white p-2.5 cursor-grab active:cursor-grabbing shadow-sm hover:shadow transition ${isActive ? "ring-2 ring-amber-500 border-amber-400" : "border-gray-200"}`}>
                       <div className="flex items-start gap-2">
                         <GripVertical className="w-4 h-4 text-gray-300 mt-0.5 shrink-0" />
                         <div className="min-w-0 flex-1">
                           <p className="font-mono text-sm font-bold text-gray-900 truncate flex items-center gap-1.5">
-                            <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${colorForWO(po.id).dot}`} />
-                            {po.work_order_no}
+                            <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${blockColor(job.key).dot}`} />
+                            {job.work_order_no}
+                            {job.color && (
+                              <span className="ml-auto text-[11px] rounded-full bg-gray-100 text-gray-700 px-2 py-0.5">{job.color}</span>
+                            )}
                           </p>
-                          <p className="text-xs text-gray-500 truncate">{po.customer_name} · {po.style_code || po.estilo || "—"}</p>
-                          <div className="mt-1 flex items-center justify-between text-xs">
-                            <span className="font-medium text-amber-700">{Math.round(remainingOf(po)).toLocaleString()} pzas</span>
-                            {po.commitment_date && <span className="text-gray-400">{format(new Date(po.commitment_date), "dd/MM")}</span>}
+                          <div className="mt-1 text-[11px] leading-tight text-gray-600 space-y-0.5">
+                            <p className="truncate"><span className="text-gray-400">Cliente:</span> {job.customer_name || "—"}</p>
+                            {job.customer_po && <p className="truncate"><span className="text-gray-400">PO cliente:</span> {job.customer_po}</p>}
+                            <p className="truncate"><span className="text-gray-400">Estilo:</span> {job.estilo || "—"}</p>
+                          </div>
+                          {job.sizes && job.sizes.length > 0 && (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {job.sizes.map((s) => (
+                                <span key={s.talla} className="text-[10px] rounded bg-blue-50 text-blue-700 px-1.5 py-0.5">
+                                  {s.talla}: {Math.round(s.quantity).toLocaleString()}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <div className="mt-1.5 flex items-center justify-between text-xs">
+                            <span className="font-medium text-amber-700">{Math.round(job.remaining).toLocaleString()} pzas</span>
+                            {job.commitment_date && <span className="text-gray-400">{format(new Date(job.commitment_date), "dd/MM")}</span>}
                           </div>
                         </div>
                       </div>
@@ -530,12 +679,13 @@ export default function PlanBoard() {
           </div>
         )}
       </div>
+      )}
 
       {/* Armed-PO hint */}
       {armedPO && !dropBusy && (
         <div className="px-5 py-2 bg-amber-100 border-b border-amber-200 text-sm text-amber-800 flex items-center justify-between gap-3">
           <span className="truncate">
-            <b className="font-mono">{armedPO.work_order_no}</b> lista para asignar — toque una casilla libre (o arrástrela). <span className="text-amber-600">Esc para cancelar.</span>
+            <b className="font-mono">{armedPO.work_order_no}{armedPO.color ? ` · ${armedPO.color}` : ""}</b> lista para asignar — toque una casilla libre (o arrástrela). <span className="text-amber-600">Esc para cancelar.</span>
           </span>
           <button onClick={() => setArmedPO(null)} className="shrink-0 text-amber-700 hover:text-amber-900 underline">
             Cancelar
@@ -549,9 +699,10 @@ export default function PlanBoard() {
         assignments
           .filter((a) => !["cancelled", "rejected"].includes(a.status))
           .forEach((a) => {
-            const cur = byOrder.get(a.work_order_id) || { id: a.work_order_id, no: woNo(a), qty: 0 };
+            const k = keyOf(a.work_order_id, a.color);
+            const cur = byOrder.get(k) || { key: k, no: woNo(a), color: a.color || null, qty: 0 };
             cur.qty += parseFloat(a.assigned_quantity) || 0;
-            byOrder.set(a.work_order_id, cur);
+            byOrder.set(k, cur);
           });
         const orders = [...byOrder.values()];
         if (orders.length === 0) return null;
@@ -561,11 +712,11 @@ export default function PlanBoard() {
               <span className="text-sm font-semibold text-gray-800 mr-1">Órdenes asignadas:</span>
               {orders.map((o) => (
                 <span
-                  key={o.id}
+                  key={o.key}
                   className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-gray-50 pl-1.5 pr-2 py-0.5 text-xs"
                 >
-                  <span className={`w-2.5 h-2.5 rounded-full ${colorForWO(o.id).dot}`} />
-                  <span className="font-mono font-medium text-gray-800">{o.no}</span>
+                  <span className={`w-2.5 h-2.5 rounded-full ${blockColor(o.key).dot}`} />
+                  <span className="font-mono font-medium text-gray-800">{o.no}{o.color ? ` · ${o.color}` : ""}</span>
                   <span className="text-gray-500">{Math.round(o.qty).toLocaleString()} pzas</span>
                 </span>
               ))}
@@ -575,7 +726,7 @@ export default function PlanBoard() {
       })()}
 
       {/* Compact square grid */}
-      <div className="p-5 overflow-x-auto relative">
+      <div className="px-5 pb-4 overflow-auto relative" style={{ maxHeight: "72vh" }}>
         {dropBusy && (
           <div className="absolute inset-0 z-40 bg-white/60 flex items-center justify-center">
             <div className="flex items-center gap-2 text-gray-700 text-sm bg-white border rounded-lg px-4 py-2 shadow">
@@ -587,15 +738,18 @@ export default function PlanBoard() {
         {!aggregated && (
         <div className="inline-block">
           {/* Day header row */}
-          <div className="grid items-end" style={{ gridTemplateColumns: gridCols, gap: GAP, marginBottom: GAP }}>
-            <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Línea</div>
+          <div className="grid items-end sticky top-0 z-20 bg-white" style={{ gridTemplateColumns: gridCols, gap: GAP, paddingBottom: GAP }}>
+            <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide sticky left-0 z-30 bg-white pr-2 self-stretch flex items-end border-r border-gray-200 shadow-[6px_0_0_0_#ffffff,4px_0_6px_-3px_rgba(0,0,0,0.18)]">Línea</div>
             {dateRange.map((date, idx) => {
               const isToday = isSameDay(date, new Date());
               const isWeekend = date.getDay() === 0 || date.getDay() === 6;
               return (
-                <div key={idx} className={`text-center leading-tight ${isWeekend ? "text-gray-300" : "text-gray-500"}`} style={{ width: CELL }}>
-                  <div className="text-[9px] uppercase">{format(date, "EEEEE")}</div>
-                  <div className={`text-[10px] font-semibold ${isToday ? "text-blue-600" : "text-gray-700"}`}>{format(date, "d")}</div>
+                <div key={idx} className={`relative text-center leading-tight ${date.getDate() === 1 ? "border-l border-gray-300" : ""} ${isWeekend ? "text-gray-400" : "text-gray-500"}`} style={{ width: CELL }}>
+                  {(idx === 0 || date.getDate() === 1) && (
+                    <div className="text-[8px] font-bold uppercase tracking-wide text-indigo-500 leading-none">{format(date, "MMM", { locale: es })}</div>
+                  )}
+                  <div className="text-[9px] uppercase leading-none mb-0.5">{format(date, "EEEEE", { locale: es })}</div>
+                  <div className={`text-[11px] font-semibold mx-auto ${isToday ? "text-white bg-blue-600 rounded-full w-[18px] h-[18px] flex items-center justify-center" : "text-gray-700"}`}>{format(date, "d")}</div>
                 </div>
               );
             })}
@@ -610,63 +764,83 @@ export default function PlanBoard() {
                 {/* Line label — click to edit sewers (operators) */}
                 <button
                   onClick={() => openOperatorsEditor(lineNo)}
-                  className="pr-1 text-left rounded-md hover:bg-gray-100 transition"
+                  className="pr-2 text-left rounded-md hover:bg-gray-100 transition sticky left-0 z-10 bg-white border-r border-gray-200 shadow-[6px_0_0_0_#ffffff,4px_0_6px_-3px_rgba(0,0,0,0.10)]"
                   title={`Línea ${lineNo} · ${latestRunForLine(lineNo)?.operators_count ?? 0} operarios · ${latestTargetForLine(lineNo).toLocaleString()} pzas/día — clic para cambiar operarios`}
                 >
-                  <div className="text-xs font-semibold text-gray-800 leading-none">L{lineNo}</div>
+                  <div className="text-sm font-bold text-gray-800 leading-none">L{lineNo}</div>
                   <div className="text-[9px] text-gray-400 leading-none mt-0.5">
                     👤{latestRunForLine(lineNo)?.operators_count ?? 0} · {latestTargetForLine(lineNo) ? `${latestTargetForLine(lineNo).toLocaleString()}` : "—"}
                   </div>
                 </button>
 
-                {/* Day squares */}
+                {/* Day squares — one line-day can now stack several POs, each
+                    slice sized by its share of that day's assigned pieces. */}
                 {dateRange.map((date, idx) => {
-                  const assignment = getAssignmentForLineAndDate(lineNo, date);
+                  const cellAssignments = getAssignmentsForLineAndDate(lineNo, date);
+                  const hasAny = cellAssignments.length > 0;
                   const isToday = isSameDay(date, new Date());
                   const isWeekend = date.getDay() === 0 || date.getDay() === 6;
                   const dateKey = `${lineNo}|${format(date, "yyyy-MM-dd")}`;
                   const moving = draggedAssignment != null;
-                  const isDropHover = dropTarget === dateKey && (activePO || moving) && !assignment;
-                  const canDrop = (activePO || moving) && !assignment;
-                  const isBeingMoved = moving && draggedAssignment.id === assignment?.id;
-                  const isStart = assignment && ymd(assignment.planned_start_date) === format(date, "yyyy-MM-dd");
+                  // A move needs an empty target; a pool PO can pack into any cell.
+                  const canDrop = moving ? !hasAny : !!activePO;
+                  const isDropHover = dropTarget === dateKey && canDrop;
+                  const dayStr = format(date, "yyyy-MM-dd");
+                  const totalQty = cellAssignments.reduce((s, a) => s + (parseFloat(a.assigned_quantity) || 0), 0);
 
-                  let cls;
-                  if (assignment) {
-                    const c = colorForWO(assignment.work_order_id);
-                    const overdue = isOverdue(assignment) ? "ring-2 ring-red-600" : "";
-                    const done = assignment.status === "completed" ? "opacity-60" : "";
-                    const dim = isBeingMoved ? "opacity-40" : "";
-                    cls = `${c.bg} ${c.border} border cursor-grab active:cursor-grabbing ${overdue} ${done} ${dim}`;
-                  } else {
-                    cls = `border ${isToday ? "border-blue-200 bg-blue-50" : isWeekend ? "border-gray-100 bg-gray-50" : "border-gray-200 bg-gray-100"}`;
-                  }
+                  const emptyCls = `border ${date.getDate() === 1 ? "border-l-2 border-l-gray-300 " : ""}${isToday ? "border-blue-300 bg-blue-50 ring-1 ring-inset ring-blue-200" : isWeekend ? "border-gray-100 bg-gray-50/60" : "border-gray-200/80 bg-gray-50"}`;
 
                   return (
                     <div
                       key={idx}
-                      draggable={!!assignment && !dropBusy}
-                      onDragStart={(e) => {
-                        if (!assignment) return;
-                        e.dataTransfer.effectAllowed = "move";
-                        e.dataTransfer.setData("text/plain", String(assignment.id));
-                        setDraggedPO(null);
-                        setArmedPO(null);
-                        setDraggedAssignment(assignment);
-                      }}
-                      onDragEnd={() => { setDraggedAssignment(null); setDropTarget(null); }}
                       onDragOver={(e) => { if (canDrop) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDropTarget(dateKey); } }}
                       onDragLeave={() => setDropTarget((t) => (t === dateKey ? null : t))}
                       onDrop={(e) => handleDrop(e, lineNo, date)}
-                      onClick={() => handleCellClick(lineNo, date, assignment)}
-                      onMouseEnter={(e) => assignment && setHovered({ assignment, x: e.clientX, y: e.clientY })}
-                      onMouseMove={(e) => assignment && setHovered({ assignment, x: e.clientX, y: e.clientY })}
-                      onMouseLeave={() => setHovered(null)}
+                      onClick={() => handleCellClick(lineNo, date)}
                       style={{ width: CELL, height: CELL }}
-                      className={`relative rounded-md transition ${cls} ${isDropHover ? "ring-2 ring-amber-400 bg-amber-100" : ""} ${canDrop ? "cursor-pointer hover:ring-2 hover:ring-amber-300" : ""}`}
-                      title={assignment ? "Arrastre para mover a otra línea o día" : ""}
+                      className={`relative rounded-md overflow-hidden transition ${hasAny ? "" : emptyCls} ${isDropHover ? "ring-2 ring-amber-400 bg-amber-100" : ""} ${canDrop && !hasAny ? "cursor-pointer hover:ring-2 hover:ring-amber-300" : ""}`}
                     >
-                      {isStart && <span className="absolute inset-y-0 left-0 w-1 rounded-l-md bg-black/25" />}
+                      {hasAny && (
+                        <div className="absolute inset-0 flex flex-col">
+                          {cellAssignments.map((a) => {
+                            const c = blockColor(keyOf(a.work_order_id, a.color));
+                            const overdue = isOverdue(a) ? "ring-1 ring-inset ring-red-600" : "";
+                            const done = a.status === "completed" ? "opacity-60" : "";
+                            const isBeingMoved = moving && draggedAssignment.id === a.id;
+                            const dim = isBeingMoved ? "opacity-40" : "";
+                            const isStart = ymd(a.planned_start_date) === dayStr;
+                            const share = totalQty > 0 ? (parseFloat(a.assigned_quantity) || 0) / totalQty : 1 / cellAssignments.length;
+                            return (
+                              <div
+                                key={a.id}
+                                draggable={!dropBusy}
+                                onDragStart={(e) => {
+                                  e.stopPropagation();
+                                  e.dataTransfer.effectAllowed = "move";
+                                  e.dataTransfer.setData("text/plain", String(a.id));
+                                  setDraggedPO(null);
+                                  setArmedPO(null);
+                                  setDraggedAssignment(a);
+                                }}
+                                onDragEnd={() => { setDraggedAssignment(null); setDropTarget(null); }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (armedPO && !dropBusy) assignPOAcrossDays(armedPO, lineNo, date);
+                                  else setSelectedAssignment(a);
+                                }}
+                                onMouseEnter={(e) => setHovered({ assignment: a, x: e.clientX, y: e.clientY })}
+                                onMouseMove={(e) => setHovered({ assignment: a, x: e.clientX, y: e.clientY })}
+                                onMouseLeave={() => setHovered(null)}
+                                style={{ flexGrow: share, flexBasis: 0, minHeight: 3 }}
+                                className={`relative ${c.bg} ${c.border} border-b last:border-b-0 cursor-grab active:cursor-grabbing ${overdue} ${done} ${dim}`}
+                                title="Arrastre para mover · toque para ver detalle"
+                              >
+                                {isStart && <span className="absolute inset-y-0 left-0 w-1 bg-black/25" />}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -687,8 +861,8 @@ export default function PlanBoard() {
           return (
             <div className="inline-block">
               {/* Period header row */}
-              <div className="grid items-end" style={{ gridTemplateColumns: aggCols, gap: GAP, marginBottom: GAP }}>
-                <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Línea</div>
+              <div className="grid items-end sticky top-0 z-20 bg-white" style={{ gridTemplateColumns: aggCols, gap: GAP, paddingBottom: GAP }}>
+                <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide sticky left-0 z-30 bg-white pr-2 self-stretch flex items-end border-r border-gray-200 shadow-[6px_0_0_0_#ffffff,4px_0_6px_-3px_rgba(0,0,0,0.18)]">Línea</div>
                 {periods.map((p) => (
                   <div key={p.key} className="text-center leading-tight text-gray-500" style={{ width: AGG_W }}>
                     <div className="text-[9px] uppercase">{p.top}</div>
@@ -705,10 +879,10 @@ export default function PlanBoard() {
                   <div key={lineNo} className="grid items-center" style={{ gridTemplateColumns: aggCols, gap: GAP, marginBottom: GAP }}>
                     <button
                       onClick={() => openOperatorsEditor(lineNo)}
-                      className="pr-1 text-left rounded-md hover:bg-gray-100 transition"
+                      className="pr-2 text-left rounded-md hover:bg-gray-100 transition sticky left-0 z-10 bg-white border-r border-gray-200 shadow-[6px_0_0_0_#ffffff,4px_0_6px_-3px_rgba(0,0,0,0.10)]"
                       title={`Línea ${lineNo} · ${latestRunForLine(lineNo)?.operators_count ?? 0} operarios`}
                     >
-                      <div className="text-xs font-semibold text-gray-800 leading-none">L{lineNo}</div>
+                      <div className="text-sm font-bold text-gray-800 leading-none">L{lineNo}</div>
                       <div className="text-[9px] text-gray-400 leading-none mt-0.5">👤{latestRunForLine(lineNo)?.operators_count ?? 0}</div>
                     </button>
 
@@ -734,9 +908,11 @@ export default function PlanBoard() {
                 ))
               )}
               <p className="mt-2 text-[11px] text-gray-400">
-                {viewMode === "month"
-                  ? "Cada bloque suma la semana. Cambie a Semana/Día para asignar o mover."
-                  : "Cada bloque suma el mes. Cambie a Semana/Día para asignar o mover."}
+                {viewMode === "week"
+                  ? "Cada bloque suma la semana. Cambie a Diario para asignar o mover."
+                  : viewMode === "month"
+                  ? "Cada bloque suma el mes. Cambie a Diario para asignar o mover."
+                  : "Cada bloque suma el año. Cambie a Diario para asignar o mover."}
               </p>
             </div>
           );
@@ -765,7 +941,7 @@ export default function PlanBoard() {
       {hovered && (
         <div className="fixed z-[60] w-56 bg-gray-900 text-white text-xs rounded-lg shadow-lg p-3 pointer-events-none"
           style={{ left: Math.min(hovered.x + 12, (typeof window !== "undefined" ? window.innerWidth : 1000) - 240), top: hovered.y + 12 }}>
-          <div className="font-medium mb-1">{woNo(hovered.assignment)}</div>
+          <div className="font-medium mb-1">{woNo(hovered.assignment)}{hovered.assignment.color ? ` · ${hovered.assignment.color}` : ""}</div>
           <div className="space-y-0.5">
             <Row k="Estilo" v={woStyle(hovered.assignment)} />
             <Row k="Línea" v={`L${hovered.assignment.line_no}`} />
@@ -788,6 +964,8 @@ export default function PlanBoard() {
                 return (
                   <>
                     <ModalRow k="Orden" v={woNo(selectedAssignment)} bold />
+                    <ModalRow k="Color" v={selectedAssignment.color || "—"} />
+                    <ModalRow k="Estilo N°" v={(wo && wo.estilo) || "—"} />
                     <ModalRow k="Estilo" v={woStyle(selectedAssignment)} />
                     <ModalRow k="Línea" v={selectedAssignment.line_no} />
                     <ModalRow k="Cantidad" v={`${Math.round(selectedAssignment.assigned_quantity).toLocaleString()} pzas`} />
@@ -796,7 +974,61 @@ export default function PlanBoard() {
                     <ModalRow k="Estado" v={selectedAssignment.status} />
                     {wo && <>
                       <ModalRow k="Cliente" v={wo.customer_name} />
+                      {wo.customer_po && <ModalRow k="PO cliente" v={wo.customer_po} />}
                       <ModalRow k="Total Orden" v={`${Math.round(targetOf(wo)).toLocaleString()} pzas`} />
+                      {Array.isArray(wo.lines) && wo.lines.length > 0 && (() => {
+                        const sizeMap = new Map();
+                        wo.lines
+                          .filter((l) => String(l.color || "") === String(selectedAssignment.color || ""))
+                          .forEach((l) => sizeMap.set(l.talla, (sizeMap.get(l.talla) || 0) + (Number(l.quantity) || 0)));
+                        const sizes = [...sizeMap.entries()].filter(([t]) => t);
+                        if (sizes.length === 0) return null;
+                        return (
+                          <div className="flex justify-between gap-3">
+                            <span className="text-gray-500">Tallas</span>
+                            <span className="flex flex-wrap gap-1 justify-end">
+                              {sizes.map(([talla, q]) => (
+                                <span key={talla} className="text-[11px] rounded bg-blue-50 text-blue-700 px-1.5 py-0.5">
+                                  {talla}: {Math.round(q).toLocaleString()}
+                                </span>
+                              ))}
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Color del bloque en el tablero */}
+                      <div className="pt-2 border-t">
+                        {(() => {
+                          const key = keyOf(selectedAssignment.work_order_id, selectedAssignment.color);
+                          const activeIdx = colorOverrides[key];
+                          return (
+                            <>
+                              <div className="flex items-center justify-between mb-1.5">
+                                <span className="text-gray-500">Color del bloque</span>
+                                {activeIdx != null && (
+                                  <button onClick={() => setBlockColor(key, null)} className="text-[11px] text-gray-500 hover:text-gray-800 underline">
+                                    Automático
+                                  </button>
+                                )}
+                              </div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {WO_PALETTE.map((c, i) => {
+                                  const on = (activeIdx != null ? activeIdx === i : blockColor(key) === c);
+                                  return (
+                                    <button
+                                      key={i}
+                                      onClick={() => setBlockColor(key, i)}
+                                      title={`Color ${i + 1}`}
+                                      className={`w-6 h-6 rounded-md ${c.bg} ${c.border} border ${on ? "ring-2 ring-gray-900 ring-offset-1" : ""}`}
+                                    />
+                                  );
+                                })}
+                              </div>
+                            </>
+                          );
+                        })()}
+                      </div>
                     </>}
                   </>
                 );
@@ -931,7 +1163,7 @@ export default function PlanBoard() {
                 .sort((a, b) => b.qty - a.qty)
                 .map((o) => (
                   <div key={o.id} className="py-2 flex items-center gap-2">
-                    <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${colorForWO(o.id).dot}`} />
+                    <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${blockColor(o.id).dot}`} />
                     <span className="font-mono text-sm font-medium text-gray-800 flex-1 truncate">{o.no}</span>
                     <span className="text-sm text-gray-600">{Math.round(o.qty).toLocaleString()} pzas</span>
                   </div>

@@ -115,6 +115,41 @@ const ymd = (v) => {
 const mondayOf = (dateStr) => ymd(startOfWeek(new Date(`${ymd(dateStr)}T00:00:00`), { weekStartsOn: 1 }));
 const sizeRank = (code) => { const i = TALLAS.findIndex((t) => t.code === code); return i === -1 ? 999 : i; };
 
+// PO cliente → estilo → talla×cantidad, from an order's lines. Pass a `color`
+// to scope it to a single color (as the color-cards / detail do). Mirrors the
+// planner board so both sides show the exact same breakdown.
+function buildBreakdownFromLines(lines, color) {
+  const detail = new Map(); // `${po}\u0000${estilo}` -> { customerPo, estilo, sizeMap, total }
+  (Array.isArray(lines) ? lines : []).forEach((l) => {
+    if (!l || l.color == null) return;
+    if (color !== undefined && String(l.color || "") !== String(color || "")) return;
+    const po = l.customerPo || l.customer_po || "";
+    const est = l.estilo || "";
+    const dk = `${po}\u0000${est}`;
+    let d = detail.get(dk);
+    if (!d) { d = { customerPo: po, estilo: est, sizeMap: new Map(), total: 0 }; detail.set(dk, d); }
+    const q = num(l.quantity);
+    if (l.talla) d.sizeMap.set(l.talla, (d.sizeMap.get(l.talla) || 0) + q);
+    d.total += q;
+  });
+  const poMap = new Map();
+  for (const d of detail.values()) {
+    let g = poMap.get(d.customerPo);
+    if (!g) { g = { customerPo: d.customerPo, total: 0, styles: [] }; poMap.set(d.customerPo, g); }
+    g.total += d.total;
+    g.styles.push({
+      estilo: d.estilo,
+      total: d.total,
+      sizes: [...d.sizeMap.entries()]
+        .map(([talla, quantity]) => ({ talla, quantity }))
+        .sort((a, b) => sizeRank(a.talla) - sizeRank(b.talla)),
+    });
+  }
+  return [...poMap.values()]
+    .sort((a, b) => String(a.customerPo).localeCompare(String(b.customerPo)))
+    .map((g) => ({ ...g, styles: g.styles.sort((a, b) => String(a.estilo).localeCompare(String(b.estilo))) }));
+}
+
 function loadStore() {
   try {
     const raw = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
@@ -177,10 +212,12 @@ function buildJobs(orders, eq) {
       photo: o.master_code_photo_url || null, status: o.status,
       sam, eqPerPiece, commitment_date: o.commitment_date || null,
     };
-    const mk = (color, qty, sizes, estilo) => ({
+    const mk = (color, qty, sizes, estilo, breakdown) => ({
       ...base, key: `${base.workOrderId}:${color || ""}`, color: color || null,
       estilo: estilo || o.estilo || "",
       sizes: (sizes || []).slice().sort((a, b) => sizeRank(a.talla) - sizeRank(b.talla)),
+      // PO cliente → estilo → talla×cantidad for this color ([] when no line detail).
+      breakdown: breakdown || [],
       cantidad: qty, eqPieces: qty * eqPerPiece,
     });
     const lines = Array.isArray(o.lines) ? o.lines.filter((l) => l && l.color != null) : [];
@@ -196,7 +233,7 @@ function buildJobs(orders, eq) {
         byColor.set(l.color, cur);
       }
       for (const c of byColor.values())
-        jobs.push(mk(c.color, c.qty, [...c.sizeMap.entries()].map(([talla, quantity]) => ({ talla, quantity })), [...c.estilos].join(", ")));
+        jobs.push(mk(c.color, c.qty, [...c.sizeMap.entries()].map(([talla, quantity]) => ({ talla, quantity })), [...c.estilos].join(", "), buildBreakdownFromLines(lines, c.color)));
     } else if (colors.length) {
       for (const c of colors) jobs.push(mk(c.color, num(c.quantity), [], o.estilo));
     } else {
@@ -515,7 +552,7 @@ export default function MerchantPlanner({
                 {board.pool.length === 0 ? (
                   <p className="text-sm text-slate-400 py-2">{poolDrop ? "Suelta aquí para quitarlo del tablero" : "Todo asignado 🎉"}</p>
                 ) : (
-                  <div className="flex gap-2 overflow-x-auto pb-1">
+                  <div className="flex gap-2 overflow-x-auto pb-1 items-start">
                     {board.pool.map((j) => (
                       <JobCard key={j.key} j={j} armed={armed === j.key}
                         onTap={() => tapCard(j.key)} onDragStart={() => setDragKey(j.key)} onDragEnd={() => setDragKey(null)} />
@@ -744,13 +781,39 @@ function JobCard({ j, armed, onTap, onDragStart, onDragEnd }) {
         <span className="font-mono text-slate-500">{j.style_code}</span>
         {j.estilo ? <> · <span className="text-slate-400">Estilo</span> <span className="font-mono">{j.estilo}</span></> : null}
       </p>
-      {j.sizes.length > 0 && (
+      {j.breakdown && j.breakdown.length > 0 ? (
+        <div className="mt-1 space-y-1.5 border-t border-slate-100 pt-1.5">
+          {j.breakdown.map((po, pi) => (
+            <div key={pi}>
+              <div className="flex items-center justify-between gap-1">
+                <span className="text-[10px] font-semibold text-slate-600 truncate"><span className="text-slate-400 font-normal">PO</span> {po.customerPo || "—"}</span>
+                <span className="text-[9px] text-slate-400 font-mono shrink-0">{fmtInt(po.total)}</span>
+              </div>
+              {po.styles.map((st, si) => (
+                <div key={si} className="pl-2 mt-0.5">
+                  <div className="text-[9px] text-slate-500 font-mono truncate flex items-center gap-1">
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${c.dot}`} />
+                    {j.color ? `${j.color} · ` : ""}{st.estilo || "—"}
+                  </div>
+                  {st.sizes.length > 0 && (
+                    <div className="flex flex-wrap gap-0.5 mt-0.5">
+                      {st.sizes.map((s) => (
+                        <span key={s.talla} className="text-[9px] rounded bg-sky-50 text-sky-700 border border-sky-100 px-1 py-0.5 font-mono">{s.talla}: {fmtInt(s.quantity)}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      ) : j.sizes.length > 0 ? (
         <div className="mt-1 flex flex-wrap gap-1">
           {j.sizes.map((s) => (
             <span key={s.talla} className="text-[10px] rounded bg-sky-50 text-sky-700 border border-sky-100 px-1.5 py-0.5 font-mono">{s.talla}: {fmtInt(s.quantity)}</span>
           ))}
         </div>
-      )}
+      ) : null}
       <div className="mt-1.5 flex items-center gap-2 text-[10px] font-mono">
         <span className="inline-flex items-center gap-1 rounded bg-slate-100 text-slate-600 px-1.5 py-0.5"><Package size={10} />{fmtInt(j.cantidad)}</span>
         <span className="inline-flex items-center gap-1 rounded bg-slate-100 text-slate-600 px-1.5 py-0.5"><Timer size={10} />{fmt2(j.sam)}</span>
@@ -803,7 +866,38 @@ function JobDetailModal({ job, assignedWeek, weeks, onMove, onClose, onRemove })
               </select>
             </div>
           )}
-          {job.sizes.length > 0 && (
+          {job.breakdown && job.breakdown.length > 0 ? (
+            <div className="pt-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1.5">Desglose · PO cliente → estilo → tallas</p>
+              <div className="space-y-2">
+                {job.breakdown.map((po, pi) => (
+                  <div key={pi} className="rounded-lg bg-slate-50 border border-slate-100 p-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[12px] font-semibold text-slate-700">
+                        <span className="text-slate-400 font-normal">PO</span> {po.customerPo || "—"}
+                      </span>
+                      <span className="text-[11px] text-slate-400 font-mono">{fmtInt(po.total)} pzas</span>
+                    </div>
+                    {po.styles.map((st, si) => (
+                      <div key={si} className="pl-2 mt-1">
+                        <div className="text-[11px] text-slate-500 font-mono flex items-center gap-1.5">
+                          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${c.dot}`} />
+                          {job.color ? `${job.color} · ` : ""}{st.estilo || "—"}
+                        </div>
+                        {st.sizes.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-0.5">
+                            {st.sizes.map((s) => (
+                              <span key={s.talla} className="text-[11px] rounded bg-slate-100 border border-slate-200 px-1.5 py-0.5 font-mono text-slate-700">{s.talla} × {fmtInt(s.quantity)}</span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : job.sizes.length > 0 && (
             <div className="pt-2">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">Tallas · cantidad</p>
               <div className="flex flex-wrap gap-1">

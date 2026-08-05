@@ -2,7 +2,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { format, addDays, differenceInDays, startOfWeek, endOfWeek, eachDayOfInterval, isSameDay, startOfMonth, endOfMonth, startOfYear, addMonths, eachWeekOfInterval, eachMonthOfInterval, getWeek } from "date-fns";
 import { es } from "date-fns/locale";
-import { ChevronLeft, ChevronRight, Package, GripVertical, Loader2, Check, AlertCircle } from "lucide-react";
+import { ChevronLeft, ChevronRight, Package, Loader2, Check, AlertCircle } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import { colorForWO, WO_PALETTE } from "../../lib/workOrderColors";
 
@@ -14,6 +14,39 @@ const authHeaders = () => ({
 const targetOf = (wo) => Number(wo?.total_to_produce) || Number(wo?.quantity) || 0;
 const assignedOf = (wo) => Number(wo?.assigned_quantity) || 0;
 const remainingOf = (wo) => Math.max(targetOf(wo) - assignedOf(wo), 0);
+
+// Shared breakdown: PO cliente → estilo → talla×cantidad, from work-order lines.
+// Pass a `color` to scope it to a single color (used by the pool card and the
+// assignment-details modal); omit it to break down every color in the order.
+function buildBreakdownFromLines(lines, color) {
+  const detail = new Map(); // `${po}\u0000${estilo}` -> { customerPo, estilo, sizeMap, total }
+  (Array.isArray(lines) ? lines : []).forEach((l) => {
+    if (!l || l.color == null) return;
+    if (color !== undefined && String(l.color || "") !== String(color || "")) return;
+    const po = l.customerPo || "";
+    const est = l.estilo || "";
+    const dk = `${po}\u0000${est}`;
+    let d = detail.get(dk);
+    if (!d) { d = { customerPo: po, estilo: est, sizeMap: new Map(), total: 0 }; detail.set(dk, d); }
+    const q = Number(l.quantity) || 0;
+    if (l.talla) d.sizeMap.set(l.talla, (d.sizeMap.get(l.talla) || 0) + q);
+    d.total += q;
+  });
+  const poMap = new Map();
+  for (const d of detail.values()) {
+    let g = poMap.get(d.customerPo);
+    if (!g) { g = { customerPo: d.customerPo, total: 0, styles: [] }; poMap.set(d.customerPo, g); }
+    g.total += d.total;
+    g.styles.push({
+      estilo: d.estilo,
+      total: d.total,
+      sizes: [...d.sizeMap.entries()].map(([talla, quantity]) => ({ talla, quantity })),
+    });
+  }
+  return [...poMap.values()]
+    .sort((a, b) => String(a.customerPo).localeCompare(String(b.customerPo)))
+    .map((g) => ({ ...g, styles: g.styles.sort((a, b) => String(a.estilo).localeCompare(String(b.estilo))) }));
+}
 
 // Compact cell sizing
 const CELL = 34;   // px — square size
@@ -38,8 +71,15 @@ export default function PlanBoard() {
   const [dropBusy, setDropBusy] = useState(false);
   const [toast, setToast] = useState(null);
   const [showPool, setShowPool] = useState(true);
+  const [showSizes, setShowSizes] = useState(false); // compact pool by default; reveal size chips on demand
   const [editLine, setEditLine] = useState(null); // { lineNo, operators, run }
   const [savingOps, setSavingOps] = useState(false);
+
+  // The merchant's weekly plan drives which orders reach the pool and their
+  // target week. `merchantOk` is false only if that fetch fails → we then fall
+  // back to the previous behavior (show every open order) so the board still works.
+  const [merchantPlan, setMerchantPlan] = useState([]);
+  const [merchantOk, setMerchantOk] = useState(true);
 
   // User-chosen block colors (per work-order+color key), persisted per browser.
   const [colorOverrides, setColorOverrides] = useState(() => {
@@ -80,14 +120,21 @@ export default function PlanBoard() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [aRes, woRes, lrRes] = await Promise.all([
+      const [aRes, woRes, lrRes, mpRes] = await Promise.all([
         fetch(`${API_URL}/api/line-assignments`, { headers: authHeaders() }),
         fetch(`${API_URL}/api/work-orders`, { headers: authHeaders() }),
         fetch(`${API_URL}/api/line-runs`, { headers: authHeaders() }),
+        fetch(`${API_URL}/api/merchant-plan`, { headers: authHeaders() }).catch(() => null),
       ]);
       const a = await aRes.json(); if (a.success) setAssignments(a.assignments);
       const wo = await woRes.json(); if (wo.success) setWorkOrders(wo.workOrders);
       const lr = await lrRes.json(); if (lr.success) setLineRuns(lr.runs);
+      // The merchant weekly plan is the upstream source for the pool.
+      try {
+        const mp = mpRes && mpRes.ok ? await mpRes.json() : null;
+        if (mp && mp.success) { setMerchantPlan(mp.plan || []); setMerchantOk(true); }
+        else { setMerchantPlan([]); setMerchantOk(false); }
+      } catch { setMerchantPlan([]); setMerchantOk(false); }
     } catch (err) {
       console.error("Error fetching plan board data:", err);
     } finally {
@@ -121,10 +168,28 @@ export default function PlanBoard() {
       )
       .reduce((s, a) => s + (parseFloat(a.assigned_quantity) || 0), 0);
 
+  // ---- merchant weekly plan → pool source -------------------------------
+  // The merchant board decides WHICH orders get planned and into WHICH week.
+  // Index those rows so the pool can (a) show only planned orders and (b) tag
+  // each with its target week. Colors are stored upper-cased on the merchant
+  // side, so normalize the key when matching.
+  const planKey = (woId, color) => `${woId}:${String(color || "").trim().toUpperCase()}`;
+  const merchantByKey = useMemo(() => {
+    const m = new Map();
+    for (const r of merchantPlan) {
+      m.set(planKey(r.work_order_id, r.color), r);
+      // Also index by work_order_no in case an order was planned before it had a numeric id.
+      if (r.work_order_no) m.set(planKey(r.work_order_no, r.color), r);
+    }
+    return m;
+  }, [merchantPlan]);
+  // Gate the pool by the plan only when it actually loaded; otherwise fall back.
+  const gateByMerchant = merchantOk;
+
   // The pool: one draggable "job" per work order + color, with remaining qty
   // and (when available) the size breakdown for that color.
   const poolJobs = useMemo(() => {
-    const mkJob = (wo, color, colorQty, sizes, estilo, customerPo) => ({
+    const mkJob = (wo, color, colorQty, sizes, estilo, customerPo, breakdown) => ({
       key: keyOf(wo.id, color),
       workOrderId: wo.id,
       work_order_no: wo.work_order_no,
@@ -132,6 +197,9 @@ export default function PlanBoard() {
       color: color || null,
       remaining: Math.max(colorQty - assignedForColor(wo.id, color), 0),
       sizes: sizes || [],
+      // PO cliente → estilo → talla×cantidad, for this color. Empty when the
+      // order has no line-level detail (colors-only or bare quantity).
+      breakdown: breakdown || [],
       estilo: estilo || wo.estilo || wo.style_code || "",
       customer_name: wo.customer_name,
       style_code: wo.style_code,
@@ -139,7 +207,8 @@ export default function PlanBoard() {
       commitment_date: wo.commitment_date,
     });
 
-    // Group work_order_lines by color → { color, qty, sizes, estilos, customerPos }.
+    // Group work_order_lines by color, and within each color keep a full
+    // PO cliente → estilo → talla×cantidad breakdown (shared with the modal).
     const groupsFromLines = (lines) => {
       const byColor = new Map();
       lines.forEach((l) => {
@@ -152,16 +221,29 @@ export default function PlanBoard() {
         if (l.customerPo) cur.pos.add(l.customerPo);
         byColor.set(l.color, cur);
       });
+
       return [...byColor.values()].map((c) => ({
         color: c.color,
         qty: c.qty,
         sizes: [...c.sizeMap.entries()].map(([talla, quantity]) => ({ talla, quantity })),
         estilo: [...c.estilos].join(", "),
         customerPo: [...c.pos].join(", "),
+        breakdown: buildBreakdownFromLines(lines, c.color),
       }));
     };
 
     const jobs = [];
+    // A job only reaches the pool if the merchant planned it into a week; that
+    // merchant week is attached so the planner knows where it belongs. If the
+    // merchant plan couldn't be loaded, fall back to showing every open order.
+    const consider = (job) => {
+      if (job.remaining <= 0) return;
+      const mp = merchantByKey.get(planKey(job.workOrderId, job.color));
+      if (gateByMerchant && !mp) return;
+      job.week = mp ? mp.week_start : null; // Monday (YYYY-MM-DD) the merchant assigned
+      jobs.push(job);
+    };
+
     workOrders.forEach((wo) => {
       if (["completed", "cancelled"].includes(wo.status)) return;
       const lines = Array.isArray(wo.lines) ? wo.lines : [];
@@ -169,28 +251,57 @@ export default function PlanBoard() {
 
       if (lines.length > 0) {
         groupsFromLines(lines).forEach((g) => {
-          const job = mkJob(wo, g.color, g.qty, g.sizes, g.estilo, g.customerPo);
-          if (job.remaining > 0) jobs.push(job);
+          consider(mkJob(wo, g.color, g.qty, g.sizes, g.estilo, g.customerPo, g.breakdown));
         });
       } else if (colors.length > 0) {
         colors.forEach((c) => {
-          const job = mkJob(wo, c.color, Number(c.quantity) || 0, [], wo.estilo, wo.customer_po);
-          if (job.remaining > 0) jobs.push(job);
+          consider(mkJob(wo, c.color, Number(c.quantity) || 0, [], wo.estilo, wo.customer_po));
         });
       } else {
-        const job = mkJob(wo, wo.color || null, targetOf(wo), [], wo.estilo, wo.customer_po);
-        if (job.remaining > 0) jobs.push(job);
+        consider(mkJob(wo, wo.color || null, targetOf(wo), [], wo.estilo, wo.customer_po));
       }
     });
 
     return jobs.sort((a, b) => {
+      // Earliest merchant week first, then commitment date, then order/color.
+      const wa = a.week || "9999-99-99";
+      const wb = b.week || "9999-99-99";
+      if (wa !== wb) return wa < wb ? -1 : 1;
       const da = a.commitment_date ? new Date(a.commitment_date).getTime() : Infinity;
       const db = b.commitment_date ? new Date(b.commitment_date).getTime() : Infinity;
       if (da !== db) return da - db;
       const c = String(a.work_order_no).localeCompare(String(b.work_order_no));
       return c !== 0 ? c : String(a.color || "").localeCompare(String(b.color || ""));
     });
-  }, [workOrders, assignments]);
+  }, [workOrders, assignments, merchantByKey, gateByMerchant]);
+
+  // Group the pool by the merchant-assigned week so the planner sees, week by
+  // week, exactly what needs to land on the day grid.
+  const poolWeekGroups = useMemo(() => {
+    const groups = new Map();
+    for (const j of poolJobs) {
+      const wk = j.week || "";
+      if (!groups.has(wk)) groups.set(wk, []);
+      groups.get(wk).push(j);
+    }
+    return [...groups.entries()]
+      .sort((a, b) => ((a[0] || "9999-99-99") < (b[0] || "9999-99-99") ? -1 : 1))
+      .map(([week, jobs]) => ({ week, jobs, totalPzas: jobs.reduce((s, j) => s + (j.remaining || 0), 0) }));
+  }, [poolJobs]);
+
+  const weekLabel = (weekStart) => {
+    if (!weekStart) return { top: "Sin semana asignada", range: "" };
+    const s = new Date(`${weekStart}T00:00:00`);
+    const e = addDays(s, 6);
+    return { top: `Semana ${getWeek(s, { weekStartsOn: 1 })}`, range: `${format(s, "dd/MM")} – ${format(e, "dd/MM/yyyy")}` };
+  };
+
+  // Jump the day grid to the Monday of a merchant week.
+  const goToWeek = (weekStart) => {
+    if (!weekStart) return;
+    setViewMode("day");
+    setCurrentDate(new Date(`${weekStart}T00:00:00`));
+  };
 
   const getDateRange = () => {
     // Daily view: individual days up to ~6 months ahead (scroll right for more).
@@ -611,69 +722,156 @@ export default function PlanBoard() {
         </div>
       </div>
 
-      {/* Unassigned PO pool — assigning/dragging only in Diario */}
+      {/* Pool: orders the MERCHANT planned, laid out as compact per-week columns
+          so the planner sees the weeks AND the line grid at the same time.
+          Assigning/dragging only in Diario. */}
       {viewMode === "day" && (
       <div className="border-b bg-amber-50/60">
-        <button onClick={() => setShowPool((v) => !v)} className="w-full flex items-center justify-between px-5 py-2.5 text-left">
-          <span className="flex items-center gap-2 text-sm font-semibold text-gray-800">
-            <Package className="w-4 h-4 text-amber-600" /> Órdenes por asignar ({poolJobs.length})
-          </span>
-          <span className="text-xs text-gray-500">{showPool ? "Ocultar" : "Mostrar"}</span>
-        </button>
+        {/* Header row — title collapses the pool; controls stay on the right */}
+        <div className="w-full flex items-center justify-between px-5 py-2.5 gap-3">
+          <button onClick={() => setShowPool((v) => !v)} className="flex items-center gap-2 text-sm font-semibold text-gray-800 min-w-0">
+            <Package className="w-4 h-4 text-amber-600 shrink-0" />
+            <span className="truncate">Órdenes planificadas por el merchant ({poolJobs.length})</span>
+          </button>
+          <div className="flex items-center gap-3 shrink-0">
+            {showPool && poolJobs.length > 0 && (
+              <label className="flex items-center gap-1.5 text-[11px] text-gray-600 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showSizes}
+                  onChange={(e) => setShowSizes(e.target.checked)}
+                  className="rounded border-gray-300 text-amber-600 focus:ring-amber-500 w-3.5 h-3.5"
+                />
+                Desglose
+              </label>
+            )}
+            <button onClick={() => setShowPool((v) => !v)} className="text-xs text-gray-500 hover:text-gray-700">
+              {showPool ? "Ocultar" : "Mostrar"}
+            </button>
+          </div>
+        </div>
+
         {showPool && (
           <div className="px-5 pb-3">
+            {!merchantOk && (
+              <p className="mb-2 text-[11px] text-amber-700 bg-amber-100 border border-amber-200 rounded-lg px-2 py-1 inline-block">
+                No se pudo cargar el plan del merchant — mostrando todas las órdenes pendientes.
+              </p>
+            )}
             {poolJobs.length === 0 ? (
-              <p className="text-sm text-gray-500 py-1">No hay órdenes pendientes.</p>
+              <p className="text-sm text-gray-500 py-1">
+                {merchantOk
+                  ? "El merchant aún no ha planificado órdenes (o ya están completamente programadas)."
+                  : "No hay órdenes pendientes."}
+              </p>
             ) : (
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                {poolJobs.map((job) => {
-                  const isActive = activePO?.key === job.key;
-                  return (
-                    <div key={job.key} draggable={!dropBusy}
-                      onDragStart={(e) => {
-                        // Required for the drag to actually start in Firefox / some browsers.
-                        e.dataTransfer.effectAllowed = "move";
-                        e.dataTransfer.setData("text/plain", job.key);
-                        setArmedPO(null);      // dragging supersedes a tapped selection
-                        setDraggedPO(job);
-                      }}
-                      onDragEnd={() => { setDraggedPO(null); setDropTarget(null); }}
-                      onClick={() => setArmedPO((cur) => (cur?.key === job.key ? null : job))}
-                      title="Arrástrela a una línea, o tóquela y luego toque una casilla libre"
-                      className={`shrink-0 w-64 rounded-xl border bg-white p-2.5 cursor-grab active:cursor-grabbing shadow-sm hover:shadow transition ${isActive ? "ring-2 ring-amber-500 border-amber-400" : "border-gray-200"}`}>
-                      <div className="flex items-start gap-2">
-                        <GripVertical className="w-4 h-4 text-gray-300 mt-0.5 shrink-0" />
-                        <div className="min-w-0 flex-1">
-                          <p className="font-mono text-sm font-bold text-gray-900 truncate flex items-center gap-1.5">
-                            <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${blockColor(job.key).dot}`} />
-                            {job.work_order_no}
-                            {job.color && (
-                              <span className="ml-auto text-[11px] rounded-full bg-gray-100 text-gray-700 px-2 py-0.5">{job.color}</span>
-                            )}
-                          </p>
-                          <div className="mt-1 text-[11px] leading-tight text-gray-600 space-y-0.5">
-                            <p className="truncate"><span className="text-gray-400">Cliente:</span> {job.customer_name || "—"}</p>
-                            {job.customer_po && <p className="truncate"><span className="text-gray-400">PO cliente:</span> {job.customer_po}</p>}
-                            <p className="truncate"><span className="text-gray-400">Estilo:</span> {job.estilo || "—"}</p>
+              // ONE bounded, scrollable strip. Weeks are columns (scroll →);
+              // sticky headers keep the week visible while scrolling ↓.
+              <div className="overflow-auto rounded-lg" style={{ maxHeight: "38vh" }}>
+                <div className="flex gap-3 items-start min-w-min">
+                  {poolWeekGroups.map((grp) => {
+                    const wl = weekLabel(grp.week);
+                    return (
+                      <div key={grp.week || "none"} className="shrink-0 w-[208px] flex flex-col">
+                        {/* Sticky week header — click to jump the grid to that week */}
+                        <button
+                          onClick={() => goToWeek(grp.week)}
+                          title={grp.week ? "Llevar el tablero a esta semana" : undefined}
+                          className="group sticky top-0 z-10 text-left bg-amber-50/95 backdrop-blur-sm border-b border-amber-200 px-1 pb-1.5 mb-2"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className="w-1.5 h-3.5 rounded-full bg-amber-400 shrink-0" />
+                            <span className="text-xs font-bold text-gray-800">{wl.top}</span>
+                            {grp.week && <ChevronRight className="w-3.5 h-3.5 text-amber-500 opacity-0 group-hover:opacity-100 transition" />}
                           </div>
-                          {job.sizes && job.sizes.length > 0 && (
-                            <div className="mt-1 flex flex-wrap gap-1">
-                              {job.sizes.map((s) => (
-                                <span key={s.talla} className="text-[10px] rounded bg-blue-50 text-blue-700 px-1.5 py-0.5">
-                                  {s.talla}: {Math.round(s.quantity).toLocaleString()}
-                                </span>
-                              ))}
-                            </div>
-                          )}
-                          <div className="mt-1.5 flex items-center justify-between text-xs">
-                            <span className="font-medium text-amber-700">{Math.round(job.remaining).toLocaleString()} pzas</span>
-                            {job.commitment_date && <span className="text-gray-400">{format(new Date(job.commitment_date), "dd/MM")}</span>}
+                          <div className="pl-3 text-[10px] text-gray-400 leading-tight">{wl.range}</div>
+                          <div className="pl-3 text-[10px] text-gray-500 leading-tight">
+                            {grp.jobs.length} ord · {Math.round(grp.totalPzas).toLocaleString()} pzas
                           </div>
+                        </button>
+
+                        {/* Compact order cards for this week */}
+                        <div className="space-y-1.5">
+                          {grp.jobs.map((job) => {
+                            const isActive = activePO?.key === job.key;
+                            return (
+                              <div key={job.key} draggable={!dropBusy}
+                                onDragStart={(e) => {
+                                  // Required for the drag to actually start in Firefox / some browsers.
+                                  e.dataTransfer.effectAllowed = "move";
+                                  e.dataTransfer.setData("text/plain", job.key);
+                                  setArmedPO(null);      // dragging supersedes a tapped selection
+                                  setDraggedPO(job);
+                                }}
+                                onDragEnd={() => { setDraggedPO(null); setDropTarget(null); }}
+                                onClick={() => setArmedPO((cur) => (cur?.key === job.key ? null : job))}
+                                title={`${job.work_order_no}${job.color ? " · " + job.color : ""} — ${job.customer_name || ""}\nArrástrela a una línea, o tóquela y luego toque una casilla libre`}
+                                className={`rounded-lg border bg-white px-2.5 py-2 cursor-grab active:cursor-grabbing shadow-sm hover:shadow transition ${isActive ? "ring-2 ring-amber-500 border-amber-400" : "border-gray-200 hover:border-amber-300"}`}>
+                                <div className="flex items-center gap-1.5">
+                                  <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${blockColor(job.key).dot}`} />
+                                  <span className="font-mono text-[12px] font-bold text-gray-900 truncate flex-1 min-w-0">{job.work_order_no}</span>
+                                  {job.color && (
+                                    <span className="text-[10px] rounded-full bg-gray-100 text-gray-700 px-1.5 py-0.5 shrink-0">{job.color}</span>
+                                  )}
+                                </div>
+                                <div className="mt-0.5 text-[10px] text-gray-500 truncate">
+                                  {job.customer_name || "—"}{job.estilo ? ` · ${job.estilo}` : ""}
+                                </div>
+                                {showSizes && (
+                                  job.breakdown && job.breakdown.length > 0 ? (
+                                    <div className="mt-1.5 space-y-1.5 border-t border-gray-100 pt-1.5">
+                                      {job.breakdown.map((po, pi) => (
+                                        <div key={pi}>
+                                          <div className="flex items-center justify-between gap-1">
+                                            <span className="text-[10px] font-semibold text-gray-700 truncate">
+                                              <span className="text-gray-400 font-normal">PO</span> {po.customerPo || "—"}
+                                            </span>
+                                            <span className="text-[9px] text-gray-400 shrink-0">{Math.round(po.total).toLocaleString()}</span>
+                                          </div>
+                                          {po.styles.map((st, si) => (
+                                            <div key={si} className="pl-2 mt-0.5">
+                                              <div className="text-[9px] text-gray-500 truncate flex items-center gap-1">
+                                                {job.color && <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${blockColor(job.key).dot}`} />}
+                                                <span className="font-mono">{st.estilo || "—"}</span>
+                                              </div>
+                                              {st.sizes.length > 0 && (
+                                                <div className="flex flex-wrap gap-0.5 mt-0.5">
+                                                  {st.sizes.map((s) => (
+                                                    <span key={s.talla} className="text-[9px] rounded bg-blue-50 text-blue-700 px-1 py-0.5">
+                                                      {s.talla}: {Math.round(s.quantity).toLocaleString()}
+                                                    </span>
+                                                  ))}
+                                                </div>
+                                              )}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (job.sizes && job.sizes.length > 0 && (
+                                    <div className="mt-1 flex flex-wrap gap-1">
+                                      {job.sizes.map((s) => (
+                                        <span key={s.talla} className="text-[9px] rounded bg-blue-50 text-blue-700 px-1 py-0.5">
+                                          {s.talla}: {Math.round(s.quantity).toLocaleString()}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  ))
+                                )}
+                                <div className="mt-1 flex items-center justify-between">
+                                  <span className="text-[12px] font-semibold text-amber-700">{Math.round(job.remaining).toLocaleString()} pzas</span>
+                                  {job.commitment_date && (
+                                    <span className="text-[10px] text-gray-400" title="Fecha compromiso">{format(new Date(job.commitment_date), "dd/MM")}</span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })}
+                </div>
               </div>
             )}
           </div>
@@ -976,23 +1174,41 @@ export default function PlanBoard() {
                       <ModalRow k="Cliente" v={wo.customer_name} />
                       {wo.customer_po && <ModalRow k="PO cliente" v={wo.customer_po} />}
                       <ModalRow k="Total Orden" v={`${Math.round(targetOf(wo)).toLocaleString()} pzas`} />
-                      {Array.isArray(wo.lines) && wo.lines.length > 0 && (() => {
-                        const sizeMap = new Map();
-                        wo.lines
-                          .filter((l) => String(l.color || "") === String(selectedAssignment.color || ""))
-                          .forEach((l) => sizeMap.set(l.talla, (sizeMap.get(l.talla) || 0) + (Number(l.quantity) || 0)));
-                        const sizes = [...sizeMap.entries()].filter(([t]) => t);
-                        if (sizes.length === 0) return null;
+                      {(() => {
+                        const bd = buildBreakdownFromLines(wo.lines, selectedAssignment.color);
+                        if (bd.length === 0) return null;
                         return (
-                          <div className="flex justify-between gap-3">
-                            <span className="text-gray-500">Tallas</span>
-                            <span className="flex flex-wrap gap-1 justify-end">
-                              {sizes.map(([talla, q]) => (
-                                <span key={talla} className="text-[11px] rounded bg-blue-50 text-blue-700 px-1.5 py-0.5">
-                                  {talla}: {Math.round(q).toLocaleString()}
-                                </span>
+                          <div className="pt-2 border-t">
+                            <div className="text-gray-500 mb-1.5">Desglose · PO cliente → estilo → tallas</div>
+                            <div className="space-y-2">
+                              {bd.map((po, pi) => (
+                                <div key={pi} className="rounded-lg bg-gray-50 border border-gray-100 p-2">
+                                  <div className="flex items-center justify-between">
+                                    <span className="text-[12px] font-semibold text-gray-700">
+                                      <span className="text-gray-400 font-normal">PO</span> {po.customerPo || "—"}
+                                    </span>
+                                    <span className="text-[11px] text-gray-400">{Math.round(po.total).toLocaleString()} pzas</span>
+                                  </div>
+                                  {po.styles.map((st, si) => (
+                                    <div key={si} className="pl-2 mt-1">
+                                      <div className="text-[11px] text-gray-500 font-mono flex items-center gap-1.5">
+                                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${blockColor(keyOf(selectedAssignment.work_order_id, selectedAssignment.color)).dot}`} />
+                                        {selectedAssignment.color ? `${selectedAssignment.color} · ` : ""}{st.estilo || "—"}
+                                      </div>
+                                      {st.sizes.length > 0 && (
+                                        <div className="flex flex-wrap gap-1 mt-0.5">
+                                          {st.sizes.map((s) => (
+                                            <span key={s.talla} className="text-[11px] rounded bg-blue-50 text-blue-700 px-1.5 py-0.5">
+                                              {s.talla}: {Math.round(s.quantity).toLocaleString()}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
                               ))}
-                            </span>
+                            </div>
                           </div>
                         );
                       })()}

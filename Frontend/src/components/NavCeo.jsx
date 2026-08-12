@@ -1,141 +1,107 @@
-// NavCeo.jsx - CEO specific side bar (collapsible)
+// NavCeo.jsx - CEO specific navigation bar
 import { useState } from "react";
 import { Link, NavLink, useNavigate } from "react-router-dom";
 
-export default function NavCeo({ collapsed = false, setCollapsed = () => {} }) {
-  const [open, setOpen] = useState(false); // controls the mobile drawer
+export default function NavCeo() {
+  const [open, setOpen] = useState(false);
   const navigate = useNavigate();
 
   const menu = [
-    { name: "Dashboard", path: "/overview", icon: "📊" },
-    { name: "Actual Efficiency", path: "/actual-efficiency", icon: "⚡" },
-    { name: "Quality Monitor", path: "/quality-monitor", icon: "✓" },
-    { name: "Mechanics", path: "/mecanics", icon: "🔧" },
+    { name: "Dashboard", path: "/overview" },
+    { name: "Actual Efficiency", path: "/actual-efficiency" },
+    { name: "Quality Monitor", path: "/quality-monitor" },
+    { name: "Mechanics", path: "/mecanics" },
+    { name: "Merchant Analytics", path: "/merchant-analytics" },
   ];
 
   const handleLogout = () => {
-    localStorage.removeItem("token");
-    localStorage.removeItem("user");
-    navigate("/");
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    navigate('/');
   };
 
-  const linkClass = ({ isActive }) =>
-    `flex items-center gap-3 py-3 rounded-lg transition duration-200 border-l-4 ${
-      collapsed ? "px-4 md:justify-center md:px-0" : "px-4"
-    } ${
-      isActive
-        ? "bg-blue-500/15 text-blue-400 border-blue-400"
-        : "text-gray-300 border-transparent hover:bg-white/5 hover:text-blue-400"
-    }`;
-
   return (
-    <>
-      {/* Mobile top bar with hamburger (hidden on desktop) */}
-      <div className="md:hidden sticky top-0 z-40 flex items-center justify-between bg-gray-900 text-white px-4 py-3 shadow-lg">
-        <Link
-          to="/overview"
-          className="text-lg font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent"
-        >
+    <nav className="bg-gradient-to-r from-gray-900 to-gray-800 text-white sticky top-0 z-50 shadow-lg">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 sm:py-4 flex items-center justify-between">
+        
+        {/* Title / Brand */}
+        <Link to="/overview" className="text-xl sm:text-2xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
           Skyrina CEO Panel
         </Link>
+
+        {/* Desktop Menu */}
+        <ul className="hidden md:flex gap-6 lg:gap-8 font-medium">
+          {menu.map((item) => (
+            <li key={item.path}>
+              <NavLink
+                to={item.path}
+                className={({ isActive }) =>
+                  `cursor-pointer transition duration-200 ${
+                    isActive
+                      ? "text-blue-400 border-b-2 border-blue-400 pb-1"
+                      : "hover:text-blue-400 hover:border-b-2 hover:border-blue-400 pb-1"
+                  }`
+                }
+              >
+                {item.name}
+              </NavLink>
+            </li>
+          ))}
+          <li>
+            <button
+              onClick={handleLogout}
+              className="cursor-pointer transition duration-200 hover:text-red-400"
+            >
+              Cerrar sesión
+            </button>
+          </li>
+        </ul>
+
+        {/* Hamburger Menu Button */}
         <button
-          onClick={() => setOpen(true)}
-          className="text-2xl cursor-pointer focus:outline-none"
-          aria-label="Open menu"
+          onClick={() => setOpen(!open)}
+          className="md:hidden text-2xl cursor-pointer focus:outline-none"
+          aria-label="Toggle menu"
         >
-          ☰
+          {open ? "✕" : "☰"}
         </button>
       </div>
 
-      {/* Backdrop behind the mobile drawer */}
+      {/* Mobile Menu */}
       {open && (
-        <div
-          className="md:hidden fixed inset-0 bg-black/50 z-40"
-          onClick={() => setOpen(false)}
-        />
-      )}
-
-      {/* Sidebar: fixed on desktop, slide-in drawer on mobile */}
-      <aside
-        className={`fixed top-0 left-0 z-50 h-screen w-64 flex flex-col
-          bg-gradient-to-b from-gray-900 to-gray-800 text-white shadow-2xl
-          transform transition-all duration-300 md:translate-x-0
-          ${collapsed ? "md:w-16" : "md:w-64"}
-          ${open ? "translate-x-0" : "-translate-x-full"}`}
-      >
-        {/* Brand + toggles */}
-        <div
-          className={`flex items-center justify-between py-5 border-b border-gray-700 ${
-            collapsed ? "px-4 md:justify-center md:px-0" : "px-5"
-          }`}
-        >
-          <Link
-            to="/overview"
-            onClick={() => setOpen(false)}
-            className={`text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent ${
-              collapsed ? "md:hidden" : ""
-            }`}
-          >
-            Skyrina CEO Panel
-          </Link>
-
-          {/* Mobile close (hidden on desktop) */}
-          <button
-            onClick={() => setOpen(false)}
-            className="md:hidden text-xl cursor-pointer focus:outline-none"
-            aria-label="Close menu"
-          >
-            ✕
-          </button>
-
-          {/* Desktop collapse / expand toggle */}
-          <button
-            onClick={() => setCollapsed(!collapsed)}
-            className="hidden md:inline-flex text-gray-400 hover:text-blue-400 text-xl cursor-pointer focus:outline-none"
-            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            title={collapsed ? "Expandir" : "Contraer"}
-          >
-            {collapsed ? "»" : "«"}
-          </button>
-        </div>
-
-        {/* Menu */}
-        <nav className="flex-1 overflow-y-auto px-3 py-4">
-          <ul className="flex flex-col gap-1 font-medium">
+        <div className="bg-gray-800 md:hidden border-t border-gray-700">
+          <ul className="flex flex-col gap-3 px-6 py-4 font-medium">
             {menu.map((item) => (
               <li key={item.path}>
                 <NavLink
                   to={item.path}
                   onClick={() => setOpen(false)}
-                  className={linkClass}
-                  title={collapsed ? item.name : undefined}
+                  className={({ isActive }) =>
+                    `block py-2 cursor-pointer transition duration-200 ${
+                      isActive
+                        ? "text-blue-400 border-l-4 border-blue-400 pl-3"
+                        : "hover:text-blue-400 hover:border-l-4 hover:border-blue-400 hover:pl-3"
+                    }`
+                  }
                 >
-                  <span className="text-lg">{item.icon}</span>
-                  <span className={collapsed ? "md:hidden" : ""}>{item.name}</span>
+                  {item.name}
                 </NavLink>
               </li>
             ))}
+            <li className="pt-2 border-t border-gray-700">
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  handleLogout();
+                }}
+                className="block w-full text-left py-2 cursor-pointer transition duration-200 hover:text-red-400"
+              >
+                Cerrar sesión
+              </button>
+            </li>
           </ul>
-        </nav>
-
-        {/* Logout pinned to the bottom */}
-        <div className="px-3 py-4 border-t border-gray-700">
-          <button
-            onClick={() => {
-              setOpen(false);
-              handleLogout();
-            }}
-            title={collapsed ? "Cerrar sesión" : undefined}
-            className={`flex items-center gap-3 w-full py-3 rounded-lg text-gray-300
-              hover:bg-red-500/10 hover:text-red-400 transition duration-200 cursor-pointer ${
-                collapsed ? "px-4 md:justify-center md:px-0" : "px-4"
-              }`}
-          >
-            <span className="text-lg">⏻</span>
-            <span className={collapsed ? "md:hidden" : ""}>Cerrar sesión</span>
-          </button>
         </div>
-      </aside>
-    </>
+      )}
+    </nav>
   );
 }

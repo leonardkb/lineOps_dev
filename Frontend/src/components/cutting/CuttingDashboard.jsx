@@ -116,7 +116,7 @@ export default function CuttingDashboard() {
                       <span className={`text-[11px] rounded-full px-2 py-0.5 ${meta.pill}`}>{meta.label}</span>
                     </div>
                     <p className="text-xs text-gray-500 truncate">
-                      {co.work_order_no} · {co.customer_name}{co.color ? ` · ${co.color}` : ""}
+                      {co.work_order_no}{co.customer_po ? ` · PO ${co.customer_po}` : ""} · {co.customer_name}{co.color ? ` · ${co.color}` : ""}
                     </p>
                   </div>
                   <div className="text-right">
@@ -146,7 +146,7 @@ export default function CuttingDashboard() {
                 <div key={co.id} className="p-3 flex items-center gap-3">
                   <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${colorForWO(co.work_order_id).dot}`} />
                   <span className="font-mono text-sm font-medium text-gray-800 w-28 shrink-0">{cutNo(co)}</span>
-                  <span className="text-xs text-gray-500 flex-1 truncate">{co.work_order_no} · {co.customer_name}</span>
+                  <span className="text-xs text-gray-500 flex-1 truncate">{co.work_order_no}{co.customer_po ? ` · PO ${co.customer_po}` : ""} · {co.customer_name}</span>
                   <span className={`text-[11px] rounded-full px-2 py-0.5 ${meta.pill}`}>{meta.label}</span>
                   <span className="text-xs text-gray-500 w-24 text-right">
                     {rem > 0 ? <span className="text-amber-600">Restan {Math.round(rem).toLocaleString()}</span> : `${Math.round(num(co.quantity)).toLocaleString()} pzas`}

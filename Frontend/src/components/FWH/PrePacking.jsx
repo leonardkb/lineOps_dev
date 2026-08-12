@@ -114,12 +114,23 @@ export default function PrePacking() {
       });
       setPick({ customerId: "", workOrderId: "" });
       await loadLists();
-      await openEditor(d.list.id);
-      showToast(
-        d.boxesGenerated
-          ? `Lista ${d.list.list_no} creada · ${d.boxesGenerated} caja(s) desde la orden`
-          : `Lista ${d.list.list_no} creada`
-      );
+
+      // The order may split into one list per PO cliente.
+      const created = d.lists || (d.list ? [{ list: d.list, boxesGenerated: d.boxesGenerated }] : []);
+      if (created.length === 0) { showToast("No se pudo crear la lista", true); return; }
+
+      if (created.length > 1) {
+        const total = created.reduce((s, c) => s + (c.boxesGenerated || 0), 0);
+        showToast(`${created.length} listas creadas (una por PO cliente) · ${total} caja(s)`);
+      } else {
+        showToast(
+          created[0].boxesGenerated
+            ? `Lista ${created[0].list.list_no} creada · ${created[0].boxesGenerated} caja(s) desde la orden`
+            : `Lista ${created[0].list.list_no} creada`
+        );
+      }
+      // Open the first list so the operator lands somewhere; the rest are in the index.
+      await openEditor(created[0].list.id);
     } catch (e) { showToast(e.message, true); }
     finally { setCreating(false); }
   };
@@ -169,6 +180,7 @@ export default function PrePacking() {
 
   const totalBoxes = boxes.length;
   const totalPieces = boxes.reduce((s, b) => s + (Number(b.quantity) || 0), 0);
+  const breakdown = buildBoxBreakdown(boxes);
   const locked = list?.status !== "draft";
 
   // =====================================================================
@@ -344,6 +356,51 @@ export default function PrePacking() {
         </section>
       )}
 
+      {/* Breakdown: PO cliente → color · estilo → tallas × cantidad */}
+      {boxes.length > 0 && (
+        <section className="bg-white rounded-xl border shadow-sm overflow-hidden">
+          <div className="px-4 py-3 border-b flex items-center gap-2">
+            <ClipboardList className="w-4 h-4 text-gray-500" />
+            <h2 className="text-sm font-semibold text-gray-800">Desglose por PO cliente</h2>
+            <span className="text-xs text-gray-400">color · estilo → tallas</span>
+            <span className="ml-auto text-sm text-gray-600">{breakdown.length} PO cliente</span>
+          </div>
+          <div className="p-4 space-y-3">
+            {breakdown.map((pg, pi) => (
+              <div key={pi} className="rounded-lg border border-gray-100 bg-gray-50/60 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-semibold text-gray-800">
+                    <span className="text-gray-400 font-normal">PO cliente</span> <span className="font-mono">{pg.po || "—"}</span>
+                  </span>
+                  <span className="text-xs text-gray-500 font-mono shrink-0">{Math.round(pg.total).toLocaleString()} pzas</span>
+                </div>
+                <div className="mt-2 space-y-2">
+                  {pg.combos.map((cg, ci) => (
+                    <div key={ci} className="pl-1">
+                      <div className="flex items-center gap-2 text-[13px] text-gray-700">
+                        <span className="font-medium">{cg.color || "—"}</span>
+                        <span className="text-gray-300">·</span>
+                        <span className="font-mono text-gray-600">{cg.estilo || "—"}</span>
+                        <span className="ml-auto text-[11px] text-gray-400 font-mono shrink-0">{Math.round(cg.total).toLocaleString()}</span>
+                      </div>
+                      {cg.sizes.length > 0 && (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {cg.sizes.map((s) => (
+                            <span key={s.size} className="text-[11px] rounded bg-indigo-50 text-indigo-700 border border-indigo-100 px-1.5 py-0.5 font-mono">
+                              {sizeLabelOf(s.size)}: {Math.round(s.quantity).toLocaleString()}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Boxes */}
       <section className="bg-white rounded-xl border shadow-sm overflow-hidden">
         <div className="px-4 py-3 border-b flex items-center gap-2">
@@ -398,6 +455,44 @@ export default function PrePacking() {
 }
 
 // ---- small presentational helpers ----
+
+// Roll boxes up into PO cliente (mo) → color · estilo → talla × cantidad, so the
+// operator can read a list the same way it's broken down everywhere else.
+function buildBoxBreakdown(boxes) {
+  const poMap = new Map();
+  for (const b of boxes || []) {
+    const po = String(b.mo ?? "").trim();
+    const color = String(b.color_name ?? "").trim();
+    const estilo = String(b.style ?? "").trim();
+    const size = String(b.size_code ?? "").trim();
+    const qty = Number(b.quantity) || 0;
+
+    let pg = poMap.get(po);
+    if (!pg) { pg = { po, total: 0, combos: new Map() }; poMap.set(po, pg); }
+    pg.total += qty;
+
+    const ck = `${color}\u0000${estilo}`;
+    let cg = pg.combos.get(ck);
+    if (!cg) { cg = { color, estilo, total: 0, sizeMap: new Map() }; pg.combos.set(ck, cg); }
+    cg.total += qty;
+    if (size) cg.sizeMap.set(size, (cg.sizeMap.get(size) || 0) + qty);
+  }
+  return [...poMap.values()]
+    .sort((a, b) => String(a.po).localeCompare(String(b.po)))
+    .map((pg) => ({
+      po: pg.po,
+      total: pg.total,
+      combos: [...pg.combos.values()]
+        .sort((a, b) => `${a.color}${a.estilo}`.localeCompare(`${b.color}${b.estilo}`))
+        .map((cg) => ({
+          color: cg.color,
+          estilo: cg.estilo,
+          total: cg.total,
+          sizes: [...cg.sizeMap.entries()].map(([size, quantity]) => ({ size, quantity })),
+        })),
+    }));
+}
+
 function Field({ label, children }) {
   return (
     <label className="block">

@@ -44,6 +44,10 @@ export default function SavedRunsViewer({ onBack }) {
   const [copyDialog, setCopyDialog] = useState({ open: false, run: null });
   const [newDate, setNewDate] = useState("");
   const [copyLoading, setCopyLoading] = useState(false);
+  // Work orders assigned to the copied line for the chosen date
+  const [copyWorkOrders, setCopyWorkOrders] = useState([]);
+  const [selectedWorkOrderId, setSelectedWorkOrderId] = useState("");
+  const [loadingCopyWorkOrders, setLoadingCopyWorkOrders] = useState(false);
 
   // Date filter state
   const [filterDate, setFilterDate] = useState("");
@@ -61,6 +65,57 @@ const [isDeleting, setIsDeleting] = useState(false);
   useEffect(() => {
     fetchLineRuns();
   }, []);
+
+  // Cargar las órdenes de trabajo asignadas a la línea para la fecha elegida
+  // cada vez que se abre el diálogo de copia o cambia la fecha.
+  useEffect(() => {
+    if (!copyDialog.open || !copyDialog.run || !newDate) {
+      setCopyWorkOrders([]);
+      setSelectedWorkOrderId("");
+      return;
+    }
+
+    let cancelled = false;
+    const loadCopyWorkOrders = async () => {
+      setLoadingCopyWorkOrders(true);
+      try {
+        const token = localStorage.getItem("token");
+        const params = new URLSearchParams({
+          line: String(copyDialog.run.line_no),
+          date: normalizeDate(newDate),
+        });
+        const response = await fetch(`http://localhost:5000/api/planning/line-work-orders?${params.toString()}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await response.json();
+        if (cancelled) return;
+        if (data.success) {
+          setCopyWorkOrders(data.workOrders || []);
+          // Preseleccionar si sólo hay una orden asignada ese día
+          if ((data.workOrders || []).length === 1) {
+            setSelectedWorkOrderId(String(data.workOrders[0].work_order_id));
+          } else {
+            setSelectedWorkOrderId("");
+          }
+        } else {
+          setCopyWorkOrders([]);
+          setSelectedWorkOrderId("");
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setCopyWorkOrders([]);
+          setSelectedWorkOrderId("");
+        }
+      } finally {
+        if (!cancelled) setLoadingCopyWorkOrders(false);
+      }
+    };
+
+    loadCopyWorkOrders();
+    return () => {
+      cancelled = true;
+    };
+  }, [copyDialog.open, copyDialog.run, newDate]);
 
 
   // Add delete handler function after handleCopyRun
@@ -426,7 +481,10 @@ const getRowsFromData = () => {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ newDate }),
+        body: JSON.stringify({
+          newDate,
+          workOrderId: selectedWorkOrderId ? parseInt(selectedWorkOrderId, 10) : null,
+        }),
       });
 
       const data = await response.json();
@@ -434,6 +492,8 @@ const getRowsFromData = () => {
         setMessage(`✅ Corrida duplicada correctamente. Nuevo ID: ${data.newRunId}`);
         setCopyDialog({ open: false, run: null });
         setNewDate("");
+        setCopyWorkOrders([]);
+        setSelectedWorkOrderId("");
         await fetchLineRuns();
       } else {
         setMessage(`❌ Error: ${data.error}`);
@@ -603,9 +663,49 @@ const getRowsFromData = () => {
                 className="mt-1 block w-full rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-900/10"
               />
             </label>
+
+            {/* Orden de trabajo asignada a la línea para esa fecha */}
+            <label className="block mb-4">
+              <span className="text-sm font-medium text-gray-700">
+                Orden de trabajo asignada
+              </span>
+              <select
+                value={selectedWorkOrderId}
+                onChange={(e) => setSelectedWorkOrderId(e.target.value)}
+                disabled={!newDate || loadingCopyWorkOrders}
+                className="mt-1 block w-full rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-900/10 disabled:bg-gray-50 disabled:text-gray-400"
+              >
+                <option value="">
+                  {loadingCopyWorkOrders ? "Cargando..." : "Sin orden de trabajo"}
+                </option>
+                {copyWorkOrders.map((wo) => (
+                  <option key={wo.assignment_id || wo.work_order_id} value={wo.work_order_id}>
+                    {wo.work_order_no}
+                    {wo.estilo ? ` – ${wo.estilo}` : ""}
+                    {wo.color ? ` (${wo.color})` : ""}
+                    {wo.assigned_quantity != null ? ` · ${wo.assigned_quantity} pzas` : ""}
+                  </option>
+                ))}
+              </select>
+              {!newDate ? (
+                <span className="mt-1 block text-xs text-gray-500">
+                  Elige una fecha para ver las órdenes asignadas a la línea.
+                </span>
+              ) : !loadingCopyWorkOrders && copyWorkOrders.length === 0 ? (
+                <span className="mt-1 block text-xs text-amber-600">
+                  No hay órdenes de trabajo asignadas a la línea {copyDialog.run?.line_no} en esa fecha.
+                </span>
+              ) : null}
+            </label>
+
             <div className="flex justify-end gap-3">
               <button
-                onClick={() => setCopyDialog({ open: false, run: null })}
+                onClick={() => {
+                  setCopyDialog({ open: false, run: null });
+                  setNewDate("");
+                  setCopyWorkOrders([]);
+                  setSelectedWorkOrderId("");
+                }}
                 className="px-4 py-2 text-sm border border-gray-200 rounded-xl hover:bg-gray-50"
               >
                 Cancelar

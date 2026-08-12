@@ -145,7 +145,7 @@ export default function CuttingEntry() {
       .filter((co) => (filter === "open" ? co.status !== "completed" && co.status !== "cancelled" : filter === "completed" ? co.status === "completed" : true))
       .filter((co) => {
         if (!q) return true;
-        const hay = `${co.work_order_no} ${co.customer_name || ""} ${co.style_code || ""} ${co.estilo || ""} ${co.color || ""} ${co.fabric || ""}`.toLowerCase();
+        const hay = `${co.work_order_no} ${co.customer_po || ""} ${co.customer_name || ""} ${co.modelo_code || ""} ${co.style_code || ""} ${co.estilo || ""} ${co.color || ""} ${co.fabric || ""}`.toLowerCase();
         return hay.includes(q);
       })
       .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
@@ -383,7 +383,7 @@ export default function CuttingEntry() {
       return setError("Esta marcada no tiene paneles ni piezas para imprimir");
     }
     const esc = (s) => String(s ?? "—").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-    const estilo = co.style_no || co.style_code || co.estilo || co.style_description || "—";
+    const estilo = co.modelo_code || co.style_no || co.style_code || co.estilo || co.style_description || "—";
 
     const pedidoMap = new Map(
       (Array.isArray(co.sizes) ? co.sizes : []).map((s) => [String(s.talla), num(s.quantity)])
@@ -445,34 +445,44 @@ export default function CuttingEntry() {
     }
 
     const oneTicket = (t) => {
-      const panelTag = t.panelCount ? `Panel ${t.panelNo}/${t.panelCount}` : "";
+      const panelTag = t.panelCount ? `P${t.panelNo}/${t.panelCount}` : "";
+      const panelNum = t.panelCount ? `${t.panelNo} / ${t.panelCount}` : "—";
       const qrData = encodeURIComponent(`${cutNo(co)}|${co.work_order_no || ""}|${co.color || ""}|${t.talla || ""}|${t.marker || ""}|P${t.panelNo || 1}`);
-      const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&margin=0&data=${qrData}`;
+      const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&margin=0&data=${qrData}`;
+      const telaTxt = [co.fabric_code, co.fabric].filter(Boolean).join(" ") || "—";
       return `
       <div class="ticket">
-        <div class="top">
-          <div class="kicker">Orden a Líneas</div>
-          <div class="row">
-            <div><div class="title">${esc(co.customer_name)}</div><div class="code">${esc(co.work_order_no)}</div></div>
-            <img class="qr" src="${qrSrc}" alt="QR" onerror="this.style.display='none'" />
+        <div class="hdr">
+          <div class="who">
+            <div class="cust">${esc(co.customer_name)}</div>
+            <div class="meta">${esc(co.work_order_no)}</div>
           </div>
+          <img class="qr" src="${qrSrc}" alt="" onerror="this.style.display='none'" />
         </div>
-        <div class="notch l"></div><div class="notch r"></div>
-        <div class="hero">
-          <div class="label">Estilo</div><div class="estilo">${esc(estilo)}</div>
+
+        <div class="po1"><span class="l">PO cliente</span><span class="v">${esc(co.customer_po || "—")}</span></div>
+
+        <div class="estilo"><span class="k">Estilo</span><span class="v">${esc(estilo)}</span></div>
+
+        <div class="talla">
+          <span class="tv">${esc(t.talla)}</span>
+          ${tallaLabel(t.talla) ? `<span class="sz">${esc(tallaLabel(t.talla))}</span>` : ""}
         </div>
-        <div class="tallabar">Talla <b>${esc(t.talla)}</b>${tallaLabel(t.talla) ? ` <span class="sz">${esc(tallaLabel(t.talla))}</span>` : ""}${panelTag ? `<span class="panel">${esc(panelTag)}</span>` : ""}</div>
-        ${t.marker ? `<div class="mkbar">Marcada <b>${esc(t.marker)}</b></div>` : ""}
+
+        <div class="pieces"><span class="pk">Piezas · panel</span><span class="pv">${rnd(t.pieces)}</span></div>
+
         <div class="grid">
-          <div class="cell"><div class="label">Color</div><div class="value">${esc(co.color)}</div></div>
-          <div class="cell"><div class="label">Season</div><div class="value">${esc(co.season)}</div></div>
-          <div class="cell"><div class="label">Tela</div><div class="value">${esc(co.fabric)}</div>${co.fabric_code ? `<div class="sub">${esc(co.fabric_code)}</div>` : ""}</div>
-          <div class="cell"><div class="label">Pedido talla</div><div class="value">${rnd(t.quantity)}</div></div>
-          <div class="cell"><div class="label">Panel</div><div class="value">${t.panelCount ? `${t.panelNo} / ${t.panelCount}` : "—"}</div></div>
-          <div class="cell hl"><div class="label">Piezas (panel)</div><div class="value">${rnd(t.pieces)}</div></div>
+          <div class="c"><span class="l">Color</span><span class="v">${esc(co.color)}</span></div>
+          <div class="c"><span class="l">Season</span><span class="v">${esc(co.season || "—")}</span></div>
+          <div class="c stack">
+            <div><span class="l">Pedido talla</span><span class="v">${rnd(t.quantity)}</span></div>
+            <div><span class="l">Panel</span><span class="v">${esc(panelNum)}</span></div>
+          </div>
+          <div class="c"><span class="l">Marcada</span><span class="v">${esc(t.marker || "—")}</span></div>
+          <div class="c wide"><span class="l">Tela</span><span class="v">${esc(telaTxt)}</span></div>
         </div>
-        <div class="barcode"></div>
-        <div class="barlabel">${esc(cutNo(co))} · T${esc(t.talla)}${t.marker ? ` · ${esc(t.marker)}` : ""}${t.panelCount ? ` · P${t.panelNo}/${t.panelCount}` : ""}</div>
+
+        <div class="code">${esc(cutNo(co))} · T${esc(t.talla)}${panelTag ? ` · ${esc(panelTag)}` : ""}</div>
         <div class="foot"><span>${esc(fmtDate(co.cut_date))}</span><span>LineOps</span></div>
       </div>`;
     };
@@ -480,44 +490,58 @@ export default function CuttingEntry() {
     const tickets = panelTickets.map(oneTicket).join("");
     const html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(cutNo(co))}</title>
       <style>
-        :root { --ink:#0f172a; --muted:#64748b; --line:#e2e8f0; }
-        * { box-sizing: border-box; }
-        html,body { margin:0; padding:0; background:#f1f5f9; }
-        body { font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:var(--ink); padding:24px; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
-        .ticket { width:420px; margin:0 auto 24px; background:#fff; border-radius:16px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,.12); position:relative; }
-        .top { background:var(--ink); color:#fff; padding:18px 22px; }
-        .top .kicker { font-size:11px; letter-spacing:.18em; text-transform:uppercase; opacity:.7; }
-        .top .title { font-size:22px; font-weight:800; margin-top:2px; }
-        .top .row { display:flex; justify-content:space-between; align-items:flex-end; }
-        .top .code { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; opacity:.9; }
-        .top .qr { width:64px; height:64px; background:#fff; padding:4px; border-radius:8px; }
-        .notch { position:absolute; width:26px; height:26px; background:#f1f5f9; border-radius:50%; top:74px; }
-        .notch.l { left:-13px; } .notch.r { right:-13px; }
-        .hero { padding:16px 22px 2px; }
-        .hero .label { font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); }
-        .hero .estilo { font-size:26px; font-weight:800; line-height:1.05; margin-top:2px; }
-        .tallabar { margin:8px 22px 0; padding:8px 12px; background:#eff6ff; color:#1e3a8a; border-radius:10px; font-size:18px; }
-        .tallabar b { font-size:22px; }
-        .tallabar .panel { float:right; font-size:13px; font-weight:700; background:#dbeafe; color:#1e40af; padding:3px 10px; border-radius:8px; }
-        .tallabar .sz { font-size:14px; font-weight:700; opacity:.85; margin-left:4px; }
-        .mkbar { margin:6px 22px 0; padding:6px 12px; background:#f1f5f9; color:#334155; border-radius:10px; font-size:13px; letter-spacing:.04em; }
-        .mkbar b { font-size:15px; }
-        .cell .sub { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; color:var(--muted); margin-top:2px; }
-        .grid { display:grid; grid-template-columns:1fr 1fr; gap:0; padding:6px 22px; }
-        .cell { padding:10px 6px; border-top:1px solid var(--line); }
-        .cell:nth-child(odd){ border-right:1px solid var(--line); padding-right:14px; }
-        .cell:nth-child(even){ padding-left:14px; }
-        .cell .label { font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
-        .cell .value { font-size:18px; font-weight:700; margin-top:2px; }
-        .cell.hl .value { color:#1d4ed8; }
-        .barcode { height:40px; margin:8px 22px 4px; background:repeating-linear-gradient(90deg,#0f172a 0 2px,#fff 2px 4px,#0f172a 4px 5px,#fff 5px 9px); border-radius:4px; }
-        .barlabel { text-align:center; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; letter-spacing:.2em; padding-bottom:10px; }
-        .foot { border-top:2px dashed var(--line); padding:10px 22px 18px; font-size:11px; color:var(--muted); display:flex; justify-content:space-between; }
+        :root { --ink:#000; --muted:#333; --line:#000; }
+        * { box-sizing:border-box; margin:0; padding:0; }
+        html,body { background:#e5e7eb; }
+        body { font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif; color:var(--ink); padding:8mm 0; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+
+        /* Etiqueta térmica de 40 mm × 80 mm */
+        .ticket {
+          width:40mm; height:80mm; padding:1.6mm 2mm; margin:0 auto 8mm;
+          background:#fff; overflow:hidden; position:relative;
+          display:flex; flex-direction:column; gap:1mm;
+        }
+
+        .hdr { display:flex; justify-content:space-between; align-items:flex-start; gap:1mm; }
+        .who { flex:1; min-width:0; }
+        .cust { font-size:8pt; font-weight:800; line-height:1.05; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .meta { font-family:ui-monospace,Consolas,monospace; font-size:6pt; color:var(--muted); line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .qr { width:13mm; height:13mm; flex:none; }
+
+        .estilo { display:flex; align-items:baseline; gap:1.5mm; border-top:0.3mm solid var(--line); padding-top:0.8mm; }
+        .estilo .k { font-size:6pt; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); flex:none; }
+        .estilo .v { font-size:12pt; font-weight:800; line-height:1.05; word-break:break-all; }
+
+        .talla { display:flex; align-items:center; gap:1.8mm; }
+        .talla .tv { font-size:13pt; font-weight:700; line-height:1; }
+        .talla .sz { font-size:22pt; font-weight:800; line-height:1; border:0.4mm solid var(--line); border-radius:1.2mm; padding:0.2mm 2mm; }
+
+        .pieces { display:flex; align-items:baseline; justify-content:space-between; gap:1mm; border:0.5mm solid var(--line); border-radius:1mm; padding:0.8mm 2mm; }
+        .pieces .pk { font-size:6.5pt; text-transform:uppercase; letter-spacing:.05em; }
+        .pieces .pv { font-size:19pt; font-weight:800; line-height:1; }
+
+        .po1 { display:flex; align-items:baseline; gap:1.5mm; border-top:0.3mm solid var(--line); padding-top:0.8mm; }
+        .po1 .l { font-size:6pt; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); flex:none; }
+        .po1 .v { font-size:15pt; font-weight:800; line-height:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+        .grid { display:grid; grid-template-columns:1fr 1fr; gap:0.8mm 2mm; }
+        .grid .c { min-width:0; display:flex; flex-direction:column; line-height:1.1; }
+        .grid .l { font-size:5.5pt; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+        .grid .c .v { font-size:8pt; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .grid .stack { gap:0.8mm; }
+        .grid .stack > div { display:flex; flex-direction:column; line-height:1.1; }
+        .grid .wide { grid-column:1 / -1; }
+        .grid .wide .v { white-space:normal; overflow:visible; word-break:break-word; }
+
+        .code { margin-top:auto; text-align:center; font-family:ui-monospace,Consolas,monospace; font-size:6.5pt; letter-spacing:.04em; border-top:0.3mm solid var(--line); padding-top:0.6mm; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .foot { display:flex; justify-content:space-between; font-size:5.5pt; color:var(--muted); }
+
+        @page { size:40mm 80mm; margin:0; }
         @media print {
-          html,body{ background:#fff; } body{ padding:0; }
-          .ticket{ box-shadow:none; margin:0 auto; page-break-after:always; break-after:page; }
-          .ticket:last-child{ page-break-after:auto; break-after:auto; }
-          .notch{ background:#fff; }
+          html,body { background:#fff; }
+          body { padding:0; }
+          .ticket { margin:0; page-break-after:always; break-after:page; }
+          .ticket:last-child { page-break-after:auto; break-after:auto; }
         }
       </style></head>
       <body>
@@ -585,7 +609,7 @@ export default function CuttingEntry() {
                       )}
                     </div>
                     <p className="text-xs text-gray-500 truncate">
-                      {co.work_order_no} · {co.customer_name}{co.color ? ` · ${co.color}` : ""}{co.style_no ? ` · Est. ${co.style_no}` : ""}
+                      {co.work_order_no}{co.customer_po ? ` · PO ${co.customer_po}` : ""} · {co.customer_name}{co.color ? ` · ${co.color}` : ""}{(co.modelo_code || co.style_no) ? ` · Est. ${co.modelo_code || co.style_no}` : ""}
                       {co.fabric || co.fabric_code ? ` · ${[co.fabric_code, co.fabric].filter(Boolean).join(" ")}` : ""}
                     </p>
                   </div>
@@ -618,12 +642,13 @@ export default function CuttingEntry() {
                     {(STATUS[selected.status] || {}).label || selected.status}
                   </span>
                 </div>
-                <p className="text-sm text-gray-600 truncate">{selected.work_order_no} · {selected.customer_name}</p>
+                <p className="text-sm text-gray-600 truncate">{selected.work_order_no}{selected.customer_po ? ` · PO ${selected.customer_po}` : ""} · {selected.customer_name}</p>
               </div>
             </div>
 
             <div className="p-5 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3 text-sm border-b">
-              <Info label="Estilo N°" value={selected.style_no || selected.style_code || selected.estilo} />
+              <Info label="PO cliente" value={selected.customer_po} />
+              <Info label="Estilo N°" value={selected.modelo_code || selected.style_no || selected.style_code || selected.estilo} />
               <Info label="Color" value={selected.color} />
               <Info label="Season" value={selected.season} />
               <Info label="Código de tela" value={selected.fabric_code} />

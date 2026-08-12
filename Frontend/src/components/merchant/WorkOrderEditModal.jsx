@@ -153,7 +153,8 @@ const sizeLabel = (code) => TALLAS.find((t) => t.code === code)?.label || "";
 
 const emptyRow = () => ({
   color: "", estilo: "", customerPo: "",
-  deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }], qty: {},
+  deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }],
+  packing: {}, sku: {},
 });
 
 // Rebuild the step-2 rows from work_order_lines: one row per color+estilo.
@@ -168,10 +169,16 @@ function rowsFromOrder(order) {
         customerPo: l.customerPo || "",
         deliveryDate: dateOnly(l.commitmentDate),
         fabrics: fabricsFromLine(l),
-        qty: {},
+        packing: {},
+        sku: {},
       });
     }
-    map.get(key).qty[l.talla] = num(l.quantity);
+    const g = map.get(key);
+    // La cantidad de la talla se guarda en dos partes: packing + SKU (piezas).
+    const pack = l.packingQty ?? l.packing_qty;
+    const sku = l.skuQty ?? l.sku_qty;
+    g.packing[l.talla] = pack == null || pack === "" ? "" : String(Math.trunc(Number(pack)));
+    g.sku[l.talla] = sku == null || sku === "" ? "" : String(Math.trunc(Number(sku)));
   }
   const rows = [...map.values()];
   if (rows.length > 0) return rows;
@@ -234,9 +241,13 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
   // ------- row helpers --------------------------------------------------
   const setRowField = (i, key, val) =>
     setRows((rs) => rs.map((r, idx) => (idx === i ? { ...r, [key]: val } : r)));
-  const setQty = (i, talla, val) =>
+  // La cantidad de la talla = packing + SKU (piezas). Solo enteros.
+  const setPacking = (i, talla, val) =>
     setRows((rs) => rs.map((r, idx) =>
-      idx === i ? { ...r, qty: { ...r.qty, [talla]: val.replace(/[^0-9.]/g, "") } } : r));
+      idx === i ? { ...r, packing: { ...r.packing, [talla]: val.replace(/[^0-9]/g, "") } } : r));
+  const setSku = (i, talla, val) =>
+    setRows((rs) => rs.map((r, idx) =>
+      idx === i ? { ...r, sku: { ...r.sku, [talla]: val.replace(/[^0-9]/g, "") } } : r));
   const addRow = () => setRows((rs) => [...rs, emptyRow()]);
   const removeRow = (i) => setRows((rs) => (rs.length === 1 ? rs : rs.filter((_, idx) => idx !== i)));
   const duplicateRow = (i) =>
@@ -246,7 +257,8 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
         ...src,
         color: "",
         fabrics: src.fabrics.map((f) => ({ ...f })),
-        qty: {},               // same logistics, fresh color and quantities
+        packing: {},           // same logistics, fresh color and quantities
+        sku: {},
       };
       return [...rs.slice(0, i + 1), copy, ...rs.slice(i + 1)];
     });
@@ -307,6 +319,11 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
       : [...s, code].sort((a, b) => sizeRank(a) - sizeRank(b))));
 
   // ------- derived ------------------------------------------------------
+  // La cantidad de una talla = packing + sku (ambas en piezas).
+  const packingOf = (row, talla) => parseInt(row.packing?.[talla], 10) || 0;
+  const skuOf = (row, talla) => parseInt(row.sku?.[talla], 10) || 0;
+  const sizeQtyOf = (row, talla) => packingOf(row, talla) + skuOf(row, talla);
+
   // One cell per talla × row: exactly the work_order_lines that will be written.
   const cells = useMemo(() => {
     const out = [];
@@ -316,14 +333,17 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
       if (!color) continue;
       const fabrics = cleanFabrics(row.fabrics);
       for (const talla of sizes) {
-        const q = parseFloat(row.qty[talla]);
-        if (isNaN(q) || q <= 0) continue;
+        const packingQty = packingOf(row, talla);
+        const skuQty = skuOf(row, talla);
+        const q = packingQty + skuQty;
+        if (q <= 0) continue;
         out.push({
           talla, color, estilo,
           customerPo: (row.customerPo || "").trim() || null,
           commitmentDate: row.deliveryDate || null,
           fabrics, // each tela carries its own { name, code, yield }
-          quantity: q,
+          packingQty, skuQty,
+          quantity: q, // = packing + sku
         });
       }
     }
@@ -525,7 +545,7 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
             ) : (
               <div className="space-y-3">
                 {rows.map((row, i) => {
-                  const rowPieces = sizes.reduce((sum, t) => sum + (parseFloat(row.qty[t]) || 0), 0);
+                  const rowPieces = sizes.reduce((sum, t) => sum + sizeQtyOf(row, t), 0);
                   const estiloBad = row.color.trim() && (row.estilo || "").trim().length !== 6;
                   const dup = isDuplicate(row);
                   return (
@@ -629,19 +649,47 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
                         </button>
                       </div>
 
-                      {/* quantities */}
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {sizes.map((s) => (
-                          <div key={s} className="w-16">
-                            <span className="block text-center text-[10px] text-slate-400">
-                              <span className="block font-mono text-[11px] font-bold text-slate-700">{s}</span>
-                              {sizeLabel(s)}
-                            </span>
-                            <input value={row.qty[s] || ""} onChange={(e) => setQty(i, s, e.target.value)}
-                              inputMode="numeric" placeholder="0"
-                              className={`mt-0.5 w-full ${controlSm} font-mono text-center`} />
-                          </div>
-                        ))}
+                      {/* Cantidad por talla = packing + SKU (ambas en piezas) */}
+                      <div className="mt-3">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                            Cantidad por talla
+                          </span>
+                          <span className="text-[10px] text-slate-400 normal-case">· packing + SKU = cantidad de la talla</span>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {sizes.map((s) => {
+                            const packingV = row.packing?.[s] || "";
+                            const skuV = row.sku?.[s] || "";
+                            const total = sizeQtyOf(row, s);
+                            return (
+                              <div key={s} className="w-20 rounded-lg border border-slate-200 bg-white p-1.5">
+                                <span className="block text-center text-[10px] text-slate-400 leading-tight">
+                                  <span className="block font-mono text-[11px] font-bold text-slate-700">{s}</span>
+                                  {sizeLabel(s)}
+                                </span>
+                                <label className="block mt-1">
+                                  <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">Packing</span>
+                                  <input value={packingV} onChange={(e) => setPacking(i, s, e.target.value)}
+                                    inputMode="numeric" placeholder="0" title="Piezas en packing (surtido)"
+                                    className={`mt-0.5 w-full ${controlSm} font-mono text-center`} />
+                                </label>
+                                <label className="block mt-1">
+                                  <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">SKU</span>
+                                  <input value={skuV} onChange={(e) => setSku(i, s, e.target.value)}
+                                    inputMode="numeric" placeholder="0" title="Piezas en SKU (talla sólida)"
+                                    className={`mt-0.5 w-full ${controlSm} font-mono text-center`} />
+                                </label>
+                                <div className="mt-1 border-t border-dashed border-slate-200 pt-1">
+                                  <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">Cant.</span>
+                                  <span className={`block text-center font-mono text-sm ${total > 0 ? "text-slate-900 font-bold" : "text-slate-300"}`}>
+                                    {total.toLocaleString()}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                   );

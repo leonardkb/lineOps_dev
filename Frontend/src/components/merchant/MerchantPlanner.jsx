@@ -45,6 +45,7 @@ import { API_URL, TALLAS } from "../../lib/masterCodeCatalog";
 
 const STORE_KEY = "merchant_plan_v2";
 const EQUIV_DEFAULT = 10;
+const WEEK_CAP = 50000;   // máximo de PIEZAS REALES (cantidad) asignables por semana
 const MES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
 const WEEKS_AHEAD = 26;   // ~6 months
 const CELL_W = 104;       // px — week column / cell width
@@ -62,6 +63,14 @@ const PALETTE = [
   { solid: "bg-cyan-500",    soft: "bg-cyan-50",    text: "text-cyan-700",    ring: "ring-cyan-300",    dot: "bg-cyan-500" },
   { solid: "bg-fuchsia-500", soft: "bg-fuchsia-50", text: "text-fuchsia-700", ring: "ring-fuchsia-300", dot: "bg-fuchsia-500" },
   { solid: "bg-lime-500",    soft: "bg-lime-50",    text: "text-lime-700",    ring: "ring-lime-300",    dot: "bg-lime-500" },
+  { solid: "bg-teal-500",    soft: "bg-teal-50",    text: "text-teal-700",    ring: "ring-teal-300",    dot: "bg-teal-500" },
+  { solid: "bg-indigo-500",  soft: "bg-indigo-50",  text: "text-indigo-700",  ring: "ring-indigo-300",  dot: "bg-indigo-500" },
+  { solid: "bg-orange-500",  soft: "bg-orange-50",  text: "text-orange-700",  ring: "ring-orange-300",  dot: "bg-orange-500" },
+  { solid: "bg-pink-500",    soft: "bg-pink-50",    text: "text-pink-700",    ring: "ring-pink-300",    dot: "bg-pink-500" },
+  { solid: "bg-sky-500",     soft: "bg-sky-50",     text: "text-sky-700",     ring: "ring-sky-300",     dot: "bg-sky-500" },
+  { solid: "bg-purple-500",  soft: "bg-purple-50",  text: "text-purple-700",  ring: "ring-purple-300",  dot: "bg-purple-500" },
+  { solid: "bg-green-600",   soft: "bg-green-50",   text: "text-green-700",   ring: "ring-green-300",   dot: "bg-green-600" },
+  { solid: "bg-red-500",     soft: "bg-red-50",     text: "text-red-700",     ring: "ring-red-300",     dot: "bg-red-500" },
 ];
 const NEUTRAL = { solid: "bg-slate-400", soft: "bg-slate-50", text: "text-slate-600", ring: "ring-slate-300", dot: "bg-slate-400" };
 const colorForKey = (key) => {
@@ -69,6 +78,12 @@ const colorForKey = (key) => {
   for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
   return PALETTE[h % PALETTE.length];
 };
+
+// Cards/tiles are colored by TIPOMODELO (style_code): every order of the same
+// model shares one color, and different models get different colors. Falls back
+// to estilo, then the job key, when a style_code isn't present.
+const modelKeyOf = (j) => String((j && (j.style_code || j.estilo)) || (j && j.key) || "");
+const colorForJob = (j) => colorForKey(modelKeyOf(j));
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
@@ -113,6 +128,7 @@ const ymd = (v) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 const mondayOf = (dateStr) => ymd(startOfWeek(new Date(`${ymd(dateStr)}T00:00:00`), { weekStartsOn: 1 }));
+const fmtDate = (v) => { const s = ymd(v); return s ? s.split("-").reverse().join("/") : "—"; };
 const sizeRank = (code) => { const i = TALLAS.findIndex((t) => t.code === code); return i === -1 ? 999 : i; };
 
 // PO cliente → estilo → talla×cantidad, from an order's lines. Pass a `color`
@@ -212,30 +228,45 @@ function buildJobs(orders, eq) {
       photo: o.master_code_photo_url || null, status: o.status,
       sam, eqPerPiece, commitment_date: o.commitment_date || null,
     };
-    const mk = (color, qty, sizes, estilo, breakdown) => ({
-      ...base, key: `${base.workOrderId}:${color || ""}`, color: color || null,
-      estilo: estilo || o.estilo || "",
-      sizes: (sizes || []).slice().sort((a, b) => sizeRank(a.talla) - sizeRank(b.talla)),
-      // PO cliente → estilo → talla×cantidad for this color ([] when no line detail).
-      breakdown: breakdown || [],
-      cantidad: qty, eqPieces: qty * eqPerPiece,
-    });
+    // A line/color may carry its own delivery date (fecha de entrega); fall
+    // back to the order header's commitment_date when it doesn't.
+    const pickDate = (x) => {
+      const d = x && (x.commitmentDate ?? x.commitment_date ?? x.deliveryDate ?? x.delivery_date);
+      return d ? ymd(d) : "";
+    };
+    const mk = (color, qty, sizes, estilo, breakdown, dates) => {
+      const src = (dates && dates.length ? dates : (base.commitment_date ? [ymd(base.commitment_date)] : [])).filter(Boolean);
+      const uniq = [...new Set(src)].sort();
+      return {
+        ...base, key: `${base.workOrderId}:${color || ""}`, color: color || null,
+        estilo: estilo || o.estilo || "",
+        sizes: (sizes || []).slice().sort((a, b) => sizeRank(a.talla) - sizeRank(b.talla)),
+        // PO cliente → estilo → talla×cantidad for this color ([] when no line detail).
+        breakdown: breakdown || [],
+        cantidad: qty, eqPieces: qty * eqPerPiece,
+        // Delivery date(s) for this color: earliest is the binding one.
+        deliveryDate: uniq[0] || null,
+        deliveryDateMax: uniq[uniq.length - 1] || null,
+        deliveryDates: uniq,
+      };
+    };
     const lines = Array.isArray(o.lines) ? o.lines.filter((l) => l && l.color != null) : [];
     const colors = Array.isArray(o.colors) ? o.colors.filter((c) => c && c.color != null) : [];
     if (lines.length) {
       const byColor = new Map();
       for (const l of lines) {
-        const cur = byColor.get(l.color) || { color: l.color, qty: 0, sizeMap: new Map(), estilos: new Set() };
+        const cur = byColor.get(l.color) || { color: l.color, qty: 0, sizeMap: new Map(), estilos: new Set(), dates: new Set() };
         const q = num(l.quantity);
         cur.qty += q;
         if (l.talla) cur.sizeMap.set(l.talla, (cur.sizeMap.get(l.talla) || 0) + q);
         if (l.estilo) cur.estilos.add(l.estilo);
+        const dd = pickDate(l); if (dd) cur.dates.add(dd);
         byColor.set(l.color, cur);
       }
       for (const c of byColor.values())
-        jobs.push(mk(c.color, c.qty, [...c.sizeMap.entries()].map(([talla, quantity]) => ({ talla, quantity })), [...c.estilos].join(", "), buildBreakdownFromLines(lines, c.color)));
+        jobs.push(mk(c.color, c.qty, [...c.sizeMap.entries()].map(([talla, quantity]) => ({ talla, quantity })), [...c.estilos].join(", "), buildBreakdownFromLines(lines, c.color), [...c.dates]));
     } else if (colors.length) {
-      for (const c of colors) jobs.push(mk(c.color, num(c.quantity), [], o.estilo));
+      for (const c of colors) jobs.push(mk(c.color, num(c.quantity), [], o.estilo, undefined, pickDate(c) ? [pickDate(c)] : undefined));
     } else {
       jobs.push(mk(o.color || null, num(o.total_to_produce ?? o.quantity ?? 0), [], o.estilo));
     }
@@ -388,10 +419,50 @@ export default function MerchantPlanner({
 
   const totalsFor = (list) => list.reduce((a, j) => ({ real: a.real + j.cantidad, eq: a.eq + j.eqPieces }), { real: 0, eq: 0 });
 
+  // Real pieces (cantidad) already committed to each period — computed from ALL
+  // jobs (not the search-filtered board) so the weekly cap can't be side-stepped
+  // by filtering. Keyed by period.key; used for both enforcement and the header.
+  const realByPeriod = useMemo(() => {
+    const m = new Map(periods.map((p) => [p.key, 0]));
+    for (const j of jobs) {
+      const date = assignments[j.key];
+      if (!date) continue;
+      const p = periodOfDate(date);
+      if (p && m.has(p.key)) m.set(p.key, m.get(p.key) + num(j.cantidad));
+    }
+    return m;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, assignments, periods]);
+
+  // Committed real pieces in a period, optionally excluding one job (the one
+  // being moved), so re-dropping a tile inside its own week never double-counts.
+  const weekRealTotal = (period, excludeKey) => {
+    const base = realByPeriod.get(period.key) || 0;
+    const exDate = excludeKey ? assignments[excludeKey] : null;
+    const exInWeek = exDate && exDate >= period.start && exDate <= period.end;
+    const exQty = exInWeek ? num(jobs.find((x) => x.key === excludeKey)?.cantidad) : 0;
+    return base - exQty;
+  };
+
   const assignToWeek = (jobKey, period) => {
     if (!assignable) return;
     // Dropped back onto its current week — nothing to do (matches PlanBoard).
     if (assignments[jobKey] === period.start) { setArmed(null); setDragKey(null); setDropTarget(null); return; }
+    // Enforce the weekly cap on real pieces: block anything that would push the
+    // destination week past WEEK_CAP, and explain why.
+    const job = jobs.find((x) => x.key === jobKey);
+    const incoming = num(job?.cantidad);
+    const current = weekRealTotal(period, jobKey);
+    if (current + incoming > WEEK_CAP) {
+      const remaining = Math.max(0, WEEK_CAP - current);
+      showToast(
+        `${period.top} llegaría a ${fmtInt(current + incoming)} pzas — supera el límite de ${fmtInt(WEEK_CAP)}/semana. ` +
+        `Ya tiene ${fmtInt(current)}; solo caben ${fmtInt(remaining)} más.`,
+        true,
+      );
+      setArmed(null); setDragKey(null); setDropTarget(null);
+      return;
+    }
     setAssignments((prev) => ({ ...prev, [jobKey]: period.start }));
     setArmed(null); setDragKey(null); setDropTarget(null);
     const j = jobs.find((x) => x.key === jobKey);
@@ -583,6 +654,7 @@ export default function MerchantPlanner({
             periods={periods} board={board} active={active} dragKey={dragKey} armed={armed}
             dropTarget={dropTarget} setDropTarget={setDropTarget} setDragKey={setDragKey}
             assignToWeek={assignToWeek} onOpenJob={setSelectedJob} onArmJob={setArmed}
+            realByPeriod={realByPeriod} weekCap={WEEK_CAP} activeJob={filteredJobs.find((x) => x.key === active)}
           />
 
           {board.outOfRange > 0 && (
@@ -610,7 +682,7 @@ export default function MerchantPlanner({
             <div className="p-4 max-h-[60vh] overflow-y-auto divide-y divide-slate-100">
               {aggModal.jobs.slice().sort((a, b) => b.eqPieces - a.eqPieces).map((j) => (
                 <div key={j.key} className="py-2 flex items-center gap-2">
-                  <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${colorForKey(j.key).dot}`} />
+                  <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${colorForJob(j).dot}`} />
                   <span className="font-mono text-sm font-medium text-slate-800 truncate">{j.work_order_no}{j.color ? ` · ${j.color}` : ""}</span>
                   <span className="ml-auto text-sm text-slate-600 whitespace-nowrap">{fmtInt(j.eqPieces)} eq</span>
                 </div>
@@ -643,7 +715,7 @@ export default function MerchantPlanner({
 
 /* ============================================================= week grid */
 
-function WeekGrid({ periods, board, active, dragKey, armed, dropTarget, setDropTarget, setDragKey, assignToWeek, onOpenJob, onArmJob }) {
+function WeekGrid({ periods, board, active, dragKey, armed, dropTarget, setDropTarget, setDragKey, assignToWeek, onOpenJob, onArmJob, realByPeriod, weekCap, activeJob }) {
   const maxAssigned = Math.max(0, ...periods.map((p) => (board.byPeriod.get(p.key) || []).length));
   const rows = Math.max(MIN_ROWS, maxAssigned + 1);
   // A drag that ends on a valid target still emits a click on the source tile in
@@ -657,13 +729,23 @@ function WeekGrid({ periods, board, active, dragKey, armed, dropTarget, setDropT
           const list = board.byPeriod.get(p.key) || [];
           const isDrop = dropTarget === p.key && active != null;
           const colTotalEq = list.reduce((s, j) => s + j.eqPieces, 0);
+          // Weekly real-piece capacity (source-of-truth totals, cap enforced in
+          // assignToWeek). Preview whether the picked-up color would fit here.
+          const realTotal = realByPeriod?.get(p.key) || 0;
+          const capPct = weekCap ? Math.min(1, realTotal / weekCap) : 0;
+          const atCap = weekCap ? realTotal >= weekCap : false;
+          const alreadyHere = activeJob && list.some((x) => x.key === activeJob.key);
+          const wouldExceed = !!weekCap && !!activeJob && !alreadyHere &&
+            realTotal + num(activeJob?.cantidad) > weekCap;
           // The whole column is the drop zone, so a color can be dropped onto an
           // empty slot OR onto a tile that is already sitting in that week.
           // dragleave only counts when the pointer truly exits the column —
           // otherwise crossing between child cells clears the highlight.
           return (
             <div key={p.key} style={{ width: CELL_W }}
-              className={`shrink-0 rounded-lg transition ${isDrop ? "ring-2 ring-blue-400 bg-blue-50/50" : ""}`}
+              className={`shrink-0 rounded-lg transition ${
+                wouldExceed ? "ring-2 ring-rose-300 bg-rose-50/40"
+                : isDrop ? "ring-2 ring-blue-400 bg-blue-50/50" : ""}`}
               onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setDropTarget(p.key); }}
               onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDropTarget((t) => (t === p.key ? null : t)); }}
               onDrop={(e) => { e.preventDefault(); setDropTarget(null); const k = dragKey ?? e.dataTransfer.getData("text/plain"); if (k) assignToWeek(k, p); setDragKey(null); }}
@@ -672,7 +754,18 @@ function WeekGrid({ periods, board, active, dragKey, armed, dropTarget, setDropT
               <div className="sticky top-0 z-10 bg-white text-center pb-1.5">
                 <div className="text-[11px] font-bold text-slate-500 leading-tight">{p.top}</div>
                 <div className="text-[11px] text-slate-400 leading-tight">{p.bottom}</div>
-                {colTotalEq > 0 && <div className="text-[10px] font-mono font-semibold text-blue-600 leading-tight">{fmtInt(colTotalEq)}</div>}
+                {colTotalEq > 0 && <div className="text-[10px] font-mono font-semibold text-blue-600 leading-tight">{fmtInt(colTotalEq)} eq</div>}
+                {weekCap ? (
+                  <div className="px-0.5 pt-0.5" title={`Piezas reales asignadas · límite ${fmtInt(weekCap)}/semana`}>
+                    <div className={`text-[9px] font-mono leading-tight ${atCap ? "text-rose-600 font-bold" : capPct >= 0.8 ? "text-amber-600" : "text-slate-400"}`}>
+                      {fmtInt(realTotal)}/{fmtInt(weekCap)}
+                    </div>
+                    <div className="mt-0.5 h-1 w-full rounded-full bg-slate-100 overflow-hidden">
+                      <div className={`h-full transition-all ${atCap ? "bg-rose-500" : capPct >= 0.8 ? "bg-amber-500" : "bg-blue-400"}`}
+                        style={{ width: `${Math.round(capPct * 100)}%` }} />
+                    </div>
+                  </div>
+                ) : null}
               </div>
 
               {/* Cells */}
@@ -680,7 +773,7 @@ function WeekGrid({ periods, board, active, dragKey, armed, dropTarget, setDropT
                 {Array.from({ length: rows }).map((_, r) => {
                   const j = list[r];
                   if (j) {
-                    const c = colorForKey(j.key);
+                    const c = colorForJob(j);
                     const isArmed = armed === j.key;
                     const isDragging = dragKey === j.key;
                     // Placed tiles are draggable (move to another week) and tappable:
@@ -693,7 +786,7 @@ function WeekGrid({ periods, board, active, dragKey, armed, dropTarget, setDropT
                           if (Date.now() - draggedAtRef.current < 300) return;
                           if (isArmed) { onArmJob(null); onOpenJob(j); } else onArmJob(j.key);
                         }}
-                        title={`${j.work_order_no}${j.color ? " · " + j.color : ""} · ${j.estilo || ""} · ${fmtInt(j.eqPieces)} pzas eq — arrástrala a otra semana, o tócala y luego toca la semana destino`}
+                        title={`${j.work_order_no}${j.color ? " · " + j.color : ""} · ${j.estilo || ""}${j.deliveryDate ? " · Entrega " + fmtDate(j.deliveryDate) : ""} · ${fmtInt(j.eqPieces)} pzas eq — arrástrala a otra semana, o tócala y luego toca la semana destino`}
                         style={{ height: CELL_H }}
                         className={`rounded-lg ${c.solid} text-white flex flex-col items-center justify-center cursor-grab active:cursor-grabbing shadow-sm hover:shadow transition leading-none px-1
                           ${isDragging ? "opacity-40" : ""}
@@ -708,8 +801,10 @@ function WeekGrid({ periods, board, active, dragKey, armed, dropTarget, setDropT
                   return (
                     <button key={`e${r}`} type="button" style={{ height: CELL_H }}
                       onClick={() => { if (active != null) assignToWeek(active, p); }}
+                      title={wouldExceed && active != null ? `Semana llena — límite ${fmtInt(weekCap)} pzas/semana` : undefined}
                       className={`rounded-lg border transition ${
-                        isDrop && isPrimary ? "border-blue-400 bg-blue-100 ring-2 ring-blue-300"
+                        wouldExceed && active != null ? "border-rose-200 bg-rose-50/50 cursor-not-allowed"
+                        : isDrop && isPrimary ? "border-blue-400 bg-blue-100 ring-2 ring-blue-300"
                         : active != null ? "border-blue-200 bg-blue-50/40 hover:bg-blue-50 cursor-pointer"
                         : "border-slate-200 bg-slate-50"}`} />
                   );
@@ -764,7 +859,7 @@ function AggGrid({ periods, board, totalsFor, onOpen }) {
 /* ================================================================= pieces */
 
 function JobCard({ j, armed, onTap, onDragStart, onDragEnd }) {
-  const c = colorForKey(j.key);
+  const c = colorForJob(j);
   return (
     <div draggable onDragStart={(e) => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", j.key); onDragStart?.(); }} onDragEnd={onDragEnd} onClick={onTap}
       title="Arrástrala a una semana, o tócala y luego toca una celda"
@@ -781,6 +876,17 @@ function JobCard({ j, armed, onTap, onDragStart, onDragEnd }) {
         <span className="font-mono text-slate-500">{j.style_code}</span>
         {j.estilo ? <> · <span className="text-slate-400">Estilo</span> <span className="font-mono">{j.estilo}</span></> : null}
       </p>
+      {j.deliveryDate && (
+        <p className="text-[11px] mt-0.5 flex items-center gap-1 truncate">
+          <CalendarDays size={11} className="text-slate-400 shrink-0" />
+          <span className="text-slate-400">Entrega</span>
+          <span className="font-mono font-semibold text-slate-700">
+            {j.deliveryDates && j.deliveryDates.length > 1
+              ? `${fmtDate(j.deliveryDate)} – ${fmtDate(j.deliveryDateMax)}`
+              : fmtDate(j.deliveryDate)}
+          </span>
+        </p>
+      )}
       {j.breakdown && j.breakdown.length > 0 ? (
         <div className="mt-1 space-y-1.5 border-t border-slate-100 pt-1.5">
           {j.breakdown.map((po, pi) => (
@@ -825,7 +931,7 @@ function JobCard({ j, armed, onTap, onDragStart, onDragEnd }) {
 }
 
 function JobDetailModal({ job, assignedWeek, weeks, onMove, onClose, onRemove }) {
-  const c = colorForKey(job.key);
+  const c = colorForJob(job);
   const curWeek = assignedWeek ? mondayOf(assignedWeek) : "";
   const Row = ({ k, v, mono }) => (
     <div className="flex justify-between gap-3 py-1 border-b border-slate-50 last:border-0">
@@ -849,6 +955,11 @@ function JobDetailModal({ job, assignedWeek, weeks, onMove, onClose, onRemove })
           {job.customer_po && <Row k="PO cliente" v={job.customer_po} mono />}
           <Row k="Estilo (code)" v={job.style_code} mono />
           <Row k="Estilo N°" v={job.estilo} mono />
+          <Row k="Fecha de entrega" v={job.deliveryDate
+            ? (job.deliveryDates && job.deliveryDates.length > 1
+                ? `${fmtDate(job.deliveryDate)} – ${fmtDate(job.deliveryDateMax)}`
+                : fmtDate(job.deliveryDate))
+            : "—"} mono />
           <Row k="Cantidad" v={`${fmtInt(job.cantidad)} pzas`} mono />
           <Row k="SAM" v={`${fmt2(job.sam)} min`} mono />
           <Row k="eq/pza" v={fmt2(job.eqPerPiece)} mono />
@@ -946,7 +1057,7 @@ function PlannerTable({ jobs, weeks, currentDate, assignments, onAssign, onUnass
           {jobs.map((j) => {
             const assignedWeek = assignments[j.key] ? mondayOf(assignments[j.key]) : "";
             const known = weekOptions.some((w) => w.start === assignedWeek);
-            const c = colorForKey(j.key);
+            const c = colorForJob(j);
             return (
               <tr key={j.key} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 align-top">
                 <td className="px-4 py-2 whitespace-nowrap font-mono font-bold text-slate-800"><span className="inline-flex items-center gap-1.5"><span className={`w-2 h-2 rounded-full ${c.dot}`} />{j.work_order_no}</span></td>

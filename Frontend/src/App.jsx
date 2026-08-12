@@ -21,6 +21,8 @@ import NuevaOrdenWizard from "./components/merchant/NuevaOrdenWizard";
 import CuttingApp from "./pages/Corte/CuttingApp";
 import FinishedWarehouse from "./pages/FWHS/FinishedWarehouse";
 import AdminUsers from "./pages/AdminUsers";
+import QualityHead from "./pages/quality_head/QualityHead";
+import MerchantAnalytics from "./pages/MerchantAnalytics";
 export default function App() {
   return (
     <Router>
@@ -47,6 +49,8 @@ export default function App() {
         <Route path="/cutting" element={<CuttingApp />} /> {/*cutting app route */}
         <Route path="/users" element={<AdminUsers />} /> {/*users route */}
         <Route path="/fws" element={<FinishedWarehouse />} /> {/*finished warehouse route */}
+        <Route path="/quality-head" element={<QualityHead />} /> {/*quality head route */}
+        <Route path ="merchant-analytics" element={<MerchantAnalytics/>} /> {/*merchant analytics route */}
       </Routes>
     </Router>
   );

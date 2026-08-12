@@ -61,6 +61,8 @@ export default function LoginPage() {
         navigate("/users", { replace: true });
       }else if(roleNorm === "finishedwarehouse") {
         navigate("/fws", { replace: true });
+      }else if(roleNorm === "qualityhead") {
+        navigate("/quality-head", { replace: true });
       }
       else {
         navigate("/", { replace: true });

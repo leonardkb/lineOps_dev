@@ -101,7 +101,14 @@ function groupLines(lines) {
       });
     }
     const g = map.get(key);
-    g.sizes.push({ talla: l.talla, quantity: Number(l.quantity) || 0 });
+    const packingQty = l.packingQty ?? l.packing_qty ?? null;
+    const skuQty = l.skuQty ?? l.sku_qty ?? null;
+    g.sizes.push({
+      talla: l.talla,
+      quantity: Number(l.quantity) || 0,
+      packingQty: packingQty == null || packingQty === "" ? null : Number(packingQty),
+      skuQty: skuQty == null || skuQty === "" ? null : Number(skuQty),
+    });
     g.total += Number(l.quantity) || 0;
   }
   const groups = [...map.values()];
@@ -240,7 +247,7 @@ export default function WorkOrderTable({ orders, onEdit }) {
                               <th className="px-3 py-2">Entrega</th>
                               <th className="px-3 py-2">Telas · código</th>
                               <th className="px-3 py-2 text-right">Rend.</th>
-                              <th className="px-3 py-2">Tallas · cantidad</th>
+                              <th className="px-3 py-2">Tallas · cantidad (Packing + SKU)</th>
                               <th className="px-3 py-2 text-right">Total</th>
                             </tr>
                           </thead>
@@ -267,11 +274,27 @@ export default function WorkOrderTable({ orders, onEdit }) {
                                 <td className="px-3 py-2 text-right font-mono text-slate-600 whitespace-nowrap">{fmtNum(g.yield)}</td>
                                 <td className="px-3 py-2">
                                   <div className="flex flex-wrap gap-1">
-                                    {g.sizes.map((s) => (
-                                      <span key={s.talla} className="inline-flex items-center gap-0.5 rounded bg-slate-100 border border-slate-200 px-1.5 py-0.5 font-mono text-slate-700">
-                                        {s.talla}<span className="text-slate-400">×</span>{s.quantity.toLocaleString()}
-                                      </span>
-                                    ))}
+                                    {g.sizes.map((s) => {
+                                      const hasSplit = s.packingQty != null || s.skuQty != null;
+                                      const pk = s.packingQty || 0;
+                                      const sk = s.skuQty || 0;
+                                      return (
+                                        <span key={s.talla}
+                                          className="inline-flex flex-col items-center rounded bg-slate-100 border border-slate-200 px-1.5 py-0.5 font-mono text-slate-700 leading-tight">
+                                          <span>
+                                            {s.talla}<span className="text-slate-400">×</span>{s.quantity.toLocaleString()}
+                                          </span>
+                                          {hasSplit && (
+                                            <span className="mt-0.5 text-[10px] text-slate-400"
+                                              title={`Packing ${pk.toLocaleString()} + SKU ${sk.toLocaleString()} = ${s.quantity.toLocaleString()}`}>
+                                              P {pk.toLocaleString()}
+                                              <span className="mx-0.5 text-slate-300">+</span>
+                                              S {sk.toLocaleString()}
+                                            </span>
+                                          )}
+                                        </span>
+                                      );
+                                    })}
                                   </div>
                                 </td>
                                 <td className="px-3 py-2 text-right font-mono font-semibold text-slate-800 whitespace-nowrap">{g.total.toLocaleString()}</td>

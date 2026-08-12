@@ -8,6 +8,7 @@ import OrderStatus from "../components/planner/OrderStatus";
 import CutOrders from "../components/planner/CutOrders";
 import LineAssignmentForm from "../components/planner/LineAssignmentForm";
 import PlanBoard from "../components/planner/PlanBoard";
+import PendingBalances from "../components/planner/PendingBalances";
 
 export default function AdvancedPlanningPage() {
   const [activeTab, setActiveTab] = useState("dashboard");
@@ -136,6 +137,8 @@ export default function AdvancedPlanningPage() {
 
           {/* Read-only order status view (assignment happens in Plan Board) */}
           {activeTab === "status" && <OrderStatus />}
+
+          {activeTab === "Pending" && <PendingBalances />}
 
           {activeTab === "cut" && <CutOrders />}
 

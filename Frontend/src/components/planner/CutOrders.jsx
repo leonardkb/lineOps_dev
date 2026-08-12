@@ -338,6 +338,7 @@ export default function CutOrders() {
             workOrderId: wo.id,
             work_order_no: wo.work_order_no,
             customer_name: wo.customer_name,
+            customer_po: wo.customer_po,
             color: g.color,
             estilo: g.estilo || wo.estilo || wo.style_code || "",
             sizes: g.sizes,
@@ -625,6 +626,7 @@ export default function CutOrders() {
                       </div>
                       <p className="text-xs text-gray-500 truncate">
                         {co.work_order_no} · {co.customer_name}
+                        {co.customer_po ? ` · PO cliente ${co.customer_po}` : ""}
                         {co.fabric || co.fabric_code ? ` · ${[co.fabric_code, co.fabric].filter(Boolean).join(" ")}` : ""}
                         {co.style_no ? ` · Estilo ${co.style_no}` : ""}{co.season ? ` · ${co.season}` : ""}
                       </p>
@@ -710,7 +712,7 @@ export default function CutOrders() {
                     </div>
                   )}
                   <p className="text-xs text-gray-500 truncate mt-0.5">
-                    {job.customer_name}{job.estilo ? ` · Estilo ${job.estilo}` : ""}
+                    {job.customer_name}{job.customer_po ? ` · PO cliente ${job.customer_po}` : ""}{job.estilo ? ` · Estilo ${job.estilo}` : ""}
                   </p>
                   <div className="mt-1 flex items-center justify-between text-xs">
                     <span className="font-medium text-amber-700">{Math.round(job.remaining).toLocaleString()} pzas</span>

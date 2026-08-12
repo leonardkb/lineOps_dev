@@ -124,8 +124,8 @@ export default function NuevaOrdenWizard() {
   // Each line may use SEVERAL fabrics, each with its own code:
   //   fabrics: [{ name, code }, ...]
   const [colorRows, setColorRows] = useState([
-    { color: "", estilo: "", qty: {}, customerPo: "", deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }] },
-  ]); // qty keyed by talla; yield is captured per tela
+    { color: "", estilo: "", packing: {}, sku: {}, customerPo: "", deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }] },
+  ]); // packing / sku (piezas) keyed by talla; la cantidad de la talla = packing + sku
 
   // step 3 — customer
   const [customerId, setCustomerId] = useState("");
@@ -191,6 +191,11 @@ export default function NuevaOrdenWizard() {
   // ------- derived -----------------------------------------------------
   const styleBase = `${tipo}${modelo}${correlativo}`;
 
+  // La cantidad de una talla = packing + sku (ambas en piezas).
+  const packingOf = (row, talla) => parseInt(row.packing?.[talla], 10) || 0;
+  const skuOf = (row, talla) => parseInt(row.sku?.[talla], 10) || 0;
+  const sizeQtyOf = (row, talla) => packingOf(row, talla) + skuOf(row, talla);
+
   const cells = useMemo(() => {
     const out = [];
     for (const row of colorRows) {
@@ -202,8 +207,14 @@ export default function NuevaOrdenWizard() {
         customerPo: (row.customerPo || "").trim() || null,
       };
       for (const talla of sizes) {
-        const q = parseFloat(row.qty[talla]);
-        if (!isNaN(q) && q > 0) out.push({ talla, color, ...meta, quantity: q });
+        const packingQty = packingOf(row, talla);
+        const skuQty = skuOf(row, talla);
+        const q = packingQty + skuQty;
+        if (q > 0) out.push({
+          talla, color, ...meta,
+          packingQty, skuQty,
+          quantity: q, // = packing + sku
+        });
       }
     }
     return out;
@@ -212,47 +223,64 @@ export default function NuevaOrdenWizard() {
   // Per-color estilo checks (step 2)
   const activeColorRows = colorRows.filter((r) => r.color.trim());
   const colorList = activeColorRows.map((r) => r.color.trim());
-  // Same color+estilo may repeat — each repeat becomes its own PO (see poPlan).
+  // A row's color+estilo may repeat; POs are split by color+estilo+PO+entrega (see poPlan).
   const allEstiloValid =
     activeColorRows.length > 0 && activeColorRows.every((r) => (r.estilo || "").trim().length === 6);
 
-  // Build the PO buckets:
-  //   • every distinct (color+estilo) line goes into ONE PO
-  //   • a REPEATED (color+estilo) line opens a second PO — a PO can't hold the
-  //     same color+estilo twice (unique index on work_order_id, talla, color, estilo)
-  //
-  // PO cliente, entrega, tela, código de tela and rendimiento travel WITH the
-  // line (work_order_lines), so a single PO may hold lines with different
-  // fabrics or dates. The header keeps the first line's values as a summary.
+  // Build the PO buckets: ONE PO per (color + estilo + PO cliente + fecha de
+  // entrega). Rows that share all four merge into the same PO; the rest of the
+  // details (tallas, cantidades, telas, código de tela, rendimiento) travel with
+  // the bucket. A repeated talla inside a bucket has its quantity summed and its
+  // telas unioned — the (work_order_id, talla, color, estilo) unique index allows
+  // only one line per size in a PO. The header keeps the bucket's values as a
+  // summary. This mirrors the split the backend enforces.
   const poPlan = useMemo(() => {
-    const seen = new Set();
-    let mainIdx = -1;
-    const buckets = [];
+    const order = [];            // first-seen order of the buckets
+    const buckets = new Map();   // key -> { cells: [] }
     for (const row of colorRows) {
       const color = row.color.trim();
       const est = (row.estilo || "").trim();
       if (!color || est.length !== 6) continue;
 
+      const customerPo = (row.customerPo || "").trim() || null;
+      const commitmentDate = row.deliveryDate || null;
       const meta = {
         estilo: est,
-        customerPo: (row.customerPo || "").trim() || null,
-        commitmentDate: row.deliveryDate || null,
+        customerPo,
+        commitmentDate,
         fabrics: cleanFabrics(row.fabrics),
       };
       const rowCells = [];
       for (const talla of sizes) {
-        const q = parseFloat(row.qty[talla]);
-        if (!isNaN(q) && q > 0) rowCells.push({ talla, color, ...meta, quantity: q });
+        const packingQty = packingOf(row, talla);
+        const skuQty = skuOf(row, talla);
+        const q = packingQty + skuQty;
+        if (q > 0) rowCells.push({
+          talla, color, ...meta,
+          packingQty, skuQty,
+          quantity: q,
+        });
       }
       if (rowCells.length === 0) continue;
 
-      const key = `${color}|${est}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        if (mainIdx === -1) { buckets.push({ cells: [], main: true }); mainIdx = buckets.length - 1; }
-        buckets[mainIdx].cells.push(...rowCells);
-      } else {
-        buckets.push({ cells: rowCells, main: false });
+      const key = `${color}|${est}|${customerPo || ""}|${commitmentDate || ""}`;
+      let bucket = buckets.get(key);
+      if (!bucket) { bucket = { cells: [] }; buckets.set(key, bucket); order.push(key); }
+      for (const cell of rowCells) {
+        const dup = bucket.cells.find((c) => c.talla === cell.talla);
+        if (dup) {
+          dup.quantity += cell.quantity;
+          // packing y sku son piezas: se suman igual que la cantidad.
+          dup.packingQty += cell.packingQty;
+          dup.skuQty += cell.skuQty;
+          const seenTela = new Set(dup.fabrics.map((f) => `${f.name}|${f.code || ""}`.toUpperCase()));
+          for (const f of cell.fabrics || []) {
+            const k = `${f.name}|${f.code || ""}`.toUpperCase();
+            if (!seenTela.has(k)) { seenTela.add(k); dup.fabrics = [...dup.fabrics, f]; }
+          }
+        } else {
+          bucket.cells.push({ ...cell, fabrics: [...(cell.fabrics || [])] });
+        }
       }
     }
     const firstOf = (cells, k) => cells.find((c) => c[k])?.[k] || null;
@@ -270,13 +298,13 @@ export default function NuevaOrdenWizard() {
       }
       return out;
     };
-    return buckets
+    return order
+      .map((key) => buckets.get(key))
       .filter((b) => b.cells.length > 0)
       .map((b) => {
         const fabricList = mergeFabrics(b.cells);
         return {
           cells: b.cells,
-          main: b.main,
           // header summary = first line that has a value
           date: firstOf(b.cells, "commitmentDate"),
           fabricList,
@@ -320,15 +348,20 @@ export default function NuevaOrdenWizard() {
   const setEstiloRow = (i, val) =>
     setColorRows((rows) => rows.map((r, idx) =>
       idx === i ? { ...r, estilo: val.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6) } : r));
-  const setQty = (i, talla, val) =>
+  // La cantidad asignada a cada talla se captura en dos partes: packing y SKU.
+  // La cantidad de la talla es la suma de ambas (packing + sku). Solo enteros.
+  const setPacking = (i, talla, val) =>
     setColorRows((rows) => rows.map((r, idx) =>
-      idx === i ? { ...r, qty: { ...r.qty, [talla]: val.replace(/[^0-9.]/g, "") } } : r));
+      idx === i ? { ...r, packing: { ...r.packing, [talla]: val.replace(/[^0-9]/g, "") } } : r));
+  const setSku = (i, talla, val) =>
+    setColorRows((rows) => rows.map((r, idx) =>
+      idx === i ? { ...r, sku: { ...r.sku, [talla]: val.replace(/[^0-9]/g, "") } } : r));
   // Generic per-line setter for the non-normalised fields (PO cliente, entrega,
   // tela, código de tela, rendimiento).
   const setRowField = (i, key, val) =>
     setColorRows((rows) => rows.map((r, idx) => (idx === i ? { ...r, [key]: val } : r)));
   const newRow = () => ({
-    color: "", estilo: "", qty: {}, customerPo: "",
+    color: "", estilo: "", packing: {}, sku: {}, customerPo: "",
     deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }],
   });
 
@@ -597,7 +630,7 @@ export default function NuevaOrdenWizard() {
               <>
               <div className="mt-5 space-y-3">
                 {colorRows.map((row, i) => {
-                  const rowPieces = sizes.reduce((sum, t) => sum + (parseFloat(row.qty[t]) || 0), 0);
+                  const rowPieces = sizes.reduce((sum, t) => sum + sizeQtyOf(row, t), 0);
                   const estiloBad = row.color.trim() && (row.estilo || "").trim().length !== 6;
                   return (
                     <div key={i} className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
@@ -691,20 +724,49 @@ export default function NuevaOrdenWizard() {
                         </button>
                       </div>
 
-                      {/* Quantities per size for this line */}
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {sizes.map((s) => (
-                          <div key={s} className="w-16">
-                            <span className="block text-center text-[10px] text-slate-400">
-                              <span className="block font-mono text-[11px] font-bold text-slate-700">{s}</span>
-                              {sizeLabel(s)}
-                            </span>
-                            <input value={row.qty[s] || ""} onChange={(e) => setQty(i, s, e.target.value)}
-                              inputMode="numeric" placeholder="0"
-                              className="mt-0.5 w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm text-center
-                                         focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                          </div>
-                        ))}
+                      {/* Cantidad por talla = packing + SKU (ambas en piezas) */}
+                      <div className="mt-3">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                            Cantidad por talla
+                          </span>
+                          <span className="text-[10px] text-slate-400 normal-case">· packing + SKU = cantidad de la talla</span>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {sizes.map((s) => {
+                            const packingV = row.packing?.[s] || "";
+                            const skuV = row.sku?.[s] || "";
+                            const total = sizeQtyOf(row, s);
+                            return (
+                              <div key={s} className="w-20 rounded-lg border border-slate-200 bg-white p-1.5">
+                                <span className="block text-center text-[10px] text-slate-400 leading-tight">
+                                  <span className="block font-mono text-[11px] font-bold text-slate-700">{s}</span>
+                                  {sizeLabel(s)}
+                                </span>
+                                <label className="block mt-1">
+                                  <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">Packing</span>
+                                  <input value={packingV} onChange={(e) => setPacking(i, s, e.target.value)}
+                                    inputMode="numeric" placeholder="0" title="Piezas en packing (surtido)"
+                                    className="mt-0.5 w-full rounded-md border border-slate-300 px-1.5 py-1 font-mono text-sm text-center
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                </label>
+                                <label className="block mt-1">
+                                  <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">SKU</span>
+                                  <input value={skuV} onChange={(e) => setSku(i, s, e.target.value)}
+                                    inputMode="numeric" placeholder="0" title="Piezas en SKU (talla sólida)"
+                                    className="mt-0.5 w-full rounded-md border border-slate-300 px-1.5 py-1 font-mono text-sm text-center
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                </label>
+                                <div className="mt-1 border-t border-dashed border-slate-200 pt-1">
+                                  <span className="block text-[9px] font-semibold uppercase tracking-wide text-slate-400">Cant.</span>
+                                  <span className={`block text-center font-mono text-sm ${total > 0 ? "text-slate-900 font-bold" : "text-slate-300"}`}>
+                                    {total.toLocaleString()}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                   );
@@ -723,7 +785,7 @@ export default function NuevaOrdenWizard() {
                 {poPlan.length > 1 && (
                   <p className="text-xs text-slate-500 mt-1 flex items-start gap-1">
                     <AlertCircle size={12} className="mt-0.5 shrink-0" />
-                    Se crearán {poPlan.length} órdenes (números automáticos): todas las líneas van en una sola orden, y cada color+estilo repetido abre una orden aparte.
+                    Se crearán {poPlan.length} órdenes (números automáticos): una orden por cada combinación de color + estilo + PO cliente + fecha de entrega.
                   </p>
                 )}
               </div>
@@ -820,7 +882,7 @@ export default function NuevaOrdenWizard() {
 
         {/* Step 5 — Review */}
         {step === 5 && (
-          <SectionCard icon={ClipboardList} title="5 · Revisar y crear" subtitle={`Se creará${poPlan.length === 1 ? "" : "n"} ${poPlan.length} orden(es) de producción — una por color+estilo repetido`}>
+          <SectionCard icon={ClipboardList} title="5 · Revisar y crear" subtitle={`Se creará${poPlan.length === 1 ? "" : "n"} ${poPlan.length} orden(es) de producción — una por color + estilo + PO cliente + fecha de entrega`}>
             <div className="rounded-lg bg-slate-900 text-white px-4 py-3 mb-4">
               <span className="text-[11px] uppercase tracking-widest text-slate-400">
                 {poPlan.length === 1 ? "N° de orden" : `${poPlan.length} órdenes de producción`}

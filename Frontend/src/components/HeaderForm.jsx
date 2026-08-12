@@ -8,13 +8,24 @@ import { API_URL } from "../lib/masterCodeCatalog";
    We still read defensively so it survives minor payload changes. */
 const getWoId = (wo) => wo?.work_order_id ?? wo?.id ?? null;
 const getWoNo = (wo) => wo?.work_order_no ?? wo?.workOrderNo ?? "";
-const getWoStyle = (wo) =>
-  wo?.style_description ??
-  wo?.styleDescription ??
-  wo?.style_code ??
-  wo?.styleCode ??
-  wo?.estilo ??
-  "";
+// Show the tipo+modelo+correlativo code (style_code, e.g. "ABCDEF01"), not the
+// short estilo code or the long style_description. style_code is built at
+// work-order creation as tipo(3)+modelo(3)+correlativo(2) — see work-orders.js.
+// find() skips null/undefined AND empty strings, so a missing style_code falls
+// back to the next best identifier instead of leaving the label empty.
+const getWoStyle = (wo) => {
+  const pick = (...vals) =>
+    vals.find((v) => v !== null && v !== undefined && String(v).trim() !== "");
+  return (
+    pick(
+      wo?.style_code,
+      wo?.styleCode,
+      wo?.estilo,
+      wo?.style_description,
+      wo?.styleDescription
+    ) ?? ""
+  );
+};
 const getWoSam = (wo) => {
   const v = wo?.sam ?? wo?.sam_minutes ?? wo?.samMinutes ?? "";
   return v === null || v === undefined ? "" : v;
@@ -40,16 +51,37 @@ export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
 
   const set = (k, v) => onChange({ ...value, [k]: v });
 
-  // Load the distinct lines that have active assignments
+  // "La línea del día": everything below is scoped to this date. Local YYYY-MM-DD
+  // (not toISOString, which is UTC and can roll a day near midnight) so it matches
+  // both the native date input and the DATE column on line_assignments.
+  const today = () => new Date().toLocaleDateString("en-CA");
+  const day = String(value.date ?? "").trim();
+
+  // Default the date to today the first time, so the line/work-order lists have a
+  // day to filter on without the engineer having to pick one first.
   useEffect(() => {
+    if (!day) onChange({ ...value, date: today() });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Load the distinct lines that have an assignment FOR THE SELECTED DAY.
+  useEffect(() => {
+    if (!day) {
+      setAssignedLines([]);
+      return;
+    }
+
+    let cancelled = false;
     const fetchAssignedLines = async () => {
       setLinesLoading(true);
       setLinesError("");
       try {
-        const res = await fetch(`${API_URL}/api/line-assignments`, {
-          headers: authHeaders(),
-        });
+        const res = await fetch(
+          `${API_URL}/api/line-assignments?date=${encodeURIComponent(day)}`,
+          { headers: authHeaders() }
+        );
         const data = await res.json();
+        if (cancelled) return;
         if (data.success && Array.isArray(data.assignments)) {
           const uniq = new Set(
             data.assignments
@@ -68,13 +100,16 @@ export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
           setLinesError(data.error || "No se pudieron cargar las líneas asignadas.");
         }
       } catch (err) {
-        setLinesError(`Error al cargar líneas: ${err.message}`);
+        if (!cancelled) setLinesError(`Error al cargar líneas: ${err.message}`);
       } finally {
-        setLinesLoading(false);
+        if (!cancelled) setLinesLoading(false);
       }
     };
     fetchAssignedLines();
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [day]);
 
   // Load the work orders assigned to the selected line
   useEffect(() => {
@@ -89,8 +124,11 @@ export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
       setWoLoading(true);
       setWoError("");
       try {
+        // Only the order(s) assigned to this line for the day being created.
+        const qs = new URLSearchParams({ line });
+        if (day) qs.set("date", day);
         const res = await fetch(
-          `${API_URL}/api/planning/line-work-orders?line=${encodeURIComponent(line)}`,
+          `${API_URL}/api/planning/line-work-orders?${qs.toString()}`,
           { headers: authHeaders() }
         );
         const data = await res.json();
@@ -124,11 +162,17 @@ export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
     return () => {
       cancelled = true;
     };
-  }, [value.line]);
+  }, [value.line, day]);
 
   // Changing the line clears the previously chosen work order (single write)
   const handleLineChange = (line) => {
     onChange({ ...value, line, workOrderId: null, workOrderNo: "" });
+  };
+
+  // Changing the day re-scopes the lists, so drop the chosen order too — it may
+  // not belong to the new day.
+  const handleDateChange = (date) => {
+    onChange({ ...value, date, workOrderId: null, workOrderNo: "" });
   };
 
   // Selecting a work order auto-fills style + SAM in ONE update to avoid
@@ -195,11 +239,14 @@ export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
         workOrderNo: value.workOrderNo || "",
       };
 
-      const response = await fetch("http://localhost:5000/api/save-production", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      const response = await fetch(`${API_URL}/api/save-production`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    ...authHeaders(),
+  },
+  body: JSON.stringify(payload),
+});
 
       const data = await response.json();
 
@@ -296,7 +343,7 @@ export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
                     ? "Cargando órdenes…"
                     : lineWorkOrders.length
                     ? "Seleccionar orden…"
-                    : "Sin órdenes para esta línea"}
+                    : "Sin órdenes para esta línea en la fecha seleccionada"}
                 </option>
                 {lineWorkOrders.map((wo) => {
                   const id = getWoId(wo);
@@ -342,7 +389,7 @@ export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
           label="Fecha"
           type="date"
           value={value.date}
-          onChange={(v) => set("date", v)}
+          onChange={handleDateChange}
         />
 
         <Field

@@ -50,7 +50,7 @@ const createAllTables = async () => {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor',
-         'soporte_it','skyrina','planner','master', 'quality_inspector','corte','finished_warehouse')),
+         'soporte_it','skyrina','planner','master', 'quality_inspector','corte','finished_warehouse','quality_head')),
         CONSTRAINT chk_line_number CHECK (line_number IS NULL OR (line_number >= 1 AND line_number <= 26))
       );
     `);
@@ -62,7 +62,7 @@ const createAllTables = async () => {
       ALTER TABLE users ADD CONSTRAINT chk_role CHECK (role IN (
         'engineer', 'line_leader', 'supervisor', 'soporte_it',
         'skyrina', 'planner', 'master', 'quality_inspector', 'inspector','merchant','admin','corte',
-        'finished_warehouse'
+        'finished_warehouse','quality_head'
       ));
     `);
     console.log("✅ users table ready in prod_db_schema");
@@ -421,6 +421,7 @@ await registerWorkOrders.initSchema({ pool, setSchema });
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
+await registerMerchantAnalytics.initSchema({ pool, setSchema });
 
 // 12. Create indexes for quality tables
 await client.query("CREATE INDEX IF NOT EXISTS idx_quality_inspections_line_date ON quality_inspections(line_no, inspection_date);");
@@ -746,7 +747,13 @@ defaultUsers.push({
   full_name: "Merchant User",
 });
 
-
+// Alicia — quality inspector account
+defaultUsers.push({
+  username: "Alicia",
+  password: "quality",
+  role: "quality_head",
+  full_name: "Alicia",
+});
 // In the role validation, update validRoles:
 
     defaultUsers.push({
@@ -949,6 +956,9 @@ app.get("/api/me", authenticateToken, async (req, res) => {
     user: req.user,
   });
 });
+
+const registerMerchantAnalytics = require("./merchant-analytics");
+registerMerchantAnalytics(app, { authenticateToken, pool, setSchema });
 
 const registerMerchantPlan = require("./merchant-plan");
 registerMerchantPlan(app, { authenticateToken, pool, setSchema });
@@ -1320,11 +1330,11 @@ app.post("/api/users", authenticateToken, requireEngineerOrSupervisor, async (re
     }
 
     // Validate role
-    const validRoles = ["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "planner", "master", "quality_inspector", "inspector", "merchant", "admin"];
+    const validRoles = ["engineer", "line_leader", "supervisor", "soporte_it", "skyrina", "planner", "master", "quality_inspector", "inspector", "merchant", "admin","quality_head"];
     if (!validRoles.includes(role)) {
       return res.status(400).json({
         success: false,
-        error: "Invalid role. Must be 'engineer', 'line_leader', 'supervisor', 'soporte_it', 'skyrina', 'planner', 'master', or 'quality_inspector', 'inspector', 'merchant', 'admin'",
+        error: "Invalid role. Must be 'engineer', 'line_leader', 'supervisor', 'soporte_it', 'skyrina', 'planner', 'master', or 'quality_inspector', 'inspector', 'merchant', 'admin', 'quality_head'",
       });
     }
 
@@ -2036,6 +2046,32 @@ app.post("/api/lineleader/update-sewed/:runId", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+      // ── Auto-cierre de celda ─────────────────────────────────────────────
+      // Si con esta captura la línea ya alcanzó (o superó) lo asignado para esta
+      // orden ESE día, la asignación se marca 'completed' con la cantidad
+      // producida. Corre DESPUÉS del COMMIT y en su propia transacción: si algo
+      // falla aquí NO debe tumbar el guardado del líder.
+      let autoCompleted = null;
+      try {
+        const runInfo = await client.query(
+          `SELECT work_order_id, line_no, to_char(run_date, 'YYYY-MM-DD') AS day
+             FROM line_runs WHERE id = $1`,
+          [runId]
+        );
+        const r = runInfo.rows[0];
+        if (r && r.work_order_id) {
+          autoCompleted = await registerWorkOrders.autoCompleteDay(client, {
+            workOrderId: r.work_order_id,
+            lineNo: r.line_no,
+            day: r.day,
+          });
+        }
+      } catch (e) {
+        console.warn("⚠️  auto-cierre de celda falló (el guardado sí se realizó):", e.message);
+      }
+
+      res.json({ success: true, updatedCount, autoCompleted });
     return res.json({ success: true, updatedCount });
   } catch (e) {
     await client.query("ROLLBACK");
@@ -2099,7 +2135,52 @@ app.get("/api/get-run-data/:runId", async (req, res) => {
        ORDER BY s.slot_order`,
       [runId]
     );
-
+    
+    // ---- Merchant size breakdown (talla + color + PO + cantidad) ----------
+    // One row per talla+color+PO so each printed ticket can carry its own color
+    // and PO cliente. Prefer lines matching this run's estilo; fall back to all
+    // lines on the work order. Wrapped in try/catch so an older DB without
+    // work_order_lines never breaks the run screen (sizes just come back []).
+    let sizes = [];
+    try {
+      const woId = runResult.rows[0].work_order_id;
+      if (woId) {
+        const styleName = runResult.rows[0].style;
+        let sizesResult = await client.query(
+          `SELECT talla,
+                  COALESCE(color, '')       AS color,
+                  COALESCE(customer_po, '') AS customer_po,
+                  SUM(quantity)::numeric    AS quantity
+             FROM work_order_lines
+            WHERE work_order_id = $1 AND estilo = $2
+            GROUP BY talla, color, customer_po
+            ORDER BY talla, color`,
+          [woId, styleName]
+        );
+        if (sizesResult.rows.length === 0) {
+          sizesResult = await client.query(
+            `SELECT talla,
+                    COALESCE(color, '')       AS color,
+                    COALESCE(customer_po, '') AS customer_po,
+                    SUM(quantity)::numeric    AS quantity
+               FROM work_order_lines
+              WHERE work_order_id = $1
+              GROUP BY talla, color, customer_po
+              ORDER BY talla, color`,
+            [woId]
+          );
+        }
+        sizes = sizesResult.rows.map((r) => ({
+          talla: r.talla,
+          color: r.color || "",
+          customerPo: r.customer_po || "",
+          quantity: Number(r.quantity) || 0,
+        }));
+      }
+    } catch (e) {
+      console.warn("get-run-data: size breakdown unavailable:", e.message);
+      sizes = [];
+    }
     // 5) Get operations with stitched_data + sewed_data
     const operationsData = [];
 
@@ -2152,6 +2233,7 @@ app.get("/api/get-run-data/:runId", async (req, res) => {
       operators: operatorsResult.rows,
       operations: operationsData,
       slotTargets: slotTargetsResult.rows,
+      sizes,
     });
   } catch (err) {
     console.error("❌ Error fetching run data:", err.message);
@@ -2287,6 +2369,12 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
     dt.setUTCDate(dt.getUTCDate() + n);
     return dt.toISOString().slice(0, 10);
   };
+  // True for Saturday/Sunday (no timezone drift). No production on weekends.
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sun, 6 = Sat
+    return dow === 0 || dow === 6;
+  };
   try {
     await setSchema(client);
     const id = parseInt(req.params.id);
@@ -2328,9 +2416,9 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
 
     // Walk the target line day by day from assignedDate, filling each day's
     // remaining capacity and carrying the remainder forward — the same packing
-    // rule as a pool placement. Days with no run configured, or already full,
-    // are skipped. All-or-nothing: if the whole quantity can't fit within the
-    // horizon, roll back and report the shortfall.
+    // rule as a pool placement. Weekends, days with no run configured, or days
+    // already full are skipped. All-or-nothing: if the whole quantity can't fit
+    // within the horizon, roll back and report the shortfall.
     const MAX_DAYS = 180;
     let remaining = totalQty;
     let dayStr = assignedDate;
@@ -2339,6 +2427,7 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
 
     while (remaining > 0 && scanned < MAX_DAYS) {
       scanned++;
+      if (isWeekend(dayStr)) { dayStr = addDaysStr(dayStr, 1); continue; }  // no weekend work
       const { lines } = await getLineCapacityForDate(client, dayStr);
       const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
       if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no capacity configured -> skip
@@ -2395,6 +2484,147 @@ app.patch("/api/line-assignments/:id/move", authenticateToken, async (req, res) 
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Error moving line assignment:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/move-batch
+//
+// Pile several existing assignments into ONE target line, starting at
+// `assignedDate`, and re-pack them forward day by day. All selected blocks may
+// come from different lines, days, orders or colors; each keeps its own row.
+// The packing rule is identical to the single move: fill each day's remaining
+// capacity, spill the rest to the next day. Rows inserted earlier in this same
+// transaction count as "used", so consecutive blocks stack naturally onto the
+// following days. All-or-nothing: if the whole selection can't fit within the
+// horizon, roll back and leave every block exactly where it was.
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, n) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  };
+  try {
+    await setSchema(client);
+    const { ids, lineNo, assignedDate } = req.body;
+    const idList = Array.isArray(ids)
+      ? [...new Set(ids.map((n) => parseInt(n)).filter((n) => Number.isInteger(n)))]
+      : [];
+
+    if (idList.length === 0 || !lineNo || !assignedDate) {
+      return res.status(400).json({
+        success: false,
+        error: "ids (no vacío), lineNo y assignedDate son obligatorios",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Load the selected assignments. Order them by their current position so the
+    // re-pack is deterministic (earliest day first, then id).
+    const cur = await client.query(
+      `SELECT id, work_order_id, assigned_quantity, color, status
+         FROM line_assignments
+        WHERE id = ANY($1::int[])
+        ORDER BY assigned_date ASC, id ASC`,
+      [idList]
+    );
+    if (cur.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "No se encontraron las asignaciones" });
+    }
+
+    // Free every selected block first so their old slots can be reused.
+    await client.query("DELETE FROM line_assignments WHERE id = ANY($1::int[])", [idList]);
+
+    const MAX_DAYS = 180;
+    const createdRows = [];
+
+    for (const original of cur.rows) {
+      const totalQty = parseFloat(original.assigned_quantity) || 0;
+      if (totalQty <= 0) continue;
+      const workOrderId = original.work_order_id;
+      const color = original.color || null;
+      const status = ["planned", "released", "completed", "cancelled"].includes(original.status)
+        ? original.status
+        : "planned";
+
+      // Prefer the work order's own SAM for the informational rate columns.
+      const woRes = await client.query(
+        "SELECT sam_minutes FROM work_orders WHERE id = $1",
+        [workOrderId]
+      );
+      const woSam = parseFloat(woRes.rows[0]?.sam_minutes) || 0;
+
+      let remaining = totalQty;
+      let dayStr = assignedDate;
+      let scanned = 0;
+
+      while (remaining > 0 && scanned < MAX_DAYS) {
+        scanned++;
+        const { lines } = await getLineCapacityForDate(client, dayStr);
+        const lineData = lines.find((l) => String(l.line_no) === String(lineNo));
+        if (!lineData) { dayStr = addDaysStr(dayStr, 1); continue; }  // no run -> skip
+
+        const usedRes = await client.query(
+          `SELECT COALESCE(SUM(assigned_quantity), 0) AS used
+             FROM line_assignments
+            WHERE line_no = $1 AND assigned_date = $2 AND status NOT IN ('cancelled', 'rejected')`,
+          [String(lineNo), dayStr]
+        );
+        const used = parseFloat(usedRes.rows[0].used) || 0;
+        const capacity = parseFloat(lineData.target_pcs) || 0;
+        const available = Math.max(0, capacity - used);
+        if (available <= 0) { dayStr = addDaysStr(dayStr, 1); continue; }  // full -> next day
+
+        const chunk = Math.min(remaining, available);
+
+        const operators = parseInt(lineData.operators_count) || 20;
+        const workingHours = parseFloat(lineData.working_hours) || 8;
+        const efficiency = parseFloat(lineData.efficiency) || 0.85;
+        const samMinutes = woSam || parseFloat(lineData.sam_minutes) || 3.5;
+        const effectiveDailyMinutes = operators * workingHours * 60 * efficiency;
+        const piecesPerDay = samMinutes > 0 ? effectiveDailyMinutes / samMinutes : 0;
+
+        const ins = await client.query(
+          `INSERT INTO line_assignments
+             (work_order_id, line_run_id, line_no, assigned_date, assigned_quantity,
+              available_minutes, required_production_rate, planned_start_date, planned_end_date, status, color)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $4, $4, $9, $8)
+           RETURNING *`,
+          [workOrderId, lineData.id || null, String(lineNo), dayStr, chunk,
+           effectiveDailyMinutes, piecesPerDay, color, status]
+        );
+        createdRows.push(ins.rows[0]);
+        remaining -= chunk;
+        dayStr = addDaysStr(dayStr, 1);
+      }
+
+      if (remaining > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: `La línea ${lineNo} no tiene capacidad suficiente para reacomodar todas las casillas seleccionadas desde el ${assignedDate}.`,
+        });
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      assignments: createdRows,
+      cells: createdRows.length,
+      moved: idList.length,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error moving batch of line assignments:", err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
@@ -2836,6 +3066,7 @@ app.post("/api/duplicate-run/:runId", authenticateToken, async (req, res) => {
     const { runId } = req.params;
     const { newDate } = req.body;            // required: YYYY-MM-DD
     const newLineNo = req.body.newLineNo;    // optional – if omitted, same line_no is used
+    const workOrderId = req.body.workOrderId; // optional – work order assigned to the line for that day
 
     if (!newDate) {
       return res.status(400).json({ success: false, error: "newDate is required" });
@@ -2857,8 +3088,8 @@ app.post("/api/duplicate-run/:runId", authenticateToken, async (req, res) => {
     const newRunRes = await client.query(
       `INSERT INTO line_runs
          (line_no, run_date, style, operators_count, working_hours,
-          sam_minutes, efficiency, target_pcs, target_per_hour, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+          sam_minutes, efficiency, target_pcs, target_per_hour, work_order_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
        RETURNING id`,
       [
         newLineNo || src.line_no,
@@ -2870,6 +3101,7 @@ app.post("/api/duplicate-run/:runId", authenticateToken, async (req, res) => {
         src.efficiency,
         src.target_pcs,
         src.target_per_hour,
+        workOrderId || null,
       ]
     );
     const newRunId = newRunRes.rows[0].id;
@@ -3571,7 +3803,7 @@ app.get("/api/run-capacity-history/:runId", authenticateToken, async (req, res) 
 
 // Helper middleware for quality inspector access
 const requireQualityInspector = (req, res, next) => {
-  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master'];
+  const allowedRoles = ['quality_inspector', 'engineer', 'supervisor', 'soporte_it', 'master','quality_head'];
   if (!allowedRoles.includes(req.user?.role)) {
     return res.status(403).json({
       success: false,
@@ -3803,7 +4035,7 @@ app.get("/api/quality/analytics", authenticateToken, async (req, res) => {
   try {
     await setSchema(client);
 
-    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector'].includes(req.user?.role)) {
+    if (!['skyrina', 'master', 'engineer', 'supervisor', 'soporte_it', 'quality_inspector', 'quality_head'].includes(req.user?.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
 
@@ -5277,6 +5509,351 @@ app.post("/api/line-assignments", authenticateToken, async (req, res) => {
   }
 });
 
+
+// Capacidad DEMOSTRADA de una línea, en MINUTOS ESTÁNDAR por día: la mediana de
+// (piezas de empaque/terminado × SAM del estilo corrido) sobre los días
+// productivos recientes. Se mide en minutos estándar (no piezas) para que sea
+// comparable entre estilos con distinto SAM. La mediana ignora el día heroico y
+// los días de arranque en cero. Regresa { medianMinutes, nDays }; medianMinutes
+// = 0 si no hay historial.
+async function demonstratedMinutesPerDay(client, lineNo, { days = 60 } = {}) {
+  // Mismas palabras clave de empaque/terminado que usa work-orders.js.
+  const likes = ["pack", "emp", "termin", "finish"]
+    .map((k) => `lower(oo.operation_name) LIKE '%${k}%'`)
+    .join(" OR ");
+  const { rows } = await client.query(
+    `WITH per_day AS (
+       SELECT lr.run_date,
+              SUM(se.sewed_qty * COALESCE(lr.sam_minutes, 3.5))
+                FILTER (WHERE (${likes})) AS std_min
+         FROM line_runs lr
+         JOIN operation_sewed_entries se ON se.run_id = lr.id
+         JOIN operator_operations oo     ON oo.id = se.operation_id
+        WHERE lr.line_no = $1
+          AND lr.run_date >= CURRENT_DATE - ($2::int)
+        GROUP BY lr.run_date
+       HAVING SUM(se.sewed_qty) FILTER (WHERE (${likes})) > 0
+     )
+     SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY std_min) AS median_min,
+            COUNT(*)::int AS n_days
+       FROM per_day`,
+    [String(lineNo), days]
+  );
+  return {
+    medianMinutes: Number(rows[0]?.median_min) || 0,
+    nDays: Number(rows[0]?.n_days) || 0,
+  };
+}
+
+/**
+ * POST /api/line-assignments/compact
+ * Re-empaqueta las asignaciones ABIERTAS de una orden en una línea a los menos
+ * días posibles, llenando cada día a la capacidad DEMOSTRADA de la línea (no la
+ * teórica). Los días ya COMPLETED no se tocan. Respeta lo que otras órdenes ya
+ * reservaron ese día y salta domingos.
+ *
+ *   body: { workOrderId, lineNo, fromDate?, fill?, basis? }
+ *
+ *   • (default)        junta sólo las cantidades PLANEADAS abiertas.
+ *   • fill: true       + jala el saldo SIN ASIGNAR de la orden (el pool) aquí.
+ *   • basis: "actual"  ignora lo planeado y usa la PRODUCCIÓN REAL:
+ *                      saldo = meta − producido(real) − abierto(otras líneas).
+ *                      Así, producir de más adelanta el término. Si el saldo es
+ *                      0, libera los días abiertos sobrantes.
+ */
+app.post("/api/line-assignments/compact", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const SAFETY = 0.90;          // planear al 90% de la mediana demostrada
+  const MAX_HORIZON_DAYS = 120; // tope de seguridad del barrido de días
+  // Fecha local 'YYYY-MM-DD' (evita el corrimiento de un día de toISOString en MX).
+  const ymdLocal = (d) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  try {
+    await setSchema(client);
+    const { workOrderId, lineNo, fromDate, fill, basis } = req.body || {};
+    if (!workOrderId || !lineNo) {
+      return res.status(400).json({ success: false, error: "workOrderId y lineNo son obligatorios." });
+    }
+
+    await client.query("BEGIN");
+
+    // 1) Orden → SAM del estilo y meta total.
+    const woRes = await client.query(
+      "SELECT id, sam_minutes, total_to_produce, quantity FROM work_orders WHERE id = $1",
+      [parseInt(workOrderId, 10)]
+    );
+    if (woRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Orden no encontrada." });
+    }
+    const samOrder = parseFloat(woRes.rows[0].sam_minutes) || 0;
+    const orderTarget = parseFloat(woRes.rows[0].total_to_produce) || parseFloat(woRes.rows[0].quantity) || 0;
+
+    // 2) Días ABIERTOS de esta orden en esta línea (no completados ni cancelados).
+    const openRes = await client.query(
+      `SELECT id, color, assigned_quantity,
+              to_char(assigned_date, 'YYYY-MM-DD') AS assigned_date
+         FROM line_assignments
+        WHERE work_order_id = $1 AND line_no = $2
+          AND status NOT IN ('completed', 'cancelled', 'rejected')
+        ORDER BY assigned_date, id
+        FOR UPDATE`,
+      [parseInt(workOrderId, 10), String(lineNo)]
+    );
+    if (openRes.rows.length === 0 && !fill && basis !== "actual") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, error: "No hay días abiertos de esta orden en esta línea para compactar." });
+    }
+
+    const daysBefore = new Set(openRes.rows.map((r) => r.assigned_date)).size;
+
+    // Piezas por color a re-empaquetar (se conservan los colores).
+    const byColor = new Map();
+    for (const r of openRes.rows) {
+      const c = r.color || "";
+      byColor.set(c, (byColor.get(c) || 0) + (Number(r.assigned_quantity) || 0));
+    }
+    const repackPieces = [...byColor.values()].reduce((s, v) => s + v, 0);
+
+    let unassignedPlaced = 0;
+    let producedAll = 0;   // en modo actual = piezas de sobreproducción acreditadas
+    if (basis === "actual") {
+      // Deja la orden COMPLETAMENTE asignada en esta línea y usa la PRODUCCIÓN
+      // REAL para reducir días:
+      //  1) Sube los días COMPLETED de la orden (cualquier línea) a lo producido.
+      //  2) saldo = meta − completados(ajustados) − abierto(otras líneas).
+      // Resultado: SUM(asignado) == meta → la orden NO regresa al pool, y la
+      // sobreproducción acorta el tail.
+      const compRes = await client.query(
+        `SELECT id, assigned_quantity, produced_quantity
+           FROM line_assignments
+          WHERE work_order_id = $1 AND status = 'completed'`,
+        [parseInt(workOrderId, 10)]
+      );
+      let overCredit = 0;
+      for (const r of compRes.rows) {
+        const asg = Number(r.assigned_quantity) || 0;
+        const prod = r.produced_quantity == null ? asg : Math.round(Number(r.produced_quantity));
+        if (prod > asg) {
+          overCredit += prod - asg;
+          await client.query(
+            "UPDATE line_assignments SET assigned_quantity = $2, updated_at = NOW() WHERE id = $1",
+            [r.id, prod]
+          );
+        }
+      }
+      producedAll = overCredit;
+
+      const doneRes = await client.query(
+        `SELECT COALESCE(SUM(assigned_quantity), 0) AS q
+           FROM line_assignments
+          WHERE work_order_id = $1 AND status = 'completed'`,
+        [parseInt(workOrderId, 10)]
+      );
+      const completedAll = Number(doneRes.rows[0]?.q) || 0;
+
+      const otherRes = await client.query(
+        `SELECT COALESCE(SUM(assigned_quantity), 0) AS q
+           FROM line_assignments
+          WHERE work_order_id = $1 AND line_no <> $2
+            AND status NOT IN ('completed', 'cancelled', 'rejected')`,
+        [parseInt(workOrderId, 10), String(lineNo)]
+      );
+      const openOther = Number(otherRes.rows[0]?.q) || 0;
+
+      const remaining = Math.max(orderTarget - completedAll - openOther, 0);
+
+      byColor.clear();
+      const ctRes = await client.query(
+        "SELECT color, quantity FROM work_order_colors WHERE work_order_id = $1",
+        [parseInt(workOrderId, 10)]
+      );
+      const colorTotal = ctRes.rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0);
+      if (remaining > 0 && ctRes.rows.length > 0 && colorTotal > 0) {
+        let acc = 0;
+        ctRes.rows.forEach((r, i) => {
+          const share = i === ctRes.rows.length - 1
+            ? remaining - acc
+            : Math.floor(((Number(r.quantity) || 0) / colorTotal) * remaining);
+          acc += share;
+          if (share > 0) byColor.set(r.color || "", share);
+        });
+      } else if (remaining > 0) {
+        byColor.set("", remaining);
+      }
+    } else if (fill) {
+    
+      // 2b) Modo "llenar": jala el SALDO SIN ASIGNAR de la orden a esta línea.
+      const asgRes = await client.query(
+        `SELECT COALESCE(color, '') AS color, COALESCE(SUM(assigned_quantity), 0) AS q
+           FROM line_assignments
+          WHERE work_order_id = $1 AND status NOT IN ('cancelled', 'rejected')
+          GROUP BY COALESCE(color, '')`,
+        [parseInt(workOrderId, 10)]
+      );
+      const assignedByColor = new Map(asgRes.rows.map((r) => [r.color, Number(r.q) || 0]));
+
+      const ctRes = await client.query(
+        "SELECT color, quantity FROM work_order_colors WHERE work_order_id = $1",
+        [parseInt(workOrderId, 10)]
+      );
+      const addPool = (color, qty) => {
+        if (qty <= 0) return;
+        byColor.set(color, (byColor.get(color) || 0) + qty);
+        unassignedPlaced += qty;
+      };
+      if (ctRes.rows.length > 0) {
+        for (const r of ctRes.rows) {
+          const color = r.color || "";
+          const target = Number(r.quantity) || 0;
+          addPool(color, Math.max(target - (assignedByColor.get(color) || 0), 0));
+        }
+      } else {
+        const assignedAll = [...assignedByColor.values()].reduce((s, v) => s + v, 0);
+        addPool("", Math.max(orderTarget - assignedAll, 0));
+      }
+    }
+
+    const totalPieces = [...byColor.values()].reduce((s, v) => s + v, 0);
+    if (totalPieces <= 0) {
+      // En modo "actual", saldo 0 = la orden YA se cubrió con producción real:
+      // se liberan los días abiertos sobrantes de esta línea.
+      if (basis === "actual") {
+        if (openRes.rows.length) {
+          await client.query("DELETE FROM line_assignments WHERE id = ANY($1)", [openRes.rows.map((r) => r.id)]);
+        }
+        await client.query("COMMIT");
+        return res.json({
+          success: true, compacted: true, basis: "actual",
+          producedAll: Math.round(producedAll), totalPieces: 0,
+          daysBefore, daysAfter: 0, cleared: openRes.rows.length,
+        });
+      }
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, error: "No hay piezas por planear para esta orden en esta línea." });
+    }
+
+    // 3) Capacidad demostrada → piezas/día para el SAM de esta orden.
+    const { medianMinutes, nDays } = await demonstratedMinutesPerDay(client, lineNo);
+    let perDayCap, rateSource, effectiveDailyMinutes;
+    if (medianMinutes > 0 && samOrder > 0) {
+      effectiveDailyMinutes = medianMinutes * SAFETY;
+      perDayCap = Math.floor(effectiveDailyMinutes / samOrder);
+      rateSource = "demostrada";
+    } else {
+      const { lines } = await getLineCapacityForDate(client, fromDate || ymdLocal(new Date()));
+      const ld = lines.find((l) => String(l.line_no) === String(lineNo));
+      perDayCap = Math.floor(parseFloat(ld?.target_pcs) || 0);
+      effectiveDailyMinutes = perDayCap * samOrder;
+      rateSource = "teorica";
+    }
+    if (!perDayCap || perDayCap <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, error: "No se pudo determinar la capacidad diaria de la línea (sin historial ni configuración)." });
+    }
+
+    // 4) Inicio: hoy o el primer día abierto, lo que sea mayor.
+    const todayStr = ymdLocal(new Date());
+    const earliestOpen = openRes.rows[0]?.assigned_date || todayStr;
+    const startStr = fromDate || (earliestOpen > todayStr ? earliestOpen : todayStr);
+
+    // 5) Borrar los días abiertos viejos (se reemplazan por el empaque nuevo).
+    await client.query("DELETE FROM line_assignments WHERE id = ANY($1)", [openRes.rows.map((r) => r.id)]);
+
+    // 6) Capacidad ya ocupada por OTRAS órdenes ese día en esta línea.
+    const bookedOnDay = async (dayStr) => {
+      const b = await client.query(
+        `SELECT COALESCE(SUM(assigned_quantity), 0) AS q
+           FROM line_assignments
+          WHERE line_no = $1 AND assigned_date = $2::date
+            AND status NOT IN ('cancelled', 'rejected')`,
+        [String(lineNo), dayStr]
+      );
+      return Number(b.rows[0].q) || 0;
+    };
+
+    // 7) Barrido de días llenando a capacidad. Salta domingo (getDay()===0).
+    const colors = [...byColor.entries()].map(([color, qty]) => ({ color, remaining: qty }));
+    let remainingTotal = totalPieces;
+    const created = [];
+    const daysUsed = [];
+    const cursor = new Date(`${startStr}T00:00:00`);
+    let guard = 0;
+
+    while (remainingTotal > 0 && guard < MAX_HORIZON_DAYS) {
+      guard++;
+      if (cursor.getDay() === 0) { cursor.setDate(cursor.getDate() + 1); continue; }
+      const dayStr = ymdLocal(cursor);
+
+      let free = Math.max(0, perDayCap - (await bookedOnDay(dayStr)));
+      if (free <= 0) { cursor.setDate(cursor.getDate() + 1); continue; }
+
+      const dayColors = colors.filter((c) => c.remaining > 0).sort((a, b) => b.remaining - a.remaining);
+      let placedToday = false;
+      for (const c of dayColors) {
+        if (free <= 0) break;
+        const take = Math.min(c.remaining, free);
+        if (take <= 0) continue;
+        const ins = await client.query(
+          `INSERT INTO line_assignments
+             (work_order_id, line_no, assigned_date, assigned_quantity,
+              available_minutes, required_production_rate,
+              planned_start_date, planned_end_date, status, color)
+           VALUES ($1, $2, $3::date, $4, $5, $6, $3::date, $3::date, 'planned', $7)
+           RETURNING id`,
+          [parseInt(workOrderId, 10), String(lineNo), dayStr, take,
+           effectiveDailyMinutes, perDayCap, c.color || null]
+        );
+        created.push(ins.rows[0].id);
+        c.remaining -= take;
+        free -= take;
+        remainingTotal -= take;
+        placedToday = true;
+      }
+      if (placedToday) daysUsed.push(dayStr);
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
+    if (remainingTotal > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        error: `No cupo todo dentro de ${MAX_HORIZON_DAYS} días con la capacidad actual (faltaron ${Math.round(remainingTotal)} pzas). Revise la capacidad de la línea.`,
+      });
+    }
+
+    await client.query(
+      "UPDATE work_orders SET status = CASE WHEN status='pending' THEN 'assigned' ELSE status END, updated_at = NOW() WHERE id = $1",
+      [parseInt(workOrderId, 10)]
+    );
+
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      compacted: true,
+      filled: !!fill,
+      basis: basis === "actual" ? "actual" : "planned",
+      producedAll: Math.round(producedAll),
+      totalPieces: Math.round(totalPieces),
+      repackPieces: Math.round(repackPieces),
+      unassignedPlaced: Math.round(unassignedPlaced),
+      perDayCap,
+      rateSource,
+      historyDays: nDays,
+      daysBefore,
+      daysAfter: daysUsed.length,
+      firstDay: daysUsed[0] || null,
+      lastDay: daysUsed[daysUsed.length - 1] || null,
+      created,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("❌ Error compacting assignments:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 /**
  * DELETE /api/line-assignments/:id
  * Removes an assignment from a line. If the work order has no active
@@ -5748,9 +6325,20 @@ app.get("/api/skyrina/period-summary", authenticateToken, async (req, res) => {
   }
 });
 
+
 /**
+ * Paste into server1.js next to the other /api/skyrina routes.
+ *
  * GET /api/skyrina/daily-production?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&style=xxx&lineNo=xxx
- * Daily produced (packing sewn qty) vs target — feeds the bar + meta-line chart.
+ *
+ * Returns one row per calendar day in the range (days with no runs come back as
+ * zeros, so the chart keeps its gaps instead of silently closing them).
+ *
+ * Produced = packing/empaque sewed quantities, matching /api/skyrina/period-summary.
+ * Meta     = sum of target_pcs across that day's runs.
+ *
+ * Overview.jsx works without this — it falls back to one period-summary call per
+ * day. This route turns 30 round trips into 1.
  */
 app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -5759,52 +6347,89 @@ app.get("/api/skyrina/daily-production", authenticateToken, async (req, res) => 
 
     const { startDate, endDate, style, lineNo } = req.query;
     if (!startDate || !endDate) {
-      return res.status(400).json({ success: false, error: "startDate and endDate parameters required" });
+      return res.status(400).json({
+        success: false,
+        error: "startDate and endDate parameters required",
+      });
     }
-    if (!['master', 'skyrina', 'engineer', 'supervisor', 'soporte_it'].includes(req.user.role)) {
+
+    if (!['master', 'skyrina', 'engineer', 'supervisor'].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
 
     const params = [startDate, endDate];
     let paramIndex = 3;
     let runFilters = "";
-    if (style && style !== 'all')  { runFilters += ` AND lr.style = $${paramIndex++}`;   params.push(style); }
-    if (lineNo && lineNo !== 'all') { runFilters += ` AND lr.line_no = $${paramIndex++}`; params.push(lineNo); }
+
+    if (style && style !== 'all') {
+      runFilters += ` AND lr.style = $${paramIndex++}`;
+      params.push(style);
+    }
+    if (lineNo && lineNo !== 'all') {
+      runFilters += ` AND lr.line_no = $${paramIndex++}`;
+      params.push(lineNo);
+    }
 
     const query = `
-      WITH filtered_runs AS (
-        SELECT lr.id AS run_id, lr.run_date, lr.target_pcs
+      WITH calendar AS (
+        SELECT generate_series($1::date, $2::date, '1 day')::date AS day
+      ),
+      filtered_runs AS (
+        SELECT
+          lr.id         AS run_id,
+          lr.run_date   AS run_date,
+          lr.target_pcs AS target_pcs
         FROM line_runs lr
         WHERE lr.run_date BETWEEN $1 AND $2${runFilters}
       ),
+      daily_target AS (
+        SELECT run_date, COALESCE(SUM(target_pcs), 0) AS target
+        FROM filtered_runs
+        GROUP BY run_date
+      ),
       run_packing_totals AS (
-        SELECT fr.run_id, fr.run_date,
-               COALESCE(SUM(se.sewed_qty), 0) AS packing_total
+        SELECT
+          fr.run_id,
+          fr.run_date,
+          COALESCE(SUM(se.sewed_qty), 0) AS packing_total
         FROM filtered_runs fr
-        JOIN run_operators ro ON fr.run_id = ro.run_id
-        JOIN operator_operations oo ON ro.id = oo.run_operator_id
+        JOIN run_operators ro          ON fr.run_id = ro.run_id
+        JOIN operator_operations oo    ON ro.id = oo.run_operator_id
         LEFT JOIN operation_sewed_entries se ON oo.id = se.operation_id
         WHERE (oo.operation_name ILIKE '%pack%' OR oo.operation_name ILIKE '%emp%')
         GROUP BY fr.run_id, fr.run_date
+      ),
+      daily_produced AS (
+        SELECT run_date, COALESCE(SUM(packing_total), 0) AS produced
+        FROM run_packing_totals
+        GROUP BY run_date
       )
       SELECT
-        to_char(fr.run_date, 'YYYY-MM-DD') AS date,
-        COALESCE(SUM(rpt.packing_total), 0) AS produced,
-        COALESCE(SUM(fr.target_pcs), 0)     AS target
-      FROM filtered_runs fr
-      LEFT JOIN run_packing_totals rpt ON fr.run_id = rpt.run_id
-      GROUP BY fr.run_date
-      ORDER BY fr.run_date
+        c.day                              AS date,
+        COALESCE(dp.produced, 0)           AS produced,
+        COALESCE(dt.target, 0)             AS target
+      FROM calendar c
+      LEFT JOIN daily_produced dp ON dp.run_date = c.day
+      LEFT JOIN daily_target   dt ON dt.run_date = c.day
+      ORDER BY c.day ASC
     `;
 
     const result = await client.query(query, params);
-    const days = result.rows.map(r => ({
-      date: r.date,
-      produced: parseFloat(r.produced) || 0,
-      target: parseFloat(r.target) || 0,
+
+    const days = result.rows.map((row) => ({
+      // send a plain YYYY-MM-DD string so the client never re-parses in UTC
+      date: row.date instanceof Date
+        ? `${row.date.getFullYear()}-${String(row.date.getMonth() + 1).padStart(2, '0')}-${String(row.date.getDate()).padStart(2, '0')}`
+        : String(row.date).slice(0, 10),
+      produced: parseFloat(row.produced) || 0,
+      target: parseFloat(row.target) || 0,
     }));
 
-    res.json({ success: true, period: { startDate, endDate }, days });
+    res.json({
+      success: true,
+      period: { startDate, endDate },
+      days,
+    });
   } catch (err) {
     console.error("❌ Error fetching daily production:", err.message);
     res.status(500).json({ success: false, error: err.message });

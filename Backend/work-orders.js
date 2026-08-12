@@ -40,6 +40,15 @@
 //    the plain work-order routes ignore them. Gated by authenticateToken only,
 //    because requireMerchantAccess is defined lower in server.js than this
 //    registration point. created_by uses req.user.id.
+// --------------------------------------------------------------------------
+// AUTOR DE LA ORDEN (work_orders.created_by)
+// --------------------------------------------------------------------------
+// Las dos rutas que crean ordenes (POST /api/work-orders y
+// POST /api/production-orders) guardan req.user.id en work_orders.created_by,
+// e initSchema crea la columna. Sin eso el dashboard de merchants no puede
+// decir QUIEN capturo cada PO. Las ordenes anteriores quedan en NULL; el
+// backfill desde merchant_week_plan vive en merchant-analytics.js.
+// GET /api/work-orders ya regresa created_by y created_by_name.
 // ==========================================================================
 
 // --- Startup migration: both breakdown tables ----------------------------
@@ -91,6 +100,13 @@ async function initSchema({ pool, setSchema }) {
     // fabric_name/fabric_code/yield_per_piece above are kept as a representative
     // (first-tela) copy for the header and list views.
     await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS fabrics JSONB NOT NULL DEFAULT '[]'::jsonb;");
+    // La cantidad de cada talla se captura en dos partes (piezas): packing
+    // (surtido) y SKU (talla sólida). quantity = packing_qty + sku_qty.
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS packing_qty NUMERIC(12,2) NOT NULL DEFAULT 0;");
+    await client.query("ALTER TABLE work_order_lines ADD COLUMN IF NOT EXISTS sku_qty NUMERIC(12,2) NOT NULL DEFAULT 0;");
+    // Reemplaza el esquema anterior de piezas-por-caja (nunca llegó a producción).
+    await client.query("ALTER TABLE work_order_lines DROP COLUMN IF EXISTS pack_per_box;");
+    await client.query("ALTER TABLE work_order_lines DROP COLUMN IF EXISTS sku_per_box;");
     await client.query("CREATE INDEX IF NOT EXISTS idx_work_order_lines_wo ON work_order_lines(work_order_id);");
     // Uniqueness must include estilo: the same color+talla can appear under two
     // different estilos within one PO. Drop the older (wo,talla,color) index and
@@ -133,6 +149,23 @@ async function initSchema({ pool, setSchema }) {
               OR wo.yield_per_piece IS NULL OR wo.commitment_date IS NULL);
     `);
     console.log("\u2705 work_orders fabric/yield header columns ready in prod_db_schema");
+
+    // Autor de la orden: QUIEN (que merchant) la capturo. Nullable, porque las
+    // ordenes creadas antes de que existiera esta columna no lo saben. El
+    // dashboard de merchants (merchant-analytics.js) lee de aqui y ademas
+    // rellena las viejas desde merchant_week_plan.created_by.
+    await client.query("ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS created_by BIGINT REFERENCES users(id) ON DELETE SET NULL;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_created_by ON work_orders(created_by);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_work_orders_created_at ON work_orders(created_at);");
+    console.log("\u2705 work_orders.created_by ready in prod_db_schema");
+
+    // Auto-cierre de celda: cuando el lider de linea captura >= lo asignado ese
+    // dia, la asignacion se marca 'completed' y aqui se guarda CUANTAS piezas se
+    // cosieron ese dia (produced_quantity) y CUANDO se cerro (completed_at).
+    // Ambas nullable: las asignaciones abiertas las dejan en NULL.
+    await client.query("ALTER TABLE line_assignments ADD COLUMN IF NOT EXISTS produced_quantity NUMERIC(12,2);");
+    await client.query("ALTER TABLE line_assignments ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;");
+    console.log("\u2705 line_assignments produced_quantity/completed_at columns ready in prod_db_schema");
   } finally {
     client.release();
   }
@@ -164,6 +197,8 @@ const LINES_SUBQUERY = `
              'fabricCode', l.fabric_code,
              'fabrics', COALESCE(l.fabrics, '[]'::jsonb),
              'yield', l.yield_per_piece,
+             'packingQty', l.packing_qty,
+             'skuQty', l.sku_qty,
              'quantity', l.quantity
            ) ORDER BY l.color, l.talla)
     FROM work_order_lines l WHERE l.work_order_id = wo.id
@@ -188,6 +223,13 @@ const PACKING_KEYWORDS = ["pack", "emp", "termin", "finish"];
 // de tronar cada consulta del planeador.
 let PRODUCED_SUBQUERY = "0::numeric AS produced_quantity";
 
+// Resolvidos en resolveProducedSubquery() y guardados a nivel de modulo para que
+// producedByLineFor() reutilice EXACTAMENTE la misma deteccion (mismo enlace
+// line_runs -> orden y las mismas operaciones de empaque/terminado). Si quedan
+// en null es que la deteccion fallo; el desglose por linea regresa vacio.
+let RESOLVED_RUN_LINK = null;   // { column, on }  — on usa alias lr y wo
+let PACKING_LIKES_SQL = null;   // "lower(oo.operation_name) LIKE '%..%' OR ..."
+
 // Tablas reales donde vive la captura por hora del lider de linea:
 //   line_runs                (id, ... , enlace a la orden)
 //   operator_operations      (id, run_id, operation_name, ...)
@@ -211,75 +253,107 @@ async function tableColumns(client, table) {
   return new Set(rows.map((r) => r.column_name));
 }
 
-// Construye el subquery de produccion. Se llama una sola vez al arranque.
+// Construye el subquery de produccion.
+// Wrapper para el flujo de migraciones: abre su propio client. initSchema lo
+// sigue llamando igual que antes.
 async function resolveProducedSubquery({ pool, setSchema }) {
   const client = await pool.connect();
   try {
     await setSchema(client);
-
-    const runCols = await tableColumns(client, "line_runs");
-    const sewCols = await tableColumns(client, "operation_sewed_entries");
-    const opCols = await tableColumns(client, "operator_operations");
-
-    const missing = [];
-    if (runCols.size === 0) missing.push("line_runs");
-    if (!sewCols.has("sewed_qty") || !sewCols.has("operation_id")) missing.push("operation_sewed_entries");
-    if (!opCols.has("operation_name")) missing.push("operator_operations");
-
-    if (missing.length) {
-      console.warn(
-        "\u26a0\ufe0f  produced_quantity quedara en 0. Tablas no encontradas o sin las " +
-        `columnas esperadas: ${missing.join(", ")}.`
-      );
-      return;
-    }
-
-    const link = RUN_LINK_CANDIDATES.find((c) => runCols.has(c.column));
-    if (!link) {
-      console.warn(
-        "\u26a0\ufe0f  produced_quantity quedara en 0: line_runs no tiene ninguna columna " +
-        `conocida hacia la orden (${RUN_LINK_CANDIDATES.map((c) => c.column).join(", ")}). ` +
-        "Agrega la correcta a RUN_LINK_CANDIDATES en work-orders.js."
-      );
-      return;
-    }
-
-    const likes = PACKING_KEYWORDS
-      .map((k) => `lower(oo.operation_name) LIKE '%${k}%'`)
-      .join(" OR ");
-
-    // Solo las operaciones de empaque/terminado. Sumar todas las operaciones
-    // contaria cada prenda una vez por operacion de la linea.
-    PRODUCED_SUBQUERY = `
-      COALESCE((
-        SELECT SUM(se.sewed_qty)
-          FROM operation_sewed_entries se
-          JOIN operator_operations oo ON oo.id = se.operation_id
-          JOIN line_runs lr           ON lr.id = se.run_id
-         WHERE ${link.on}
-           AND (${likes})
-      ), 0) AS produced_quantity
-    `;
-
-    console.log(`\u2705 produced_quantity resuelto (line_runs.${link.column})`);
-
-    // Aviso temprano: si ninguna operacion capturada coincide con las palabras
-    // clave, el total sera 0 aunque la linea si este produciendo.
-    const { rows } = await client.query(
-      `SELECT COUNT(*)::int AS n FROM operator_operations oo WHERE ${likes}`
-    );
-    if (rows[0].n === 0) {
-      console.warn(
-        "\u26a0\ufe0f  Ninguna operacion coincide con PACKING_KEYWORDS " +
-        `[${PACKING_KEYWORDS.join(", ")}]; produced_quantity sera 0. ` +
-        "Revisa como se llaman tus operaciones de empaque y ajusta la lista."
-      );
-    }
+    await detectProducedSubquery(client);
   } catch (err) {
     console.warn("\u26a0\ufe0f  resolveProducedSubquery fallo:", err.message);
   } finally {
     client.release();
   }
+}
+
+// La deteccion real. Recibe un client que YA tiene el search_path puesto, para
+// poder reusar el de la peticion en curso sin abrir otra conexion.
+async function detectProducedSubquery(client) {
+  const runCols = await tableColumns(client, "line_runs");
+  const sewCols = await tableColumns(client, "operation_sewed_entries");
+  const opCols = await tableColumns(client, "operator_operations");
+
+  const missing = [];
+  if (runCols.size === 0) missing.push("line_runs");
+  if (!sewCols.has("sewed_qty") || !sewCols.has("operation_id")) missing.push("operation_sewed_entries");
+  if (!opCols.has("operation_name")) missing.push("operator_operations");
+
+  if (missing.length) {
+    console.warn(
+      "\u26a0\ufe0f  produced_quantity quedara en 0. Tablas no encontradas o sin las " +
+      `columnas esperadas: ${missing.join(", ")}.`
+    );
+    return;
+  }
+
+  const link = RUN_LINK_CANDIDATES.find((c) => runCols.has(c.column));
+  if (!link) {
+    console.warn(
+      "\u26a0\ufe0f  produced_quantity quedara en 0: line_runs no tiene ninguna columna " +
+      `conocida hacia la orden (${RUN_LINK_CANDIDATES.map((c) => c.column).join(", ")}). ` +
+      "Agrega la correcta a RUN_LINK_CANDIDATES en work-orders.js."
+    );
+    return;
+  }
+
+  const likes = PACKING_KEYWORDS
+    .map((k) => `lower(oo.operation_name) LIKE '%${k}%'`)
+    .join(" OR ");
+
+  // Solo las operaciones de empaque/terminado. Sumar todas las operaciones
+  // contaria cada prenda una vez por operacion de la linea.
+  PRODUCED_SUBQUERY = `
+    COALESCE((
+      SELECT SUM(se.sewed_qty)
+        FROM operation_sewed_entries se
+        JOIN operator_operations oo ON oo.id = se.operation_id
+        JOIN line_runs lr           ON lr.id = se.run_id
+       WHERE ${link.on}
+         AND (${likes})
+    ), 0) AS produced_quantity
+  `;
+
+  // Guardar para el desglose por linea (finished-warehouse los reutiliza).
+  RESOLVED_RUN_LINK = link;
+  PACKING_LIKES_SQL = likes;
+
+  console.log(`\u2705 produced_quantity resuelto (line_runs.${link.column})`);
+
+  // Aviso temprano: si ninguna operacion capturada coincide con las palabras
+  // clave, el total sera 0 aunque la linea si este produciendo.
+  const { rows } = await client.query(
+    `SELECT COUNT(*)::int AS n FROM operator_operations oo WHERE ${likes}`
+  );
+  if (rows[0].n === 0) {
+    console.warn(
+      "\u26a0\ufe0f  Ninguna operacion coincide con PACKING_KEYWORDS " +
+      `[${PACKING_KEYWORDS.join(", ")}]; produced_quantity sera 0. ` +
+      "Revisa como se llaman tus operaciones de empaque y ajusta la lista."
+    );
+  }
+}
+
+// Detección resuelta una sola vez por proceso, bajo demanda.
+//
+// NO puede depender de runMigrations(): en Lambda RUN_MIGRATIONS=false y esa
+// funcion ni siquiera se invoca, asi que initSchema nunca corre. Sin este
+// candado PRODUCED_SUBQUERY se queda en el literal "0::numeric" durante toda la
+// vida del proceso y el planeador ve 0 producido aunque el piso si haya cosido.
+let producedResolution = null;
+
+async function ensureProducedResolved(client) {
+  if (RESOLVED_RUN_LINK) return;              // ya resuelto en este proceso
+  if (!producedResolution) {
+    producedResolution = detectProducedSubquery(client).catch((err) => {
+      // Se limpia el memo para reintentar en la siguiente peticion en vez de
+      // quedarse en 0 para siempre por un error transitorio de conexion.
+      producedResolution = null;
+      console.warn("\u26a0\ufe0f  detectProducedSubquery fallo:", err.message);
+    });
+  }
+  await producedResolution;
 }
 
 const up = (v, n) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, n);
@@ -340,6 +414,9 @@ function registerWorkOrders(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      // PRODUCED_SUBQUERY se interpola abajo: hay que resolverlo ANTES de armar
+      // el string de la consulta, o se cuela el literal 0.
+      await ensureProducedResolved(client);
       const { status, lineNo, startDate, endDate } = req.query;
 
       let query = `
@@ -353,6 +430,9 @@ function registerWorkOrders(app, deps) {
           wo.master_code_id, wo.sam_minutes, wo.customer_po,
           wo.fabric_name, wo.fabric_code, wo.yield_per_piece,
           wo.created_at, wo.updated_at,wo.season,wo.status,
+          wo.created_by,
+          (SELECT COALESCE(NULLIF(TRIM(u.full_name), ''), u.username)
+             FROM users u WHERE u.id = wo.created_by) AS created_by_name,
           ${COLORS_SUBQUERY},
           ${LINES_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
@@ -424,6 +504,7 @@ function registerWorkOrders(app, deps) {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      await ensureProducedResolved(client);
       const { id } = req.params;
 
       const result = await client.query(
@@ -463,6 +544,312 @@ function registerWorkOrders(app, deps) {
       res.json({ success: true, workOrder });
     } catch (err) {
       console.error("❌ Error fetching work order:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ---- GET /api/line-assignments/day-balances ---------------------------
+  //
+  // Una fila por celda del tablero (orden + linea + dia):
+  //   assigned    piezas que el planeador puso en esa celda
+  //   produced    piezas de empaque/terminado que reporto esa linea ESE dia
+  //   balance     assigned - produced  (nunca negativo)
+  //   run_linked  si existe corrida de esa linea ese dia ligada a la orden
+  //
+  // Hasta ahora la produccion se conocia a nivel ORDEN (produced_quantity) y a
+  // nivel ORDEN+LINEA (producedByLineFor). Ninguno decia EN QUE DIA se cosio,
+  // asi que el planeador no podia ver que el martes se asignaron 501 pzas y
+  // solo entraron 301. line_runs si tiene run_date: agrupando por
+  // (orden, linea, run_date) sale el tercer eje que faltaba.
+  //
+  // run_linked=false con balance completo casi siempre significa que el lider
+  // guardo la corrida SIN seleccionar la orden, no que la linea no cosio. Sin
+  // ese dato el planeador reasignaria piezas que ya estan hechas.
+  //
+  // Se agrupa por (orden, linea, dia) y NO por asignacion: una celda puede
+  // tener varias filas en line_assignments (una por color) y la produccion no
+  // se captura por color, asi que restarla contra cada fila la contaria de mas.
+  app.get("/api/line-assignments/day-balances", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await ensureProducedResolved(client);
+
+      const { from, to, workOrderId, lineNo, onlyPending } = req.query;
+
+      // Sin deteccion resuelta no hay forma de saber que se cosio: mejor decirlo
+      // que devolver saldos que serian el 100% de lo asignado.
+      if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) {
+        return res.json({
+          success: true,
+          resolved: false,
+          rows: [],
+          warning:
+            "No se pudo ligar la captura de piso con las ordenes; el saldo por dia no esta disponible.",
+        });
+      }
+
+      const params = [];
+      const where = ["la.status NOT IN ('cancelled', 'rejected')"];
+
+      if (from) { params.push(from); where.push(`la.assigned_date >= $${params.length}::date`); }
+      if (to)   { params.push(to);   where.push(`la.assigned_date <= $${params.length}::date`); }
+      if (workOrderId) { params.push(parseInt(workOrderId, 10)); where.push(`la.work_order_id = $${params.length}`); }
+      if (lineNo)      { params.push(String(lineNo));            where.push(`la.line_no = $${params.length}`); }
+
+      const { rows } = await client.query(
+        `
+        WITH prod AS (
+          SELECT wo.id       AS work_order_id,
+                 lr.line_no,
+                 lr.run_date,
+                 COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced,
+                 MAX(se.updated_at) AS last_reported_at
+            FROM work_orders wo
+            JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+            JOIN operation_sewed_entries se ON se.run_id = lr.id
+            JOIN operator_operations oo     ON oo.id = se.operation_id
+           GROUP BY wo.id, lr.line_no, lr.run_date
+        ),
+        runs AS (
+          SELECT lr.line_no,
+                 lr.run_date,
+                 COUNT(*)::int AS n_runs
+            FROM line_runs lr
+           GROUP BY lr.line_no, lr.run_date
+        ),
+        cells AS (
+          SELECT la.work_order_id,
+                 la.line_no,
+                 la.assigned_date,
+                 SUM(la.assigned_quantity)       AS assigned,
+                 ARRAY_AGG(la.id ORDER BY la.id) AS assignment_ids,
+                 ARRAY_AGG(DISTINCT la.color) FILTER (WHERE la.color IS NOT NULL) AS colors
+            FROM line_assignments la
+           WHERE ${where.join(" AND ")}
+           GROUP BY la.work_order_id, la.line_no, la.assigned_date
+        )
+        SELECT c.work_order_id,
+               wo.work_order_no,
+               wo.style_description,
+               wo.customer_name,
+               c.line_no,
+               to_char(c.assigned_date, 'YYYY-MM-DD') AS assigned_date,
+               c.assigned::numeric                     AS assigned,
+               COALESCE(p.produced, 0)::numeric        AS produced,
+               GREATEST(c.assigned - COALESCE(p.produced, 0), 0)::numeric AS balance,
+               GREATEST(COALESCE(p.produced, 0) - c.assigned, 0)::numeric AS over_qty,
+               c.assignment_ids,
+               COALESCE(c.colors, ARRAY[]::text[])     AS colors,
+               p.last_reported_at,
+               COALESCE(r.n_runs, 0)                   AS runs_on_day,
+               (p.produced IS NOT NULL)                AS run_linked,
+               (COALESCE(r.n_runs, 0) > 1)             AS shared_day,
+               (c.assigned_date <  CURRENT_DATE)       AS is_past,
+               (c.assigned_date =  CURRENT_DATE)       AS is_today
+          FROM cells c
+          JOIN work_orders wo ON wo.id = c.work_order_id
+          LEFT JOIN prod p ON p.work_order_id = c.work_order_id
+                          AND p.line_no       = c.line_no
+                          AND p.run_date      = c.assigned_date
+          LEFT JOIN runs r ON r.line_no  = c.line_no
+                          AND r.run_date = c.assigned_date
+         ORDER BY c.assigned_date DESC, c.line_no
+        `,
+        params
+      );
+
+      const out = rows.map((r) => {
+        const assigned = Number(r.assigned) || 0;
+        const produced = Number(r.produced) || 0;
+        const balance = Number(r.balance) || 0;
+        const state = r.is_today ? "today"
+          : !r.is_past ? "future"
+          : balance > 0 ? "short"
+          : "met";
+        return {
+          work_order_id: Number(r.work_order_id),
+          work_order_no: r.work_order_no,
+          style_description: r.style_description,
+          customer_name: r.customer_name,
+          line_no: r.line_no,
+          assigned_date: r.assigned_date,
+          assigned,
+          produced,
+          balance,
+          over: Number(r.over_qty) || 0,
+          pct: assigned > 0 ? Math.min((produced / assigned) * 100, 100) : 0,
+          assignment_ids: r.assignment_ids || [],
+          colors: r.colors || [],
+          run_linked: !!r.run_linked,
+          runs_on_day: Number(r.runs_on_day) || 0,
+          shared_day: !!r.shared_day,
+          is_past: !!r.is_past,
+          is_today: !!r.is_today,
+          last_reported_at: r.last_reported_at,
+          state,
+        };
+      });
+
+      const pending = out.filter((r) => r.is_past && r.balance > 0);
+
+      res.json({
+        success: true,
+        resolved: true,
+        rows: onlyPending ? pending : out,
+        totals: {
+          cells: out.length,
+          pendingCells: pending.length,
+          pendingPieces: Math.round(pending.reduce((s, r) => s + r.balance, 0)),
+          unlinkedCells: pending.filter((r) => !r.run_linked && r.runs_on_day > 0).length,
+        },
+      });
+    } catch (err) {
+      console.error("\u274c Error en day-balances:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ---- POST /api/line-assignments/settle-day ----------------------------
+  //
+  // Cierra una celda por lo que REALMENTE se cosio y devuelve el saldo.
+  //
+  // Hace falta antes de reasignar. Si se crean celdas nuevas dejando la vieja
+  // intacta, el martes queda con 501 pzas asignadas (de las que solo se hicieron
+  // 301) MAS 200 el miercoles: 701 asignadas para 501 de trabajo real. Como el
+  // pool del tablero se llena con total - assigned_quantity, la orden se veria
+  // totalmente asignada y el saldo desapareceria de Estado de Ordenes justo
+  // cuando el planeador mas lo necesita.
+  //
+  // El reparto entre colores es proporcional porque la produccion se captura por
+  // orden, no por color: no hay dato para hacerlo de otra forma.
+  app.post("/api/line-assignments/settle-day", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      await ensureProducedResolved(client);
+
+      const { workOrderId, lineNo, date } = req.body || {};
+      if (!workOrderId || !lineNo || !date) {
+        return res.status(400).json({ success: false, error: "Faltan workOrderId, lineNo o date." });
+      }
+      if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) {
+        return res.status(409).json({
+          success: false,
+          error: "No se puede liquidar el dia: la captura de piso no esta ligada a las ordenes.",
+        });
+      }
+
+      await client.query("BEGIN");
+
+      // Bloquear las filas para que dos planeadores no liquiden el mismo dia al
+      // mismo tiempo y el saldo salga reasignado dos veces.
+      const cellRes = await client.query(
+        `SELECT id, color, assigned_quantity
+           FROM line_assignments
+          WHERE work_order_id = $1
+            AND line_no = $2
+            AND assigned_date = $3::date
+            AND status NOT IN ('cancelled', 'rejected')
+          ORDER BY id
+          FOR UPDATE`,
+        [parseInt(workOrderId, 10), String(lineNo), date]
+      );
+
+      if (cellRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "No hay asignacion en esa celda." });
+      }
+
+      const prodRes = await client.query(
+        `SELECT COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced
+           FROM work_orders wo
+           JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+           JOIN operation_sewed_entries se ON se.run_id = lr.id
+           JOIN operator_operations oo     ON oo.id = se.operation_id
+          WHERE wo.id = $1
+            AND lr.line_no = $2
+            AND lr.run_date = $3::date`,
+        [parseInt(workOrderId, 10), String(lineNo), date]
+      );
+
+      const produced = Number(prodRes.rows[0]?.produced) || 0;
+      const assigned = cellRes.rows.reduce((s, r) => s + (Number(r.assigned_quantity) || 0), 0);
+      const balance = Math.max(assigned - produced, 0);
+
+      if (balance <= 0) {
+        await client.query(
+          `UPDATE line_assignments SET status = 'completed', updated_at = now() WHERE id = ANY($1)`,
+          [cellRes.rows.map((r) => r.id)]
+        );
+        await client.query("COMMIT");
+        return res.json({
+          success: true,
+          settled: true,
+          assigned, produced, balance: 0,
+          updated: cellRes.rows.length, deleted: 0,
+          message: "El dia alcanzo su meta; no hay saldo que reasignar.",
+        });
+      }
+
+      // Reparto proporcional. El residuo del redondeo va a la fila mas grande,
+      // para que la suma de las partes sea exactamente `produced` y no aparezcan
+      // saldos fantasma de 1 pza.
+      const parts = cellRes.rows.map((r) => ({
+        id: r.id,
+        color: r.color,
+        assigned: Number(r.assigned_quantity) || 0,
+      }));
+      let repartido = 0;
+      parts.forEach((r) => {
+        r.keep = assigned > 0 ? Math.floor((r.assigned / assigned) * produced) : 0;
+        repartido += r.keep;
+      });
+      const residuo = produced - repartido;
+      if (residuo > 0) {
+        parts.slice().sort((a, b) => b.assigned - a.assigned)[0].keep += residuo;
+      }
+
+      const toDelete = parts.filter((r) => r.keep <= 0).map((r) => r.id);
+      const toUpdate = parts.filter((r) => r.keep > 0);
+
+      for (const r of toUpdate) {
+        await client.query(
+          `UPDATE line_assignments
+              SET assigned_quantity = $2, status = 'completed', updated_at = now()
+            WHERE id = $1`,
+          [r.id, r.keep]
+        );
+      }
+      // assigned_quantity tiene CHECK (> 0): una celda sin nada cosido no se
+      // puede dejar en cero, hay que borrarla.
+      if (toDelete.length) {
+        await client.query(`DELETE FROM line_assignments WHERE id = ANY($1)`, [toDelete]);
+      }
+
+      await client.query("COMMIT");
+
+      // El saldo NO se reasigna aqui a proposito: a donde van esas piezas es
+      // decision del planeador (misma linea manana, otra linea, o de regreso al
+      // pool). El frontend recibe `balance` y llama a la asignacion normal, que
+      // ya sabe repartir respetando la capacidad diaria de cada linea.
+      res.json({
+        success: true,
+        settled: true,
+        assigned,
+        produced,
+        balance,
+        updated: toUpdate.length,
+        deleted: toDelete.length,
+        colors: parts.filter((r) => r.color).map((r) => r.color),
+      });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("\u274c Error en settle-day:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
@@ -535,9 +922,9 @@ function registerWorkOrders(app, deps) {
           work_order_no, quantity, customer_id, customer_name, style_description,
           color, fabric_supplier, style_code, estilo, fabrics, line_no, run_date,
           warehouse_stock, extra_quantity, total_to_produce, commitment_date,
-          master_code_id, sam_minutes, created_at, updated_at, status
+          master_code_id, sam_minutes, created_by, created_at, updated_at, status
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW(),'pending')
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW(),'pending')
         RETURNING *
         `,
         [
@@ -546,6 +933,7 @@ function registerWorkOrders(app, deps) {
           styleCode || null, estilo || null, Array.isArray(fabrics) ? fabrics : [], lineNo || null,
           runDate || null, wStock, xtra, resolvedTotalToProduce, commitmentDate || null,
           masterCodeId ? parseInt(masterCodeId) : null, resolvedSamMinutes,
+          req.user?.id ?? null,                       // created_by: el merchant que la capturo
         ]
       );
 
@@ -659,7 +1047,17 @@ function registerWorkOrders(app, deps) {
               fabricName: primary.name || fb.fabricName || null,
               fabricCode: primary.code || fb.fabricCode || null,
               yieldPerPiece: primary.yield ?? fb.yieldPerPiece ?? null,
-              quantity: parseFloat(l.quantity),
+              // Cantidad por talla en dos partes (piezas): packing + SKU.
+              // El servidor recalcula quantity = packing + sku (autoritativo);
+              // si no vienen, cae al quantity enviado por compatibilidad.
+              packingQty: Math.max(parseFloat(l.packingQty) || 0, 0),
+              skuQty: Math.max(parseFloat(l.skuQty) || 0, 0),
+              quantity: (() => {
+                const p = Math.max(parseFloat(l.packingQty) || 0, 0);
+                const s = Math.max(parseFloat(l.skuQty) || 0, 0);
+                const sum = p + s;
+                return sum > 0 ? sum : parseFloat(l.quantity);
+              })(),
             };
           })
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
@@ -692,6 +1090,74 @@ function registerWorkOrders(app, deps) {
         if (bad) return res.status(400).json({ success: false, error: `Falta el estilo cliente (6 caracteres) para el color ${bad.color || "?"}` });
       }
 
+      // ------------------------------------------------------------------
+      // ONE PO PER (color + estilo + customer PO + delivery date).
+      // Whatever grouping the client sent — a single `lines` payload or an
+      // `orders` array — is re-bucketed here so every distinct combination of
+      // color, estilo cliente, PO cliente and fecha de entrega becomes its own
+      // auto-numbered work order. The rest of the details (tallas, cantidades,
+      // telas, código de tela, rendimiento) travel with the bucket.
+      //
+      // Cells that fall in the same bucket are merged; a repeated talla within a
+      // bucket has its quantity summed and its telas unioned, because the
+      // (work_order_id, talla, color, estilo) unique index allows only one line
+      // per size in a PO.
+      const bucketKey = (c) =>
+        [c.color, c.estilo, c.customerPo || "", c.commitmentDate || ""].join("\u0001");
+      const unionFabrics = (a = [], b = []) => {
+        const out = [];
+        const seen = new Set();
+        for (const f of [...a, ...b]) {
+          const nm = toTxt(f?.name);
+          if (!nm) continue;
+          const cd = toTxt(f?.code);
+          const key = `${nm}|${cd || ""}`.toUpperCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ name: nm, code: cd, yield: toNum(f?.yield) });
+        }
+        return out;
+      };
+      const poSpecs = [];
+      for (const spec of orderSpecs) {
+        const byKey = new Map();
+        for (const cell of spec.cells) {
+          const key = bucketKey(cell);
+          let bucket = byKey.get(key);
+          if (!bucket) {
+            bucket = {
+              cells: [],
+              commitmentDate: cell.commitmentDate ?? spec.commitmentDate ?? null,
+              fabricName: spec.fabricName ?? null,
+              fabricCode: spec.fabricCode ?? null,
+              yieldPerPiece: spec.yieldPerPiece ?? null,
+            };
+            byKey.set(key, bucket);
+          }
+          const dup = bucket.cells.find((x) => x.talla === cell.talla);
+          if (dup) {
+            dup.quantity += cell.quantity;
+            dup.fabrics = unionFabrics(dup.fabrics, cell.fabrics);
+            const primary = dup.fabrics[0] || {};
+            dup.fabricName = primary.name || dup.fabricName;
+            dup.fabricCode = primary.code || dup.fabricCode;
+            dup.yieldPerPiece = primary.yield ?? dup.yieldPerPiece;
+            // packing y sku son piezas: se suman igual que la cantidad.
+            dup.packingQty = (dup.packingQty || 0) + (cell.packingQty || 0);
+            dup.skuQty = (dup.skuQty || 0) + (cell.skuQty || 0);
+          } else {
+            bucket.cells.push({ ...cell });
+          }
+        }
+        for (const bucket of byKey.values()) poSpecs.push(bucket);
+      }
+      if (poSpecs.length === 0) return res.status(400).json({ success: false, error: "Enter at least one size/color quantity" });
+
+      // Auto-number whenever more than one PO results (the split created extras)
+      // or the caller is already in multi mode. A lone legacy PO keeps using the
+      // caller-provided workOrderNo.
+      const autoNumber = multi || poSpecs.length > 1;
+
       await client.query("BEGIN");
 
       const cust = await client.query("SELECT name FROM customers WHERE id = $1", [parseInt(customerId)]);
@@ -710,9 +1176,9 @@ function registerWorkOrders(app, deps) {
 
       const samNum = parseFloat(sam) || 0;
 
-      // For multi-PO submissions we assign sequential SKM#### numbers ourselves.
+      // For auto-numbered submissions we assign sequential SKM#### numbers ourselves.
       let seq = 0;
-      if (multi) {
+      if (autoNumber) {
         const maxRes = await client.query(
           `SELECT COALESCE(MAX((substring(work_order_no from '^SKM([0-9]+)'))::int), 0) AS maxseq
              FROM work_orders WHERE work_order_no LIKE 'SKM%'`
@@ -724,9 +1190,9 @@ function registerWorkOrders(app, deps) {
       let created = 0, reused = 0;
       const createdOrders = [];
 
-      for (let i = 0; i < orderSpecs.length; i++) {
+      for (let i = 0; i < poSpecs.length; i++) {
         const { cells, commitmentDate: specDate, fabricName: specFabricName,
-                fabricCode: specFabricCode, yieldPerPiece: specYield } = orderSpecs[i];
+                fabricCode: specFabricCode, yieldPerPiece: specYield } = poSpecs[i];
         // A PO may carry several customer POs (one per line). Store a distinct,
         // comma-joined summary on the header for display/search; the authoritative
         // per-line values live in work_order_lines.customer_po.
@@ -762,9 +1228,10 @@ function registerWorkOrders(app, deps) {
           }
         }
 
-        // PO number: auto sequence for multi; provided number for the legacy case.
+        // PO number: auto sequence when splitting/multi; provided number only for
+        // a single legacy PO.
         let woNo;
-        if (multi) {
+        if (autoNumber) {
           seq += 1;
           woNo = `SKM${String(seq).padStart(4, "0")}-${CLI}-${styleCode}`;
         } else {
@@ -792,9 +1259,9 @@ function registerWorkOrders(app, deps) {
               color, fabric_supplier, style_code, estilo, fabrics, warehouse_stock,
               extra_quantity, total_to_produce, commitment_date, master_code_id,
               sam_minutes, season, customer_po, fabric_name, fabric_code,
-              yield_per_piece, created_at, updated_at, status
+              yield_per_piece, created_by, created_at, updated_at, status
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW(),NOW(),'pending')
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW(),'pending')
            RETURNING *`,
           [
             woNo, orderedQty, parseInt(customerId), customerName, description,
@@ -803,6 +1270,7 @@ function registerWorkOrders(app, deps) {
             wStock, xtra, totalToProduce,
             headerDate, primaryMasterCodeId, samNum, season || null, cPo || null,
             hFabricName, hFabricCode, hYield,
+            req.user?.id ?? null,                     // created_by: el merchant que la capturo
           ]
         );
         const workOrder = woResult.rows[0];
@@ -812,12 +1280,14 @@ function registerWorkOrders(app, deps) {
           await client.query(
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
-                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics,
+                packing_qty, sku_qty)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
             [workOrder.id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo || null, cell.commitmentDate || null, cell.fabricName || null,
              cell.fabricCode || null, cell.yieldPerPiece, cell.quantity,
-             JSON.stringify(cell.fabrics || [])]
+             JSON.stringify(cell.fabrics || []),
+             cell.packingQty ?? 0, cell.skuQty ?? 0]
           );
         }
 
@@ -929,7 +1399,14 @@ function registerWorkOrders(app, deps) {
               fabricName: primary.name || null,
               fabricCode: primary.code || null,
               yieldPerPiece: primary.yield ?? null,
-              quantity: parseFloat(l.quantity),
+              packingQty: Math.max(parseFloat(l.packingQty) || 0, 0),
+              skuQty: Math.max(parseFloat(l.skuQty) || 0, 0),
+              quantity: (() => {
+                const p = Math.max(parseFloat(l.packingQty) || 0, 0);
+                const s = Math.max(parseFloat(l.skuQty) || 0, 0);
+                const sum = p + s;
+                return sum > 0 ? sum : parseFloat(l.quantity);
+              })(),
             };
           })
           .filter((l) => l.talla && l.color && !isNaN(l.quantity) && l.quantity > 0);
@@ -1005,12 +1482,14 @@ function registerWorkOrders(app, deps) {
           await client.query(
             `INSERT INTO work_order_lines
                (work_order_id, master_code_id, talla, color, estilo, customer_po,
-                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+                commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics,
+                packing_qty, sku_qty)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
             [id, codeToId[code], cell.talla, cell.color, cell.estilo,
              cell.customerPo, cell.commitmentDate, cell.fabricName,
              cell.fabricCode, cell.yieldPerPiece, cell.quantity,
-             JSON.stringify(cell.fabrics || [])]
+             JSON.stringify(cell.fabrics || []),
+             cell.packingQty ?? 0, cell.skuQty ?? 0]
           );
         }
 
@@ -1098,6 +1577,7 @@ function registerWorkOrders(app, deps) {
 // captured per talla/color. Other modules (e.g. finished-warehouse) reuse this
 // so the logic lives in exactly one place.
 async function producedQuantityFor(client, workOrderId) {
+  await ensureProducedResolved(client);
   const { rows } = await client.query(
     `SELECT ${PRODUCED_SUBQUERY} FROM work_orders wo WHERE wo.id = $1`,
     [workOrderId]
@@ -1105,6 +1585,208 @@ async function producedQuantityFor(client, workOrderId) {
   return Number(rows[0]?.produced_quantity) || 0;
 }
 
+// Produccion terminada por LINEA para VARIAS ordenes en una sola consulta (evita
+// N+1 en el dashboard). Regresa Map<work_order_id, [{ line_no, finished,
+// last_reported_at }]>. Mismo enlace y mismas operaciones de empaque/terminado
+// que producedQuantityFor. Vacio si la deteccion no resolvio.
+async function producedByLineForMany(client, workOrderIds) {
+  await ensureProducedResolved(client);
+  const ids = (workOrderIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
+  if (ids.length === 0 || !RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) return new Map();
+  const { rows } = await client.query(
+    `SELECT wo.id AS work_order_id,
+            lr.line_no,
+            COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS finished,
+            MAX(se.updated_at) AS last_reported_at
+       FROM work_orders wo
+       JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+       JOIN operation_sewed_entries se ON se.run_id = lr.id
+       JOIN operator_operations oo     ON oo.id = se.operation_id
+      WHERE wo.id = ANY($1)
+      GROUP BY wo.id, lr.line_no
+      ORDER BY wo.id, lr.line_no`,
+    [ids]
+  );
+  const map = new Map();
+  for (const r of rows) {
+    const key = Number(r.work_order_id);
+    const arr = map.get(key) || [];
+    arr.push({ line_no: r.line_no, finished: Number(r.finished) || 0, last_reported_at: r.last_reported_at });
+    map.set(key, arr);
+  }
+  return map;
+}
+
+// Produccion terminada por LINEA para una orden. Usa el mismo enlace
+// line_runs->orden y las mismas operaciones de empaque/terminado que
+// producedQuantityFor, pero agrupado por line_no y con la ultima captura del
+// lider de linea, para que el Almacen PT vea "que entro de cada linea" y decida
+// cuando armar la lista de pre-empaque. Regresa [] si la deteccion no resolvio.
+//
+//   [{ line_no, finished, last_reported_at }]
+//
+// finished          = piezas terminadas reportadas por esa linea para la orden
+// last_reported_at  = ultima captura por hora de esa linea (cualquier operacion),
+//                     para que se vea actividad aunque aun no llegue a empaque.
+async function producedByLineFor(client, workOrderId) {
+  const map = await producedByLineForMany(client, [workOrderId]);
+  return map.get(Number(workOrderId)) || [];
+}
+
+// Piezas terminadas por (ORDEN, LINEA, DIA). Mismo enlace line_runs->orden y
+// las mismas operaciones de empaque/terminado que producedQuantityFor, solo
+// que ademas agrupado por lr.run_date: ese es el eje que faltaba para saber
+// que un dia cerro incompleto. Regresa [] si la deteccion no resolvio.
+//
+//   [{ work_order_id, line_no, day: 'YYYY-MM-DD', produced, last_reported_at }]
+//
+// OJO con line_runs: la UNIQUE es (line_no, run_date, style), o sea UNA corrida
+// por linea/dia/estilo, y esa corrida apunta a UNA orden. Si una linea cose dos
+// ordenes distintas el mismo dia (el tablero si permite varios POs por celda),
+// el piso solo puede reportar contra una de ellas y el saldo de la otra saldra
+// completo. No es un bug de esta consulta: es el limite del modelo actual.
+async function producedByLineDayForMany(client, { workOrderIds = null, from = null, to = null } = {}) {
+  await ensureProducedResolved(client);
+  if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) return [];
+
+  const params = [];
+  const where = [];
+
+  const ids = Array.isArray(workOrderIds)
+    ? workOrderIds.map(Number).filter(Number.isFinite)
+    : null;
+  if (ids && ids.length) {
+    params.push(ids);
+    where.push(`wo.id = ANY($${params.length})`);
+  }
+  if (from) { params.push(from); where.push(`lr.run_date >= $${params.length}::date`); }
+  if (to)   { params.push(to);   where.push(`lr.run_date <= $${params.length}::date`); }
+
+  const { rows } = await client.query(
+    `SELECT wo.id                              AS work_order_id,
+            lr.line_no,
+            to_char(lr.run_date, 'YYYY-MM-DD') AS day,
+            COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced,
+            MAX(se.updated_at)                 AS last_reported_at
+       FROM work_orders wo
+       JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+       JOIN operation_sewed_entries se ON se.run_id = lr.id
+       JOIN operator_operations oo     ON oo.id = se.operation_id
+      ${where.length ? "WHERE " + where.join(" AND ") : ""}
+      GROUP BY wo.id, lr.line_no, lr.run_date
+      ORDER BY lr.run_date, lr.line_no`,
+    params
+  );
+
+  return rows.map((r) => ({
+    work_order_id: Number(r.work_order_id),
+    line_no: r.line_no,
+    day: r.day,
+    produced: Number(r.produced) || 0,
+    last_reported_at: r.last_reported_at,
+  }));
+}
+
+// Marca como 'completed' las asignaciones de UNA celda del tablero (orden +
+// linea + dia) cuando lo COSIDO ese dia ya alcanzo o supero lo ASIGNADO, y
+// guarda cuanto se produjo (produced_quantity) y cuando se cerro (completed_at).
+//
+// Es el gemelo AUTOMATICO de settle-day: settle-day lo dispara el planeador a
+// mano y ademas reasigna el faltante cuando la linea quedo corta. Esto, en
+// cambio, lo dispara la propia captura del lider de linea, y SOLO actua en el
+// caso "meta alcanzada" (producido >= asignado): no encoge cantidades, no borra
+// filas y no reasigna nada. El faltante se sigue manejando con settle-day.
+//
+// Propiedades importantes:
+//   • Una sola direccion: nunca "descompleta" una celda. Asi no pelea con el
+//     flujo manual del planeador si despues corrige la captura hacia abajo.
+//   • Idempotente: si la celda ya esta completa no toca nada.
+//   • Multi-color: una celda puede tener varias filas (una por color) y la
+//     produccion se captura por ORDEN, no por color, asi que produced_quantity
+//     se reparte proporcional (residuo del redondeo a la fila mas grande) para
+//     que SUM(produced_quantity) de la celda == lo cosido ese dia.
+//   • Abre su PROPIA transaccion, asi que el client que reciba NO debe estar ya
+//     dentro de un BEGIN. Devuelve null si no hubo cambios.
+//
+// Regresa null (sin cambios) o
+//   { workOrderId, lineNo, day, assigned, produced, completed: [ids...] }
+async function autoCompleteDay(client, { workOrderId, lineNo, day }) {
+  await ensureProducedResolved(client);
+  if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) return null;
+
+  const wo = Number(workOrderId);
+  const ln = String(lineNo == null ? "" : lineNo);
+  if (!Number.isFinite(wo) || !ln || !day) return null;
+
+  await client.query("BEGIN");
+  try {
+    // Piezas de empaque/terminado que reporto esa linea para esa orden ESE dia.
+    // Mismo enlace y mismas operaciones que producedQuantityFor / day-balances.
+    const prodRes = await client.query(
+      `SELECT COALESCE(SUM(se.sewed_qty) FILTER (WHERE (${PACKING_LIKES_SQL})), 0) AS produced
+         FROM work_orders wo
+         JOIN line_runs lr               ON ${RESOLVED_RUN_LINK.on}
+         JOIN operation_sewed_entries se ON se.run_id = lr.id
+         JOIN operator_operations oo     ON oo.id = se.operation_id
+        WHERE wo.id = $1
+          AND lr.line_no = $2
+          AND lr.run_date = $3::date`,
+      [wo, ln, day]
+    );
+    const produced = Number(prodRes.rows[0]?.produced) || 0;
+    if (produced <= 0) { await client.query("ROLLBACK"); return null; }
+
+    // Filas de la celda que aun estan abiertas. Se bloquean para no competir con
+    // settle-day ni con dos capturas simultaneas.
+    const cellRes = await client.query(
+      `SELECT id, color, assigned_quantity
+         FROM line_assignments
+        WHERE work_order_id = $1
+          AND line_no = $2
+          AND assigned_date = $3::date
+          AND status NOT IN ('completed', 'cancelled', 'rejected')
+        ORDER BY id
+        FOR UPDATE`,
+      [wo, ln, day]
+    );
+    if (cellRes.rows.length === 0) { await client.query("ROLLBACK"); return null; }
+
+    const assigned = cellRes.rows.reduce((s, r) => s + (Number(r.assigned_quantity) || 0), 0);
+    // Aun no alcanza la meta: se deja abierta (en proceso) y no se toca nada.
+    if (assigned <= 0 || produced < assigned) { await client.query("ROLLBACK"); return null; }
+
+    // Reparto proporcional de lo cosido entre las filas de color; el residuo del
+    // redondeo va a la fila mas grande para que la suma cuadre exacto.
+    const parts = cellRes.rows.map((r) => ({ id: r.id, assigned: Number(r.assigned_quantity) || 0, share: 0 }));
+    let repartido = 0;
+    parts.forEach((r) => { r.share = assigned > 0 ? Math.floor((r.assigned / assigned) * produced) : 0; repartido += r.share; });
+    const residuo = produced - repartido;
+    if (residuo > 0) parts.slice().sort((a, b) => b.assigned - a.assigned)[0].share += residuo;
+
+    for (const r of parts) {
+      await client.query(
+        `UPDATE line_assignments
+            SET status = 'completed',
+                produced_quantity = $2,
+                completed_at = now(),
+                updated_at = now()
+          WHERE id = $1`,
+        [r.id, r.share]
+      );
+    }
+
+    await client.query("COMMIT");
+    return { workOrderId: wo, lineNo: ln, day, assigned, produced, completed: parts.map((r) => r.id) };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  }
+}
+
 registerWorkOrders.initSchema = initSchema;
+registerWorkOrders.autoCompleteDay = autoCompleteDay;
 registerWorkOrders.producedQuantityFor = producedQuantityFor;
+registerWorkOrders.producedByLineFor = producedByLineFor;
+registerWorkOrders.producedByLineForMany = producedByLineForMany;
+registerWorkOrders.producedByLineDayForMany = producedByLineDayForMany;
 module.exports = registerWorkOrders;

@@ -51,6 +51,9 @@ export default function SavedRunsViewer({ onBack }) {
 
   // Date filter state
   const [filterDate, setFilterDate] = useState("");
+  // Line number and style filter state
+  const [filterLine, setFilterLine] = useState("");
+  const [filterStyle, setFilterStyle] = useState("");
 
   const [showOperatorModal, setShowOperatorModal] = useState(false);
 
@@ -60,6 +63,13 @@ export default function SavedRunsViewer({ onBack }) {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 const [runToDelete, setRunToDelete] = useState(null);
 const [isDeleting, setIsDeleting] = useState(false);
+
+// Multi-select delete state
+const [selectMode, setSelectMode] = useState(false);
+const [selectedIds, setSelectedIds] = useState(() => new Set());
+const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
+const [bulkDeleting, setBulkDeleting] = useState(false);
+const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
 
   // Cargar todas las corridas guardadas
   useEffect(() => {
@@ -160,6 +170,115 @@ const handleDeleteRun = async () => {
     setIsDeleting(false);
   }
 };
+
+// Entrar/salir del modo selección múltiple
+const toggleSelectMode = () => {
+  setSelectMode((prev) => {
+    if (prev) setSelectedIds(new Set()); // limpiar al salir
+    return !prev;
+  });
+};
+
+// Marcar/desmarcar una corrida
+const toggleRunSelection = (runId) => {
+  setSelectedIds((prev) => {
+    const next = new Set(prev);
+    if (next.has(runId)) next.delete(runId);
+    else next.add(runId);
+    return next;
+  });
+};
+
+// Seleccionar/deseleccionar todas las corridas visibles (filtradas)
+const toggleSelectAll = (runs) => {
+  setSelectedIds((prev) => {
+    const allSelected = runs.length > 0 && runs.every((r) => prev.has(r.id));
+    if (allSelected) return new Set();
+    return new Set(runs.map((r) => r.id));
+  });
+};
+
+// Eliminar en lote: reutiliza el endpoint individual DELETE /api/run/:id
+const handleBulkDelete = async () => {
+  const ids = Array.from(selectedIds);
+  if (ids.length === 0) return;
+
+  setBulkDeleting(true);
+  setMessage("");
+  setBulkProgress({ done: 0, total: ids.length });
+
+  const token = localStorage.getItem("token");
+  const failed = [];
+  let done = 0;
+
+  for (const id of ids) {
+    try {
+      const response = await fetch(`http://localhost:5000/api/run/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (!data.success) failed.push({ id, error: data.error });
+    } catch (err) {
+      failed.push({ id, error: err.message });
+    } finally {
+      done += 1;
+      setBulkProgress({ done, total: ids.length });
+    }
+  }
+
+  const deletedCount = ids.length - failed.length;
+  if (failed.length === 0) {
+    setMessage(`✅ ${deletedCount} corrida(s) eliminada(s) correctamente.`);
+  } else {
+    setMessage(
+      `⚠️ ${deletedCount} eliminada(s), ${failed.length} fallaron. Primer error: ${failed[0].error}`
+    );
+  }
+
+  // Si la corrida abierta fue eliminada, limpiar la vista
+  if (selectedRun && selectedIds.has(selectedRun)) {
+    setSelectedRun(null);
+    setRunData(null);
+    setOperators([]);
+    setActivePanel("select");
+  }
+
+  await fetchLineRuns();
+  setShowBulkDeleteConfirm(false);
+  setBulkDeleting(false);
+  setSelectMode(false);
+  setSelectedIds(new Set());
+  setBulkProgress({ done: 0, total: 0 });
+};
+
+  // Confirmar un borrador: quita la marca is_draft y lo vuelve una corrida
+  // normal. El borrador lo crea el planificador al asignar una orden a una
+  // línea que ingeniería aún no había configurado ese día.
+  const [confirmingId, setConfirmingId] = useState(null);
+  const handleConfirmDraft = async (run) => {
+    if (!run) return;
+    setConfirmingId(run.id);
+    setMessage("");
+    try {
+      const token = localStorage.getItem("token");
+      const response = await fetch(`http://localhost:5000/api/run/${run.id}/confirm`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (data.success) {
+        setMessage(`✅ Corrida de la línea ${run.line_no} confirmada.`);
+        await fetchLineRuns();
+      } else {
+        setMessage(`❌ Error: ${data.error}`);
+      }
+    } catch (err) {
+      setMessage(`❌ No se pudo confirmar la corrida: ${err.message}`);
+    } finally {
+      setConfirmingId(null);
+    }
+  };
 
   const fetchLineRuns = async () => {
     setLoading(true);
@@ -505,10 +624,21 @@ const getRowsFromData = () => {
     }
   };
 
-  // Filtrar runs por fecha seleccionada
-  const filteredRuns = filterDate
-    ? lineRuns.filter((run) => normalizeDate(run.run_date) === normalizeDate(filterDate))
-    : lineRuns;
+  // Opciones distintas de línea y estilo a partir de las corridas cargadas
+  const lineOptions = Array.from(
+    new Set(lineRuns.map((run) => run.line_no).filter((v) => v != null && v !== ""))
+  ).sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true }));
+  const styleOptions = Array.from(
+    new Set(lineRuns.map((run) => run.style).filter((v) => v != null && v !== ""))
+  ).sort((a, b) => String(a).localeCompare(String(b)));
+
+  // Filtrar runs por fecha, línea y estilo (todos combinables)
+  const filteredRuns = lineRuns.filter((run) => {
+    if (filterDate && normalizeDate(run.run_date) !== normalizeDate(filterDate)) return false;
+    if (filterLine && String(run.line_no) !== String(filterLine)) return false;
+    if (filterStyle && String(run.style) !== String(filterStyle)) return false;
+    return true;
+  });
 
   if (loading) {
     return (
@@ -558,9 +688,9 @@ const getRowsFromData = () => {
           </div>
 
           <div className="p-5">
-            {/* Filtro por fecha */}
+            {/* Filtros: fecha, línea y estilo */}
             <div className="mb-5 flex flex-wrap items-center gap-3">
-              <div className="w-full sm:w-64">
+              <div className="w-full sm:w-56">
                 <input
                   type="date"
                   value={filterDate}
@@ -569,38 +699,131 @@ const getRowsFromData = () => {
                   placeholder="Filtrar por fecha"
                 />
               </div>
-              {filterDate && (
+              <div className="w-full sm:w-48">
+                <select
+                  value={filterLine}
+                  onChange={(e) => setFilterLine(e.target.value)}
+                  className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-gray-900/10 bg-white"
+                >
+                  <option value="">Todas las líneas</option>
+                  {lineOptions.map((line) => (
+                    <option key={line} value={line}>
+                      Línea {line}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="w-full sm:w-48">
+                <select
+                  value={filterStyle}
+                  onChange={(e) => setFilterStyle(e.target.value)}
+                  className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-gray-900/10 bg-white"
+                >
+                  <option value="">Todos los estilos</option>
+                  {styleOptions.map((style) => (
+                    <option key={style} value={style}>
+                      {style}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {(filterDate || filterLine || filterStyle) && (
                 <button
-                  onClick={() => setFilterDate("")}
+                  onClick={() => {
+                    setFilterDate("");
+                    setFilterLine("");
+                    setFilterStyle("");
+                  }}
                   className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm hover:bg-gray-50"
                 >
-                  Limpiar filtro
+                  Limpiar filtros
                 </button>
               )}
               <span className="text-sm text-gray-600">
                 {filteredRuns.length} corrida(s) encontrada(s)
               </span>
+
+              {/* Controles de selección múltiple */}
+              <div className="ml-auto flex flex-wrap items-center gap-3">
+                {!selectMode ? (
+                  <button
+                    onClick={toggleSelectMode}
+                    disabled={filteredRuns.length === 0}
+                    className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    Seleccionar
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => toggleSelectAll(filteredRuns)}
+                      className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm hover:bg-gray-50"
+                    >
+                      {filteredRuns.length > 0 && filteredRuns.every((r) => selectedIds.has(r.id))
+                        ? "Deseleccionar todo"
+                        : "Seleccionar todo"}
+                    </button>
+                    <button
+                      onClick={() => setShowBulkDeleteConfirm(true)}
+                      disabled={selectedIds.size === 0}
+                      className="rounded-xl bg-red-600 text-white px-4 py-2 text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+                    >
+                      🗑️ Eliminar seleccionadas ({selectedIds.size})
+                    </button>
+                    <button
+                      onClick={toggleSelectMode}
+                      className="rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm hover:bg-gray-50"
+                    >
+                      Cancelar
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
 
             {filteredRuns.length === 0 ? (
               <div className="text-center py-8 text-gray-600">
-                {filterDate
-                  ? `No hay corridas para la fecha ${filterDate}`
+                {filterDate || filterLine || filterStyle
+                  ? "No hay corridas que coincidan con los filtros seleccionados."
                   : "No se encontraron corridas guardadas. Primero guarda una corrida desde el planificador."}
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {filteredRuns.map((run) => (
+                {filteredRuns.map((run) => {
+  const isSelected = selectedIds.has(run.id);
+  return (
   <div
     key={run.id}
-    className="rounded-xl border border-gray-200 p-4 hover:border-gray-300 hover:bg-gray-50 transition flex flex-col h-full"
+    className={`rounded-xl border p-4 transition flex flex-col h-full ${
+      selectMode && isSelected
+        ? "border-red-400 ring-2 ring-red-200 bg-red-50/40"
+        : run.is_draft
+        ? "border-amber-300 bg-amber-50/40 hover:border-amber-400"
+        : "border-gray-200 hover:border-gray-300 hover:bg-gray-50"
+    }`}
   >
-    <div 
+    <div
       className="flex-grow cursor-pointer"
-      onClick={() => handleSelectRun(run.id)}
+      onClick={() =>
+        selectMode ? toggleRunSelection(run.id) : handleSelectRun(run.id)
+      }
     >
       <div className="flex items-center justify-between mb-2">
-        <div className="font-semibold text-gray-900">{run.line_no}</div>
+        <div className="flex items-center gap-2">
+          {selectMode && (
+            <input
+              type="checkbox"
+              checked={isSelected}
+              onChange={() => toggleRunSelection(run.id)}
+              onClick={(e) => e.stopPropagation()}
+              className="h-4 w-4 rounded border-gray-300 text-red-600 focus:ring-red-500"
+            />
+          )}
+          <div className="font-semibold text-gray-900">{run.line_no}</div>
+          {run.is_draft && (
+            <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-bold uppercase tracking-wide">Borrador</span>
+          )}
+        </div>
         <div className="text-xs text-gray-500">
           {new Date(run.run_date).toLocaleDateString()}
         </div>
@@ -613,8 +836,21 @@ const getRowsFromData = () => {
       </div>
     </div>
 
-    {/* Action Buttons */}
+    {/* Action Buttons — se ocultan en modo selección */}
+    {!selectMode && (
     <div className="mt-3 pt-3 border-t border-gray-100 flex justify-end gap-3">
+      {run.is_draft && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            handleConfirmDraft(run);
+          }}
+          disabled={confirmingId === run.id}
+          className="text-sm text-emerald-600 hover:text-emerald-800 font-medium disabled:opacity-50"
+        >
+          {confirmingId === run.id ? "Confirmando..." : "✅ Confirmar"}
+        </button>
+      )}
       <button
         onClick={(e) => {
           e.stopPropagation();
@@ -636,8 +872,10 @@ const getRowsFromData = () => {
         🗑️ Eliminar
       </button>
     </div>
+    )}
   </div>
-))}
+  );
+})}
               </div>
             )}
           </div>
@@ -757,6 +995,46 @@ const getRowsFromData = () => {
           className="px-4 py-2 text-sm bg-red-600 text-white rounded-xl hover:bg-red-700 disabled:opacity-50"
         >
           {isDeleting ? "Eliminando..." : "Sí, eliminar"}
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
+{/* Modal de confirmación de eliminación en lote */}
+{showBulkDeleteConfirm && (
+  <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+    <div className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6">
+      <h3 className="text-lg font-semibold text-gray-900 mb-2">
+        Eliminar varias corridas
+      </h3>
+      <p className="text-sm text-gray-600 mb-4">
+        Vas a eliminar <span className="font-semibold">{selectedIds.size}</span> corrida(s).
+      </p>
+      <p className="text-xs text-red-600 mb-4">
+        ⚠️ Esta acción eliminará permanentemente cada corrida seleccionada, incluyendo todos
+        los operadores, operaciones, metas horarias y datos de producción asociados. No se
+        puede deshacer.
+      </p>
+      {bulkDeleting && (
+        <p className="text-sm text-gray-600 mb-4">
+          Eliminando {bulkProgress.done} de {bulkProgress.total}...
+        </p>
+      )}
+      <div className="flex justify-end gap-3">
+        <button
+          onClick={() => setShowBulkDeleteConfirm(false)}
+          disabled={bulkDeleting}
+          className="px-4 py-2 text-sm border border-gray-200 rounded-xl hover:bg-gray-50 disabled:opacity-50"
+        >
+          Cancelar
+        </button>
+        <button
+          onClick={handleBulkDelete}
+          disabled={bulkDeleting}
+          className="px-4 py-2 text-sm bg-red-600 text-white rounded-xl hover:bg-red-700 disabled:opacity-50"
+        >
+          {bulkDeleting ? "Eliminando..." : `Sí, eliminar ${selectedIds.size}`}
         </button>
       </div>
     </div>

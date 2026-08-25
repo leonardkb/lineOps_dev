@@ -4,6 +4,7 @@ import {
   Plus, Trash2, Check, X, AlertCircle, RefreshCw, ChevronLeft, ChevronRight,
   Camera, ClipboardList,
 } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { API_URL, TIPOS, MODELOS, TALLAS } from "../../lib/masterCodeCatalog";
 import MerchantNavbar from "../../components/merchant/MerchantNavbar";
 
@@ -107,6 +108,15 @@ function RowField({ label, children, hint }) {
 export default function NuevaOrdenWizard() {
   const [step, setStep] = useState(1);
 
+  // Pre-orden de origen (opcional). /nuevo-orden-wizard?preOrderId=123 abre el
+  // wizard con el estilo, el cliente y las piezas ya comprometidas; lo que falta
+  // — tallas, colores, telas, entregas, SAM — es justo lo que se captura aquí.
+  // Al crear la(s) PO(s) la pre-orden se marca como convertida.
+  const location = useLocation();
+  const navigate = useNavigate();
+  const preOrderId = new URLSearchParams(location.search).get("preOrderId");
+  const [preOrder, setPreOrder] = useState(null);
+
   // catalogs
   const [customers, setCustomers] = useState([]);
   const [fabrics, setFabrics] = useState([]);
@@ -167,6 +177,43 @@ export default function NuevaOrdenWizard() {
       }
     })();
   }, []);
+
+  // Carga la pre-orden y precarga los pasos 1, 3 y 4 con lo que ya se sabe.
+  useEffect(() => {
+    if (!preOrderId) return;
+    (async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/pre-orders/${preOrderId}`, { headers: authHeaders() });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "No se pudo cargar la pre-orden");
+        const p = data.preOrder;
+        if (p.status === "converted") {
+          showToast(`${p.pre_order_no} ya se convirtió en ${p.work_order_nos || "una PO"}`, true);
+          return;
+        }
+        setPreOrder(p);
+        if (p.tipo) setTipo(p.tipo);
+        if (p.modelo) setModelo(p.modelo);
+        if (p.correlativo) setCorrelativo(p.correlativo);
+        if (p.customer_id) setCustomerId(String(p.customer_id));
+        if (p.cliente_code) setClienteCode(p.cliente_code);
+        if (p.style_description) setDescription(p.style_description);
+        // Si la pre-orden ya traía SAM, se hereda para no recapturarlo (aquí es
+        // requerido); el merchant lo confirma o ajusta antes de crear la PO.
+        if (Number(p.sam_minutes) > 0) setSam(String(p.sam_minutes));
+        // Estilo cliente y PO del cliente entran en la primera línea del paso 2,
+        // donde las piezas se reparten por talla y color.
+        if (p.estilo || p.customer_po) {
+          setColorRows((rows) => rows.map((r, i) => (i === 0
+            ? { ...r, estilo: p.estilo || r.estilo, customerPo: p.customer_po || r.customerPo }
+            : r)));
+        }
+        showToast(`Pre-orden ${p.pre_order_no} cargada · ${Number(p.pieces || 0).toLocaleString()} pzs por repartir`);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    })();
+  }, [preOrderId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // auto-fetch correlativo when tipo+modelo chosen
   useEffect(() => {
@@ -327,6 +374,11 @@ export default function NuevaOrdenWizard() {
     orderedQty - (parseFloat(warehouseStock) || 0) + (parseFloat(extraQuantity) || 0), 0
   );
   const season = seasonCode ? `${seasonCode}${seasonYear}` : "";
+
+  // Piezas comprometidas en la pre-orden vs. las capturadas hasta ahora. Es una
+  // referencia, no un candado: la orden real puede subir o bajar.
+  const preOrderPieces = preOrder ? Number(preOrder.pieces) || 0 : 0;
+  const piecesDiff = preOrder ? orderedQty - preOrderPieces : 0;
 
   // ------- step handlers ----------------------------------------------
   // Order selected sizes by their position in the TALLAS catalog (smallest →
@@ -519,6 +571,27 @@ export default function NuevaOrdenWizard() {
 
       const nos = (data.workOrders || [data.workOrder]).filter(Boolean).map((w) => w.work_order_no);
       showToast(`✅ ${nos.length} orden(es) creada(s): ${nos.join(", ")}`);
+
+      // Cierra la pre-orden y le deja el rastro de las POs que produjo. Si esto
+      // falla las órdenes YA existen: se avisa y la pre-orden queda pendiente
+      // para cerrarla a mano — no se deshace nada.
+      if (preOrder) {
+        try {
+          const convRes = await fetch(`${API_URL}/api/pre-orders/${preOrder.id}/convert`, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify({
+              workOrderIds: (data.workOrders || [data.workOrder]).filter(Boolean).map((w) => w.id),
+              workOrderNos: nos,
+            }),
+          });
+          if (!convRes.ok) throw new Error("Las órdenes se crearon, pero la pre-orden sigue pendiente");
+          setTimeout(() => navigate("/pre-ordenes"), 1200);
+          return;
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      }
       // reset
       setStep(1);
       setTipo(""); setModelo(""); setCorrelativo("");
@@ -541,9 +614,40 @@ export default function NuevaOrdenWizard() {
 
   return (
     <div className="min-h-screen bg-slate-100">
-      <MerchantNavbar title="Nueva orden · Código maestro + PO" showRefresh={false} />
+      <MerchantNavbar
+        title={preOrder ? `Completar ${preOrder.pre_order_no} → PO` : "Nueva orden · Código maestro + PO"}
+        showRefresh={false}
+      />
 
       <main className="max-w-5xl mx-auto px-6 py-8 space-y-6">
+        {/* Viene de una pre-orden: qué se comprometió y qué llevamos capturado */}
+        {preOrder && (
+          <div className="rounded-xl bg-slate-900 text-white px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <ClipboardList size={16} className="text-slate-400" />
+              <div>
+                <p className="text-[11px] uppercase tracking-widest text-slate-400">Completando pre-orden</p>
+                <p className="font-mono text-sm font-bold">
+                  {preOrder.pre_order_no} · {preOrder.customer_name}
+                  {preOrder.target_date ? ` · objetivo ${preOrder.target_date}` : ""}
+                </p>
+              </div>
+            </div>
+            <div className="text-right">
+              <p className="text-[11px] uppercase tracking-widest text-slate-400">Piezas capturadas</p>
+              <p className="font-mono text-sm font-bold">
+                {orderedQty.toLocaleString()}
+                <span className="text-slate-400"> / {preOrderPieces.toLocaleString()}</span>
+                {piecesDiff !== 0 && (
+                  <span className={piecesDiff > 0 ? "ml-2 text-amber-300" : "ml-2 text-rose-300"}>
+                    {piecesDiff > 0 ? `+${piecesDiff.toLocaleString()}` : piecesDiff.toLocaleString()}
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Stepper */}
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-4">
           <div className="flex items-center">
@@ -938,6 +1042,15 @@ export default function NuevaOrdenWizard() {
                     </span>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {preOrder?.notes && (
+              <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                  Notas de {preOrder.pre_order_no}
+                </p>
+                <p className="text-xs text-slate-600 whitespace-pre-wrap">{preOrder.notes}</p>
               </div>
             )}
 

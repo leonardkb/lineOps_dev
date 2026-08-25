@@ -12,6 +12,8 @@ export default function NavCeo() {
     { name: "Quality Monitor", path: "/quality-monitor" },
     { name: "Mechanics", path: "/mecanics" },
     { name: "Merchant Analytics", path: "/merchant-analytics" },
+    { name: "Cut-Order Analysis", path: "/cut-order-analytics" },
+    { name: "FWH Analysis", path: "/fwh-analytics" },
   ];
 
   const handleLogout = () => {

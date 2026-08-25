@@ -23,6 +23,10 @@ import FinishedWarehouse from "./pages/FWHS/FinishedWarehouse";
 import AdminUsers from "./pages/AdminUsers";
 import QualityHead from "./pages/quality_head/QualityHead";
 import MerchantAnalytics from "./pages/MerchantAnalytics";
+import CutOrderAnalytics from "./pages/Corte/CutOrderAnalytics";
+import FinishedWarehouseAnalytics from "./pages/FWHS/FinishedWarehouseAnalytics";
+import PreOrdenesPage from "./components/merchant/PreOrdenesPage";
+import PreOrdenWizard from "./components/merchant/Preordenwizard";
 export default function App() {
   return (
     <Router>
@@ -51,6 +55,10 @@ export default function App() {
         <Route path="/fws" element={<FinishedWarehouse />} /> {/*finished warehouse route */}
         <Route path="/quality-head" element={<QualityHead />} /> {/*quality head route */}
         <Route path ="merchant-analytics" element={<MerchantAnalytics/>} /> {/*merchant analytics route */}
+        <Route path='/cut-order-analytics' element={<CutOrderAnalytics/>} /> {/*cut order analytics route */}
+        <Route path='/fwh-analytics' element={<FinishedWarehouseAnalytics/>} /> {/*finished warehouse analytics route */}
+        <Route path='/pre-ordenes' element={<PreOrdenesPage/>} /> {/*pre-orders route */}
+        <Route path='/pre-orden-wizard' element ={<PreOrdenWizard/>}/>
       </Routes>
     </Router>
   );

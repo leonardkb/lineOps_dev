@@ -16,7 +16,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   Factory, Clock, RefreshCw, Loader2, AlertCircle, ClipboardList,
-  Boxes, Package, ArrowRight, CheckCircle2, PackageCheck,
+  Boxes, Package, ArrowRight, CheckCircle2, PackageCheck, ScanLine,
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 
@@ -122,8 +122,14 @@ export default function FinishedWarehouseDashboard({ onNavigate = null, onCreate
           <p className="text-sm text-gray-500">Lo que entra de las líneas, por orden. Arme la lista cuando esté terminada.</p>
         </div>
         <button
+          onClick={() => onNavigate && onNavigate("escaneo")}
+          className="ml-auto inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700"
+        >
+          <ScanLine className="w-4 h-4" /> Escanear tickets
+        </button>
+        <button
           onClick={load}
-          className="ml-auto inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50"
+          className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50"
         >
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Actualizar
         </button>

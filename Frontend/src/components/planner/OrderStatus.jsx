@@ -48,7 +48,21 @@ const AUTO_REFRESH_MS = 30_000;
 const targetOf = (wo) => Number(wo?.total_to_produce) || Number(wo?.quantity) || 0;
 const assignedOf = (wo) => Number(wo?.assigned_quantity) || 0;
 const producedOf = (wo) => Number(wo?.produced_quantity) || 0;
-const remainingOf = (wo) => Math.max(targetOf(wo) - assignedOf(wo), 0);
+// Lo que falta POR PLANEAR. Deliberadamente NO es target - assigned: una pieza
+// ya cosida no hay que volver a asignarla, exista o no su fila de asignacion.
+// Si el historial de una celda se borro, assigned queda por debajo de produced y
+// target - assigned pediria replanear trabajo que el piso ya hizo (el caso
+// "Asignado 0 / 1,500" con 1,251 producidas -> faltan 249, no 1,500).
+// El backend manda pending_to_assign ya calculado; esto es el respaldo.
+const remainingOf = (wo) => {
+  const fromApi = wo?.pending_to_assign;
+  if (fromApi != null && fromApi !== "") return Math.max(Number(fromApi) || 0, 0);
+  return Math.max(targetOf(wo) - Math.max(assignedOf(wo), producedOf(wo)), 0);
+};
+
+// True cuando hay piezas cosidas que ya no estan respaldadas por ninguna
+// asignacion viva: el tablero perdio historial y hay que reconciliar.
+const orphanProducedOf = (wo) => Math.max(producedOf(wo) - assignedOf(wo), 0);
 const toGoalOf = (wo) => Math.max(targetOf(wo) - producedOf(wo), 0);
 
 const pctOf = (part, total) => (total > 0 ? Math.min((part / total) * 100, 100) : 0);
@@ -394,6 +408,15 @@ export default function OrderStatus() {
                       >
                         {remaining > 0 ? `Faltan ${n(remaining)} por asignar` : "Totalmente asignada"}
                       </p>
+                      {orphanProducedOf(o) > 0 && (
+                        <p className="text-[11px] mt-0.5 text-red-600 flex items-start gap-1">
+                          <AlertCircle className="w-3 h-3 mt-0.5 shrink-0" />
+                          <span>
+                            {n(orphanProducedOf(o))} cosidas sin asignación: el
+                            historial de esas celdas se perdió.
+                          </span>
+                        </p>
+                      )}
                     </div>
 
                     {/* Producción (piso) */}

@@ -5,6 +5,7 @@ import { useState } from "react";
 import FinishedWarehouseNav from "../../components/FWH/FinishedWarehouseNav";
 import PrePacking from "../../components/FWH/PrePacking";
 import FinishedWarehouseDashboard from "../../components/FWH/Finishedwarehousedashboard";
+import FinishedWarehouseScan from "../../components/FWH/Finishedwarehousescan";
 // When they exist, drop these in and replace the placeholders below:
 // import FinishedWarehouseDashboard from "./FinishedWarehouseDashboard";
 // import FinishedInventory from "./FinishedInventory";
@@ -17,6 +18,8 @@ export default function FinishedWarehouse() {
       <FinishedWarehouseNav active={tab} onNavigate={setTab} />
 
       {tab === "pre-empaque" && <PrePacking />}
+
+      {tab === "escaneo"    && <FinishedWarehouseScan onNavigate={setTab} />} 
 
       {tab === "dashboard" && (
         <FinishedWarehouseDashboard active ={tab} onNavigate={setTab} />

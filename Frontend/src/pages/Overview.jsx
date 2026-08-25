@@ -10,6 +10,13 @@
 // Data sources:
 //   /api/skyrina/period-summary          -> KPI cards + daily series fallback
 //   /api/skyrina/daily-production        -> daily series (optional single-query route)
+//
+// Efficiency (SAM-based) is NEVER computed in this file. Both routes above return
+// it already calculated by the same SQL that feeds ActualEfficiency.jsx:
+//   efficiency = SUM(packed * sam_minutes) / SUM(operators * working_hours * 60) * 100
+// with the denominator spanning EVERY run in the window, not just runs that have a
+// packing operation. Read avgEfficiency / efficiency straight off the response —
+// re-deriving it here is how the two dashboards start disagreeing.
 //   /api/skyrina/style-performance       -> horizontal Meta vs Producido bars
 //   /api/skyrina/line-performance-detail -> product table
 //   /api/skyrina/available-styles        -> estilo dropdown
@@ -97,7 +104,20 @@ const C = {
   good: '#b7e1cd', goodInk: '#0d652d',
   warn: '#fce8b2', warnInk: '#7c5800',
   bad: '#f4c7c3', badInk: '#a50e0e',
+  eff: '#9334e6', effInk: '#7627bb',
 };
+
+// Efficiency bands — same thresholds ActualEfficiency.jsx paints with, so a line
+// that reads "green" on one dashboard reads green on the other.
+const EFF_BANDS = [
+  { min: 90, color: '#15803d' },
+  { min: 80, color: '#10b981' },
+  { min: 70, color: '#84cc16' },
+  { min: 60, color: '#f97316' },
+  { min: -Infinity, color: '#ef4444' },
+];
+
+const effColor = (v) => EFF_BANDS.find((b) => (Number(v) || 0) >= b.min).color;
 
 const TOP_CHART_H = 292;
 const STYLE_CHART_H = 344;
@@ -119,6 +139,10 @@ const fmtMil = (v) => {
 };
 
 const fmtPct = (v) => `${Math.round(Number(v) || 0)} %`;
+// Efficiency keeps one decimal to match ActualEfficiency.jsx's formatPercent —
+// rounding to whole points here would make the same number look different on the
+// two screens.
+const fmtPct1 = (v) => (v == null || isNaN(v) ? '–' : `${Number(v).toFixed(1)} %`);
 const sentence = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
 /* ------------------------------------------------------------------ *
@@ -169,6 +193,11 @@ const eachDay = (start, end) => {
 };
 
 const pctChange = (current, previous) => (previous ? ((current - previous) / previous) * 100 : null);
+
+// Efficiency is already a percentage, so movement between periods is a difference
+// in percentage points — a "% change of a %" would be meaningless here.
+const ppChange = (current, previous) =>
+  current == null || previous == null ? null : Number(current) - Number(previous);
 
 const fmtShort = (d) => d.toLocaleDateString('es-MX', { day: 'numeric', month: 'short' }).replace(/\./g, '');
 const fmtLong = (d) =>
@@ -312,9 +341,18 @@ function PanelHead({ title, subtitle, children }) {
 /* ------------------------------------------------------------------ *
  * KPI card
  * ------------------------------------------------------------------ */
-function KpiCard({ label, value, change, caption, loading, tall, accent }) {
+function KpiCard({
+  label, value, change, caption, loading, tall, accent,
+  efficiency, efficiencyChange, efficiencyLabel = 'Eficiencia',
+}) {
   const hasValue = value != null && value > 0;
   const isUp = change != null && change >= 0;
+
+  // `undefined` = this card doesn't track efficiency at all; `null` = it does,
+  // but the period had no runs, so we show a dash instead of a misleading 0 %.
+  const showsEff = efficiency !== undefined;
+  const hasEff = efficiency != null;
+  const effUp = efficiencyChange != null && efficiencyChange >= 0;
 
   return (
     <div className={`dp-kpi${tall ? ' dp-kpi-tall' : ''}${accent ? ' dp-kpi-accent' : ''}`}>
@@ -324,6 +362,7 @@ function KpiCard({ label, value, change, caption, loading, tall, accent }) {
         <>
           <div className="dp-kpi-ghost dp-kpi-ghost-lg" />
           <div className="dp-kpi-ghost dp-kpi-ghost-sm" />
+          {showsEff && <div className="dp-kpi-ghost dp-kpi-ghost-md" />}
         </>
       ) : (
         <>
@@ -334,6 +373,34 @@ function KpiCard({ label, value, change, caption, loading, tall, accent }) {
           >
             {change == null ? 'Sin comparación' : `${isUp ? '▲' : '▼'} ${Math.abs(Math.round(change))}%`}
           </div>
+
+          {showsEff && (
+            <div className="dp-kpi-eff">
+              <div className="dp-kpi-eff-top">
+                <span className="dp-kpi-eff-label">{efficiencyLabel}</span>
+                <span
+                  className="dp-kpi-eff-value"
+                  style={{ color: hasEff ? effColor(efficiency) : C.faint }}
+                >
+                  {fmtPct1(efficiency)}
+                </span>
+              </div>
+              <div className="dp-kpi-eff-track" aria-hidden="true">
+                <span
+                  style={{
+                    width: `${Math.min(Math.max(Number(efficiency) || 0, 0), 100)}%`,
+                    background: hasEff ? effColor(efficiency) : 'transparent',
+                  }}
+                />
+              </div>
+              {efficiencyChange != null && (
+                <div className={`dp-kpi-eff-delta${effUp ? ' up' : ' down'}`}>
+                  {`${effUp ? '▲' : '▼'} ${Math.abs(efficiencyChange).toFixed(1)} pp`}
+                </div>
+              )}
+            </div>
+          )}
+
           {caption && <div className="dp-kpi-caption">{caption}</div>}
         </>
       )}
@@ -375,18 +442,24 @@ function DailyTooltip({ active, payload, label }) {
   const row = payload[0]?.payload || {};
   const meta = row.target;
   const prod = row.produced;
+  const eff = row.efficiency;
   const cump = meta ? (prod / meta) * 100 : null;
+  const hasRuns = meta != null || row.runs > 0;
 
   return (
     <div className="dp-tip">
       <div className="dp-tip-head">{fmtDayLabel(label)}</div>
-      {meta == null ? (
+      {!hasRuns ? (
         <div className="dp-tip-note">Sin corridas programadas</div>
       ) : (
         <>
-          <div className="dp-tip-row"><span style={{ color: C.meta }}>Meta</span><span>{fmtInt(meta)}</span></div>
+          <div className="dp-tip-row"><span style={{ color: C.meta }}>Meta</span><span>{meta == null ? '–' : fmtInt(meta)}</span></div>
           <div className="dp-tip-row"><span style={{ color: C.blueInk }}>Producido</span><span>{fmtInt(prod)}</span></div>
-          <div className="dp-tip-row strong"><span>Cumplimiento</span><span>{cump == null ? '–' : fmtPct(cump)}</span></div>
+          <div className="dp-tip-row"><span>Cumplimiento</span><span>{cump == null ? '–' : fmtPct(cump)}</span></div>
+          <div className="dp-tip-row strong">
+            <span style={{ color: C.effInk }}>Eficiencia</span>
+            <span style={{ color: eff == null ? C.faint : effColor(eff) }}>{fmtPct1(eff)}</span>
+          </div>
         </>
       )}
     </div>
@@ -402,8 +475,38 @@ function StyleTooltip({ active, payload }) {
       <div className="dp-tip-head">{row.product}</div>
       <div className="dp-tip-row"><span style={{ color: C.greenInk }}>Meta</span><span>{fmtInt(row.target)}</span></div>
       <div className="dp-tip-row"><span style={{ color: C.blueInk }}>Producido</span><span>{fmtInt(row.produced)}</span></div>
-      <div className="dp-tip-row strong"><span>Cumplimiento</span><span>{cump == null ? '–' : fmtPct(cump)}</span></div>
+      <div className="dp-tip-row"><span>Cumplimiento</span><span>{cump == null ? '–' : fmtPct(cump)}</span></div>
+      <div className="dp-tip-row strong">
+        <span style={{ color: C.effInk }}>Eficiencia</span>
+        <span style={{ color: row.efficiency == null ? C.faint : effColor(row.efficiency) }}>
+          {fmtPct1(row.efficiency)}
+        </span>
+      </div>
     </div>
+  );
+}
+
+// Two-line category tick: style name, then its SAM efficiency in band colour.
+// Efficiency is a rate, not a quantity — putting it on the value axis next to
+// Meta/Producido bars would imply it shares their scale.
+function StyleCategoryTick({ x, y, payload, data }) {
+  const row = data?.[payload?.index] || {};
+  const eff = row.efficiency;
+  return (
+    <g transform={`translate(${x},${y})`}>
+      <text x={-4} y={-1} textAnchor="end" fill={C.axis} fontSize={10}>
+        {row.short ?? payload?.value}
+      </text>
+      <text
+        x={-4}
+        y={10}
+        textAnchor="end"
+        fontSize={9}
+        fill={eff == null ? C.faint : effColor(eff)}
+      >
+        {eff == null ? '' : `Ef. ${Number(eff).toFixed(1)}%`}
+      </text>
+    </g>
   );
 }
 
@@ -488,10 +591,11 @@ export default function Overview() {
 
   /* ---- data ---- */
   const [kpis, setKpis] = useState({
-    lastWeek: null, lastWeekChange: null,
-    thisWeek: null, thisWeekChange: null,
-    thisMonth: null, thisMonthChange: null,
+    lastWeek: null, lastWeekChange: null, lastWeekEff: null, lastWeekEffChange: null,
+    thisWeek: null, thisWeekChange: null, thisWeekEff: null, thisWeekEffChange: null,
+    thisMonth: null, thisMonthChange: null, thisMonthEff: null, thisMonthEffChange: null,
     period: null, periodChange: null, periodTarget: null,
+    periodEff: null, periodEffChange: null,
   });
   const [daily, setDaily] = useState([]);
   const [seriesNote, setSeriesNote] = useState('');
@@ -500,6 +604,7 @@ export default function Overview() {
 
   const [chartOrder, setChartOrder] = useState('date');
   const [hideEmptyDays, setHideEmptyDays] = useState(false);
+  const [showEfficiency, setShowEfficiency] = useState(true);
   const [styleSort, setStyleSort] = useState('target');
   const [sortKey, setSortKey] = useState('compliance');
   const [sortDir, setSortDir] = useState('desc');
@@ -544,25 +649,36 @@ export default function Overview() {
         { headers }
       );
       if (res.data?.success) {
+        const runs = Number(res.data.summary.totalRuns) || 0;
         return {
           produced: Number(res.data.summary.totalSewed) || 0,
           target: Number(res.data.summary.totalTarget) || 0,
+          runs,
+          // Server-calculated SAM efficiency, taken verbatim. Null (not 0) when
+          // the window had no runs so the card shows "–" instead of a fake 0 %.
+          efficiency: runs > 0 ? Number(res.data.summary.avgEfficiency) || 0 : null,
         };
       }
     } catch (e) {
       console.error('period-summary failed', ymd(start), ymd(end), e?.message);
     }
-    return { produced: 0, target: 0 };
+    return { produced: 0, target: 0, runs: 0, efficiency: null };
   }, []);
 
   const dailySeries = useCallback(async (start, end, headers, qs) => {
-    // target null (not 0) on days with no runs, so the Meta line breaks
+    // target/efficiency null (not 0) on days with no runs, so both lines break
     // instead of plunging to zero across weekends and shutdowns.
-    const shape = (d) => ({
-      date: String(d.date).slice(0, 10),
-      produced: Number(d.produced) || 0,
-      target: Number(d.target) > 0 ? Number(d.target) : null,
-    });
+    const shape = (d) => {
+      const runs = Number(d.runs) || 0;
+      return {
+        date: String(d.date).slice(0, 10),
+        runs,
+        produced: Number(d.produced) || 0,
+        target: Number(d.target) > 0 ? Number(d.target) : null,
+        // Server-calculated, never re-derived here — see the note at the top.
+        efficiency: runs > 0 ? Number(d.efficiency) || 0 : null,
+      };
+    };
 
     try {
       const res = await apiGet(
@@ -593,11 +709,13 @@ export default function Overview() {
           .then((r) =>
             shape({
               date: d,
+              runs: r.data?.summary?.totalRuns,
               produced: r.data?.summary?.totalSewed,
               target: r.data?.summary?.totalTarget,
+              efficiency: r.data?.summary?.avgEfficiency,
             })
           )
-          .catch(() => ({ date: d, produced: 0, target: null }))
+          .catch(() => ({ date: d, runs: 0, produced: 0, target: null, efficiency: null }))
       )
     );
     return { rows: out, note: '' };
@@ -685,13 +803,28 @@ export default function Overview() {
         setKpis({
           lastWeek: lastWeek.produced,
           lastWeekChange: pctChange(lastWeek.produced, prevWeek.produced),
+          lastWeekEff: lastWeek.efficiency,
+          lastWeekEffChange: ppChange(lastWeek.efficiency, prevWeek.efficiency),
+
           thisWeek: thisWeek.produced,
           thisWeekChange: thisWeek.produced ? pctChange(thisWeek.produced, lastWeekPartial.produced) : null,
+          thisWeekEff: thisWeek.efficiency,
+          // compared against the same number of days into last week, not the
+          // full week — otherwise Monday always looks catastrophic.
+          thisWeekEffChange: ppChange(thisWeek.efficiency, lastWeekPartial.efficiency),
+
           thisMonth: thisMonth.produced,
           thisMonthChange: pctChange(thisMonth.produced, prevMonth.produced),
+          thisMonthEff: thisMonth.efficiency,
+          thisMonthEffChange: ppChange(thisMonth.efficiency, prevMonth.efficiency),
+
           period: current.produced,
           periodChange: pctChange(current.produced, previous.produced),
           periodTarget: current.target,
+          // This is the "global efficiency" of the selected period — the exact
+          // value ActualEfficiency.jsx shows for the same range and filters.
+          periodEff: current.efficiency,
+          periodEffChange: ppChange(current.efficiency, previous.efficiency),
         });
 
         setDaily(series.rows);
@@ -736,9 +869,12 @@ export default function Overview() {
       target: Number(s.target) || 0,
       produced: Number(s.produced) || 0,
       compliance: Number(s.target) ? (Number(s.produced) / Number(s.target)) * 100 : 0,
+      // Server-calculated SAM efficiency — same field ActualEfficiency.jsx reads.
+      efficiency: Number(s.efficiency) || 0,
     }));
 
     if (styleSort === 'compliance') mapped.sort((a, b) => a.compliance - b.compliance);
+    else if (styleSort === 'efficiency') mapped.sort((a, b) => a.efficiency - b.efficiency);
     else mapped.sort((a, b) => b.target - a.target);
 
     return mapped.slice(0, 12);
@@ -762,6 +898,12 @@ export default function Overview() {
   const totals = useMemo(() => {
     const target = rows.reduce((a, r) => a + (Number(r.target) || 0), 0);
     const produced = rows.reduce((a, r) => a + (Number(r.produced) || 0), 0);
+    // NOTE: there is deliberately no efficiency here. Averaging the per-row
+    // efficiency column would be wrong (a line that ran 2 hours and one that ran
+    // 80 must not get an equal vote), and line-performance-detail doesn't return
+    // the SAM output / available minutes needed to weight them. The correct
+    // period-wide figure is period-summary's avgEfficiency, already in
+    // kpis.periodEff — the footer reuses that rather than inventing a rival number.
     return { target, produced, compliance: target ? (produced / target) * 100 : 0 };
   }, [rows]);
 
@@ -883,13 +1025,37 @@ export default function Overview() {
         <div className="dp-grid">
           {/* ---------- KPI rail ---------- */}
           <aside className="dp-rail">
-            <KpiCard label="Semana pasada" value={kpis.lastWeek} change={kpis.lastWeekChange} loading={loading} />
-            <KpiCard label="Esta semana" value={kpis.thisWeek} change={kpis.thisWeekChange} loading={loading} />
-            <KpiCard label="Este mes" value={kpis.thisMonth} change={kpis.thisMonthChange} loading={loading} />
+            <KpiCard
+              label="Semana pasada"
+              value={kpis.lastWeek}
+              change={kpis.lastWeekChange}
+              efficiency={kpis.lastWeekEff}
+              efficiencyChange={kpis.lastWeekEffChange}
+              loading={loading}
+            />
+            <KpiCard
+              label="Esta semana"
+              value={kpis.thisWeek}
+              change={kpis.thisWeekChange}
+              efficiency={kpis.thisWeekEff}
+              efficiencyChange={kpis.thisWeekEffChange}
+              loading={loading}
+            />
+            <KpiCard
+              label="Este mes"
+              value={kpis.thisMonth}
+              change={kpis.thisMonthChange}
+              efficiency={kpis.thisMonthEff}
+              efficiencyChange={kpis.thisMonthEffChange}
+              loading={loading}
+            />
             <KpiCard
               label={period.label}
               value={kpis.period}
               change={kpis.periodChange}
+              efficiency={kpis.periodEff}
+              efficiencyChange={kpis.periodEffChange}
+              efficiencyLabel="Eficiencia global"
               caption={
                 kpis.periodTarget
                   ? `Meta ${fmtInt(kpis.periodTarget)} · ${fmtPct((kpis.period / kpis.periodTarget) * 100)}`
@@ -918,12 +1084,17 @@ export default function Overview() {
                 <input type="checkbox" checked={hideEmptyDays} onChange={(e) => setHideEmptyDays(e.target.checked)} />
                 Solo días con corridas
               </label>
+              <label className="dp-check">
+                <input type="checkbox" checked={showEfficiency} onChange={(e) => setShowEfficiency(e.target.checked)} />
+                Eficiencia
+              </label>
             </PanelHead>
 
             <Legend
               items={[
                 { label: 'Meta', color: C.meta, type: 'line' },
                 { label: 'Producido', color: C.blue, type: 'square' },
+                ...(showEfficiency ? [{ label: 'Eficiencia', color: C.eff, type: 'line' }] : []),
               ]}
             />
 
@@ -933,7 +1104,12 @@ export default function Overview() {
               empty={seriesNote || (chartData.length ? '' : 'Sin datos en este período.')}
             >
               {(w, h) => (
-                <ComposedChart width={w} height={h} data={chartData} margin={{ top: 16, right: 14, left: 0, bottom: 24 }}>
+                <ComposedChart
+                  width={w}
+                  height={h}
+                  data={chartData}
+                  margin={{ top: 16, right: showEfficiency ? 6 : 14, left: 0, bottom: 24 }}
+                >
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis
                     dataKey="date"
@@ -943,18 +1119,35 @@ export default function Overview() {
                     interval={tickInterval}
                     height={42}
                   />
+                  {/* pieces (left) and % (right) can't share a scale — 1.2k pieces
+                      would flatten an 80 % line onto the axis */}
                   <YAxis
+                    yAxisId="left"
                     tickFormatter={fmtMil}
                     tick={{ fill: C.axis, fontSize: 11 }}
                     tickLine={false}
                     axisLine={false}
                     width={54}
                   />
+                  {showEfficiency && (
+                    <YAxis
+                      yAxisId="right"
+                      orientation="right"
+                      // headroom above 100 % so an over-performing day isn't clipped
+                      domain={[0, (max) => Math.max(100, Math.ceil((Number(max) || 0) / 10) * 10)]}
+                      tickFormatter={(v) => `${Math.round(v)}%`}
+                      tick={{ fill: C.effInk, fontSize: 11 }}
+                      tickLine={false}
+                      axisLine={false}
+                      width={46}
+                    />
+                  )}
                   <Tooltip content={<DailyTooltip />} cursor={{ fill: 'rgba(60,64,67,0.06)' }} />
-                  <Bar dataKey="produced" name="Producido" fill={C.blue} maxBarSize={44} isAnimationActive={false}>
+                  <Bar yAxisId="left" dataKey="produced" name="Producido" fill={C.blue} maxBarSize={44} isAnimationActive={false}>
                     <LabelList dataKey="produced" content={<BarValueLabel />} />
                   </Bar>
                   <Line
+                    yAxisId="left"
                     type="linear"
                     dataKey="target"
                     name="Meta"
@@ -964,6 +1157,19 @@ export default function Overview() {
                     connectNulls={false}
                     isAnimationActive={false}
                   />
+                  {showEfficiency && (
+                    <Line
+                      yAxisId="right"
+                      type="linear"
+                      dataKey="efficiency"
+                      name="Eficiencia"
+                      stroke={C.eff}
+                      strokeWidth={2}
+                      dot={false}
+                      connectNulls={false}
+                      isAnimationActive={false}
+                    />
+                  )}
                 </ComposedChart>
               )}
             </ChartFrame>
@@ -971,6 +1177,14 @@ export default function Overview() {
             {!loading && daily.length > 0 && (
               <p className="dp-foot-note">
                 {activeDays} de {daily.length} días con corridas programadas
+                {kpis.periodEff != null && (
+                  <>
+                    {' · '}Eficiencia global{' '}
+                    <b style={{ color: effColor(kpis.periodEff), fontWeight: 500 }}>
+                      {fmtPct1(kpis.periodEff)}
+                    </b>
+                  </>
+                )}
               </p>
             )}
           </section>
@@ -984,7 +1198,8 @@ export default function Overview() {
                 onChange={setStyleSort}
                 options={[
                   { value: 'target', label: 'Mayor meta' },
-                  { value: 'compliance', label: 'Menor cumplimiento' },
+                  { value: 'compliance', label: 'Menor cumpl.' },
+                  { value: 'efficiency', label: 'Menor efic.' },
                 ]}
               />
             </PanelHead>
@@ -993,6 +1208,7 @@ export default function Overview() {
               items={[
                 { label: 'Meta', color: C.green, type: 'square' },
                 { label: 'Producido', color: C.blue, type: 'square' },
+                { label: 'Ef. = eficiencia SAM', color: C.eff, type: 'line' },
               ]}
             />
 
@@ -1022,10 +1238,10 @@ export default function Overview() {
                   <YAxis
                     type="category"
                     dataKey="short"
-                    tick={{ fill: C.axis, fontSize: 10 }}
+                    tick={<StyleCategoryTick data={styleData} />}
                     tickLine={false}
                     axisLine={false}
-                    width={96}
+                    width={112}
                     interval={0}
                   />
                   <Tooltip content={<StyleTooltip />} cursor={{ fill: 'rgba(60,64,67,0.06)' }} />
@@ -1059,13 +1275,14 @@ export default function Overview() {
                     {th('lineNo', 'Línea')}
                     {th('target', 'Meta', 'right')}
                     {th('produced', 'Prod', 'right')}
+                    {th('efficiency', 'Efic', 'right')}
                     {th('compliance', 'Cump', 'right')}
                   </tr>
                 </thead>
                 <tbody>
-                  {loading && <tr><td colSpan={6} className="dp-empty">Cargando productos…</td></tr>}
+                  {loading && <tr><td colSpan={7} className="dp-empty">Cargando productos…</td></tr>}
                   {!loading && !pageRows.length && (
-                    <tr><td colSpan={6} className="dp-empty">Sin producción registrada en este período.</td></tr>
+                    <tr><td colSpan={7} className="dp-empty">Sin producción registrada en este período.</td></tr>
                   )}
                   {!loading &&
                     pageRows.map((r, i) => {
@@ -1077,6 +1294,9 @@ export default function Overview() {
                           <td>{r.lineNo}</td>
                           <td className="dp-num">{fmtInt(r.target)}</td>
                           <td className="dp-num">{fmtInt(r.produced)}</td>
+                          <td className="dp-num dp-eff-num" style={{ color: effColor(r.efficiency) }}>
+                            {fmtPct1(r.efficiency)}
+                          </td>
                           <td className="dp-cump-cell">
                             <div className={`dp-cump ${complianceClass(r.compliance)}`}>{fmtPct(r.compliance)}</div>
                           </td>
@@ -1091,6 +1311,13 @@ export default function Overview() {
                       <td className="dp-total-label" colSpan={2}>Total del período</td>
                       <td className="dp-num">{fmtInt(totals.target)}</td>
                       <td className="dp-num">{fmtInt(totals.produced)}</td>
+                      <td
+                        className="dp-num dp-eff-num"
+                        style={{ color: kpis.periodEff == null ? C.faint : effColor(kpis.periodEff) }}
+                        title="Eficiencia global del período (ponderada por minutos disponibles)"
+                      >
+                        {fmtPct1(kpis.periodEff)}
+                      </td>
                       <td className="dp-cump-cell">
                         <div className={`dp-cump ${complianceClass(totals.compliance)}`}>{fmtPct(totals.compliance)}</div>
                       </td>
@@ -1199,6 +1426,24 @@ const css = `
 .dp-kpi-ghost{background:${C.grid};border-radius:4px}
 .dp-kpi-ghost-lg{height:30px;width:70%}
 .dp-kpi-ghost-sm{height:11px;width:35%;margin-top:8px}
+.dp-kpi-ghost-md{height:13px;width:55%;margin-top:12px}
+
+.dp-kpi-eff{margin-top:9px;padding-top:8px;border-top:1px solid ${C.grid}}
+.dp-kpi-eff-top{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.dp-kpi-eff-label{font-size:11.5px;color:${C.muted};overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.dp-kpi-eff-value{font-size:15px;font-weight:500;font-variant-numeric:tabular-nums;
+  letter-spacing:-.2px;white-space:nowrap}
+.dp-kpi-tall .dp-kpi-eff-value{font-size:17px}
+.dp-kpi-eff-track{margin-top:6px;height:4px;border-radius:2px;background:${C.grid};
+  overflow:hidden}
+.dp-kpi-eff-track span{display:block;height:100%;border-radius:2px;
+  transition:width .35s ease}
+.dp-kpi-eff-delta{margin-top:5px;font-size:11px;color:${C.faint}}
+.dp-kpi-eff-delta.up{color:${C.up}}
+.dp-kpi-eff-delta.down{color:${C.down}}
+
+.dp-eff-num{font-weight:500;font-variant-numeric:tabular-nums}
 
 .dp-legend{display:flex;gap:18px;align-items:center;padding:8px 0 2px 14px;
   font-size:12.5px;color:${C.ink}}

@@ -46,6 +46,14 @@ const STATUS = {
   cancelled: { label: "Cancelada", pill: "bg-gray-100 text-gray-500" },
 };
 
+// Prioridad del corte que fija el planner. rank ordena de más a menos urgente.
+const PRIORITY = {
+  urgent:       { label: "Urgente",   pill: "bg-red-100 text-red-700",       dot: "bg-red-500",    ring: "focus:ring-red-500/30 border-red-300",    rank: 0 },
+  intermediate: { label: "Intermedia", pill: "bg-yellow-100 text-yellow-700", dot: "bg-yellow-500", ring: "focus:ring-yellow-500/30 border-yellow-300", rank: 1 },
+  normal:       { label: "Normal",    pill: "bg-green-100 text-green-700",   dot: "bg-green-500",  ring: "focus:ring-green-500/30 border-green-300", rank: 2 },
+};
+const priorityMeta = (p) => PRIORITY[p] || PRIORITY.normal;
+
 const todayStr = () => format(new Date(), "yyyy-MM-dd");
 
 // Group a work order's lines by color → [{ color, qty, sizes, estilo }].
@@ -81,24 +89,47 @@ const colorGroups = (wo) => {
   return [];
 };
 
-// Distinct fabric {name, code} pairs for a PO. The PO header fabric (captured
-// in the wizard) is primary; per-line fabrics and the fabrics[] array are added
-// too. Any missing code is resolved from the fabrics catalog by name.
+// Distinct fabric {name, code} pairs for a PO. Sources, in order:
+//   1) the PO header tela (representative scalar from the wizard),
+//   2) EACH tela of every line — a line may carry several (l.fabrics =
+//      [{name, code, yield}, ...]); this is what surfaces a 2nd código that
+//      shares a name with the 1st (e.g. two "Monique" with different codes),
+//   3) name-only entries from wo.fabrics, added only for names not already
+//      seen with a real code, resolving the code from the fabrics catalog.
+// NOTE: the /api/work-orders lines[] use camelCase keys (fabricName/
+// fabricCode/fabrics); the WO header uses snake_case (fabric_name/fabric_code).
 const fabricPairs = (wo, codeByName) => {
   if (!wo) return [];
   const codeFor = (name) =>
     name && codeByName ? codeByName.get(String(name).trim().toLowerCase()) || "" : "";
+  const toNum = (v) => (v === undefined || v === null || v === "" || isNaN(parseFloat(v)) ? null : parseFloat(v));
   const map = new Map();
-  const add = (name, code) => {
-    const nm = name || "";
-    const cd = code || codeFor(nm) || "";
+  const add = (name, code, yld) => {
+    const nm = (name ?? "").toString().trim();
+    const cd = ((code ?? "").toString().trim()) || codeFor(nm) || "";
     if (!nm && !cd) return;
     const k = `${nm}||${cd}`;
-    if (!map.has(k)) map.set(k, { name: nm, code: cd });
+    const y = toNum(yld);
+    if (!map.has(k)) map.set(k, { name: nm, code: cd, yield: y });
+    else if (map.get(k).yield == null && y != null) map.get(k).yield = y;
   };
-  add(wo.fabric_name || wo.fabric_supplier, wo.fabric_code);
-  (Array.isArray(wo.lines) ? wo.lines : []).forEach((l) => add(l?.fabric_name || l?.fabric, l?.fabric_code));
-  (Array.isArray(wo.fabrics) ? wo.fabrics : []).forEach((n) => add(n, ""));
+  // 1) header tela
+  add(wo.fabric_name || wo.fabric_supplier, wo.fabric_code, wo.yield_per_piece);
+  // 2) every tela of every line
+  (Array.isArray(wo.lines) ? wo.lines : []).forEach((l) => {
+    if (Array.isArray(l?.fabrics) && l.fabrics.length) {
+      l.fabrics.forEach((f) => add(f?.name, f?.code, f?.yield ?? f?.yieldPerPiece));
+    } else {
+      add(l?.fabricName || l?.fabric_name || l?.fabric, l?.fabricCode || l?.fabric_code, l?.yield ?? l?.yieldPerPiece);
+    }
+  });
+  // 3) name-only fallback, skipping names already present above
+  const haveName = new Set([...map.values()].map((o) => o.name.toLowerCase()).filter(Boolean));
+  (Array.isArray(wo.fabrics) ? wo.fabrics : []).forEach((n) => {
+    const nm = (n ?? "").toString().trim();
+    if (!nm || haveName.has(nm.toLowerCase())) return;
+    add(nm, "", null);
+  });
   return [...map.values()];
 };
 
@@ -120,9 +151,13 @@ export default function CutOrders() {
     color: "",
     fabric: "",
     fabricCode: "",
+    // Todas las telas del corte (misma cantidad para cada una).
+    // [{ name, code, yield, include }]
+    fabrics: [],
     cutDate: todayStr(),
     quantity: "",
     yield: "",
+    priority: "normal",
     notes: "",
   });
 
@@ -195,6 +230,41 @@ export default function CutOrders() {
   }, [form.yield, form.quantity]);
 
   const fabricOptions = useMemo(() => fabricPairs(selectedWO, fabricCodeByName), [selectedWO, fabricCodeByName]);
+  // ¿La orden trae más de una tela? Entonces el corte lleva TODAS (misma
+  // cantidad de piezas para cada una); no se elige una sola.
+  const isMultiFabric = fabricOptions.length > 1;
+  const includedFabrics = useMemo(
+    () => (form.fabrics || []).filter((f) => f.include),
+    [form.fabrics]
+  );
+  // Largo total = suma de (rendimiento × cantidad) de cada tela incluida.
+  const multiTotalLength = useMemo(() => {
+    const q = num(form.quantity);
+    if (q <= 0) return 0;
+    return includedFabrics.reduce((s, f) => s + num(f.yield) * q, 0);
+  }, [includedFabrics, form.quantity]);
+
+  // Construye la lista editable de telas a partir de las opciones de la orden.
+  const buildFormFabrics = (fp) =>
+    fp.map((f) => ({
+      name: f.name,
+      code: f.code,
+      yield: f.yield != null ? String(f.yield) : "",
+      include: true,
+    }));
+
+  const toggleFabric = (idx) =>
+    setForm((f) => ({
+      ...f,
+      fabrics: f.fabrics.map((x, i) => (i === idx ? { ...x, include: !x.include } : x)),
+    }));
+  const setFabricYield = (idx, val) =>
+    setForm((f) => ({
+      ...f,
+      fabrics: f.fabrics.map((x, i) =>
+        i === idx ? { ...x, yield: val.replace(/[^0-9.]/g, "") } : x
+      ),
+    }));
 
   // Alert the planner to any cut orders with leftover (restante) or over-cut (exceeds).
   const cutAlerts = useMemo(() => {
@@ -217,14 +287,25 @@ export default function CutOrders() {
   const handlePickWO = (id) => {
     const wo = workOrders.find((w) => String(w.id) === String(id));
     const fp = fabricPairs(wo, fabricCodeByName);
+    const rep = fp[0] || null;
     setForm((f) => ({
       ...f,
       workOrderId: id,
       color: "",
       quantity: "",
-      fabric: fp[0]?.name || "",
-      fabricCode: fp[0]?.code || "",
-      yield: wo?.yield_per_piece != null && wo.yield_per_piece !== "" ? String(wo.yield_per_piece) : "",
+      fabric: rep?.name || "",
+      fabricCode: rep?.code || "",
+      fabrics: buildFormFabrics(fp),
+      // Con una sola tela usamos el rendimiento compartido; con varias, cada
+      // tela lleva el suyo en la lista.
+      yield:
+        fp.length === 1
+          ? rep?.yield != null
+            ? String(rep.yield)
+            : wo?.yield_per_piece != null && wo.yield_per_piece !== ""
+            ? String(wo.yield_per_piece)
+            : ""
+          : "",
     }));
     setMessage("");
     setError("");
@@ -240,15 +321,24 @@ export default function CutOrders() {
     const wo = workOrders.find((w) => String(w.id) === String(woId));
     if (!wo) return;
     const fp = fabricPairs(wo, fabricCodeByName);
+    const rep = fp[0] || null;
     const g = colorGroups(wo).find((c) => String(c.color) === String(color));
     setForm((f) => ({
       ...f,
       workOrderId: String(woId),
       color: color || "",
       quantity: g ? String(Math.round(g.qty)) : String(Math.round(totalOf(wo))),
-      fabric: fp[0]?.name || "",
-      fabricCode: fp[0]?.code || "",
-      yield: wo?.yield_per_piece != null && wo.yield_per_piece !== "" ? String(wo.yield_per_piece) : "",
+      fabric: rep?.name || "",
+      fabricCode: rep?.code || "",
+      fabrics: buildFormFabrics(fp),
+      yield:
+        fp.length === 1
+          ? rep?.yield != null
+            ? String(rep.yield)
+            : wo?.yield_per_piece != null && wo.yield_per_piece !== ""
+            ? String(wo.yield_per_piece)
+            : ""
+          : "",
     }));
     setMessage("");
     setError("");
@@ -260,7 +350,25 @@ export default function CutOrders() {
     if (colorOpts.length > 0 && !form.color) return setError("Elija el color");
     if (!form.cutDate) return setError("Elija la fecha de corte");
     if (!form.quantity || num(form.quantity) <= 0) return setError("La cantidad debe ser mayor a 0");
-    if (!form.yield || num(form.yield) <= 0) return setError("Ingrese el rendimiento (mayor a 0)");
+
+    if (isMultiFabric) {
+      // Varias telas: la CORTE las lleva todas (misma cantidad). Debe quedar al
+      // menos una incluida y cada una con su rendimiento.
+      if (includedFabrics.length === 0) return setError("Incluya al menos una tela");
+      if (includedFabrics.some((f) => !(num(f.yield) > 0)))
+        return setError("Cada tela incluida necesita su rendimiento (mayor a 0)");
+    } else {
+      if (!form.yield || num(form.yield) <= 0) return setError("Ingrese el rendimiento (mayor a 0)");
+    }
+
+    // Telas a enviar. En modo multi, las incluidas con su propio rendimiento;
+    // en modo simple, la tela elegida con el rendimiento compartido.
+    const fabricsPayload = isMultiFabric
+      ? includedFabrics.map((f) => ({ name: f.name || null, code: f.code || null, yield: num(f.yield) || null }))
+      : form.fabric || form.fabricCode
+      ? [{ name: form.fabric || null, code: form.fabricCode || null, yield: num(form.yield) || null }]
+      : [];
+    const repFabric = fabricsPayload[0] || {};
 
     setSaving(true);
     setError("");
@@ -275,18 +383,20 @@ export default function CutOrders() {
           sizes: selectedColorGroup ? selectedColorGroup.sizes : [],
           styleNo: selectedColorGroup?.estilo || selectedWO?.style_code || null,
           season: selectedWO?.season || null,
-          fabric: form.fabric || null,
-          fabricCode: form.fabricCode || null,
+          fabric: repFabric.name || form.fabric || null,
+          fabricCode: repFabric.code || form.fabricCode || null,
+          fabrics: fabricsPayload,
           cutDate: form.cutDate,
           quantity: Number(form.quantity),
-          yieldPerPiece: Number(form.yield),
+          yieldPerPiece: isMultiFabric ? (repFabric.yield ?? null) : Number(form.yield),
+          priority: form.priority || "normal",
           notes: form.notes || null,
         }),
       });
       const data = await res.json();
       if (data.success) {
         setMessage("✅ Orden de corte creada");
-        setForm({ workOrderId: "", color: "", fabric: "", fabricCode: "", cutDate: todayStr(), quantity: "", yield: "", notes: "" });
+        setForm({ workOrderId: "", color: "", fabric: "", fabricCode: "", fabrics: [], cutDate: todayStr(), quantity: "", yield: "", priority: "normal", notes: "" });
         await fetchCutOrders();
       } else {
         setError(data.error || "No se pudo crear la orden de corte");
@@ -309,6 +419,20 @@ export default function CutOrders() {
       if (data.success) fetchCutOrders();
     } catch (err) {
       console.error("Error updating status:", err);
+    }
+  };
+
+  const changePriority = async (id, priority) => {
+    try {
+      const res = await fetch(`${API_URL}/api/cut-orders/${id}/priority`, {
+        method: "PATCH",
+        headers: authHeaders(),
+        body: JSON.stringify({ priority }),
+      });
+      const data = await res.json();
+      if (data.success) fetchCutOrders();
+    } catch (err) {
+      console.error("Error updating priority:", err);
     }
   };
 
@@ -391,8 +515,9 @@ export default function CutOrders() {
               )}
             </div>
 
-            {/* PO fabric details (from the work order) */}
-            {selectedWO && (
+            {/* PO fabric details (from the work order) — single tela only;
+                con varias telas se muestran en la lista de abajo. */}
+            {selectedWO && !isMultiFabric && (
               <div className="sm:col-span-2 grid grid-cols-3 gap-2">
                 <div className="rounded-xl border bg-gray-50 border-gray-100 p-3">
                   <div className="text-[11px] text-gray-500 uppercase tracking-wide mb-1">Código de tela</div>
@@ -458,22 +583,47 @@ export default function CutOrders() {
             </div>
 
             {/* Fabric */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Tela</label>
-              {fabricOptions.length > 0 ? (
-                <select
-                  value={fabricKey(form.fabric, form.fabricCode)}
-                  onChange={(e) => {
-                    const opt = fabricOptions.find((o) => fabricKey(o.name, o.code) === e.target.value);
-                    setForm((f) => ({ ...f, fabric: opt?.name || "", fabricCode: opt?.code || "" }));
-                  }}
-                  className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-gray-900/10"
-                >
-                  <option value="||">— Elegir tela —</option>
-                  {fabricOptions.map((o) => (
-                    <option key={fabricKey(o.name, o.code)} value={fabricKey(o.name, o.code)}>{fabricLabel(o)}</option>
+            <div className="sm:col-span-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                {isMultiFabric ? "Telas del corte" : "Tela"}
+              </label>
+
+              {isMultiFabric ? (
+                <div className="rounded-xl border border-gray-200 divide-y">
+                  <div className="px-3 py-1.5 text-[11px] text-gray-500 bg-gray-50 rounded-t-xl">
+                    Esta orden tiene {fabricOptions.length} telas · se cortan todas en la misma cantidad
+                  </div>
+                  {form.fabrics.map((f, idx) => (
+                    <div key={`${f.name}||${f.code}||${idx}`} className={`flex items-center gap-2 px-3 py-2 ${f.include ? "" : "opacity-50"}`}>
+                      <input
+                        type="checkbox"
+                        checked={f.include}
+                        onChange={() => toggleFabric(idx)}
+                        className="h-4 w-4 rounded border-gray-300"
+                        title="Incluir esta tela en el corte"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-semibold text-gray-900 truncate">{f.code || "(sin código)"}</div>
+                        <div className="text-xs text-gray-500 truncate">{f.name || "—"}</div>
+                      </div>
+                      <label className="flex items-center gap-1">
+                        <input
+                          type="number" step="0.0001" min="0"
+                          value={f.yield}
+                          onChange={(e) => setFabricYield(idx, e.target.value)}
+                          disabled={!f.include}
+                          placeholder="m/pza"
+                          className="w-24 rounded-lg border border-gray-200 px-2 py-1.5 text-sm text-right outline-none focus:ring-2 focus:ring-gray-900/10 disabled:bg-gray-50"
+                        />
+                        <span className="text-[11px] text-gray-400">m/pza</span>
+                      </label>
+                    </div>
                   ))}
-                </select>
+                </div>
+              ) : fabricOptions.length === 1 ? (
+                <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-semibold text-gray-900">
+                  {fabricLabel(fabricOptions[0])}
+                </div>
               ) : (
                 <div className="grid grid-cols-3 gap-2">
                   <input
@@ -492,9 +642,6 @@ export default function CutOrders() {
                   />
                 </div>
               )}
-              {form.fabricCode && (
-                <p className="text-xs text-gray-400 mt-1">Código: <span className="font-mono">{form.fabricCode}</span></p>
-              )}
             </div>
 
             {/* Cut date */}
@@ -508,7 +655,33 @@ export default function CutOrders() {
               />
             </div>
 
-            {/* Yield per piece */}
+            {/* Priority */}
+            <div className="sm:col-span-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1">Prioridad</label>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { key: "urgent",       label: "Urgente",    on: "bg-red-500 text-white border-red-500 ring-2 ring-red-500/30",       off: "bg-white text-red-700 border-red-200 hover:bg-red-50" },
+                  { key: "intermediate", label: "Intermedia", on: "bg-yellow-400 text-yellow-950 border-yellow-400 ring-2 ring-yellow-500/30", off: "bg-white text-yellow-700 border-yellow-200 hover:bg-yellow-50" },
+                  { key: "normal",       label: "Normal",     on: "bg-green-500 text-white border-green-500 ring-2 ring-green-500/30", off: "bg-white text-green-700 border-green-200 hover:bg-green-50" },
+                ].map((opt) => {
+                  const active = form.priority === opt.key;
+                  return (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      onClick={() => setForm((f) => ({ ...f, priority: opt.key }))}
+                      className={`flex items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-sm font-medium transition ${active ? opt.on : opt.off}`}
+                    >
+                      <span className={`w-2 h-2 rounded-full ${PRIORITY[opt.key].dot} ${active ? "ring-2 ring-white/70" : ""}`} />
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Yield per piece — sólo una tela; con varias, cada tela trae el suyo */}
+            {!isMultiFabric && (
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Rendimiento (por pieza)</label>
               <input
@@ -520,17 +693,23 @@ export default function CutOrders() {
               />
               <p className="text-xs text-gray-400 mt-1">Tela por pieza (m/pza)</p>
             </div>
+            )}
 
             {/* Total fabric length */}
-            <div>
+            <div className={isMultiFabric ? "sm:col-span-2" : ""}>
               <label className="block text-sm font-medium text-gray-700 mb-1">Tela total</label>
               <input
                 type="text"
-                value={totalLength > 0 ? `${totalLength.toLocaleString(undefined, { maximumFractionDigits: 2 })} m` : "—"}
+                value={(() => {
+                  const tl = isMultiFabric ? multiTotalLength : totalLength;
+                  return tl > 0 ? `${tl.toLocaleString(undefined, { maximumFractionDigits: 2 })} m` : "—";
+                })()}
                 readOnly
                 className="w-full rounded-xl border border-gray-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-900 outline-none"
               />
-              <p className="text-xs text-gray-400 mt-1">Rendimiento × cantidad</p>
+              <p className="text-xs text-gray-400 mt-1">
+                {isMultiFabric ? "Suma de (rendimiento × cantidad) de todas las telas" : "Rendimiento × cantidad"}
+              </p>
             </div>
 
             {/* Notes */}
@@ -612,6 +791,10 @@ export default function CutOrders() {
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-mono text-sm font-bold text-gray-900">{cutNo(co)}</span>
                         {co.color && <span className="text-[11px] rounded-full bg-gray-100 text-gray-700 px-2 py-0.5">{co.color}</span>}
+                        <span className={`text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1 ${priorityMeta(co.priority).pill}`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${priorityMeta(co.priority).dot}`} />
+                          {priorityMeta(co.priority).label}
+                        </span>
                         <span className={`text-[11px] rounded-full px-2 py-0.5 ${meta.pill}`}>{meta.label}</span>
                         {bal.exceeds > 0 && (
                           <span className="text-[11px] font-medium rounded-full bg-red-100 text-red-700 px-2 py-0.5">
@@ -627,7 +810,16 @@ export default function CutOrders() {
                       <p className="text-xs text-gray-500 truncate">
                         {co.work_order_no} · {co.customer_name}
                         {co.customer_po ? ` · PO cliente ${co.customer_po}` : ""}
-                        {co.fabric || co.fabric_code ? ` · ${[co.fabric_code, co.fabric].filter(Boolean).join(" ")}` : ""}
+                        {(() => {
+                          const fabs = Array.isArray(co.fabrics) && co.fabrics.length
+                            ? co.fabrics
+                            : (co.fabric || co.fabric_code ? [{ name: co.fabric, code: co.fabric_code }] : []);
+                          if (!fabs.length) return "";
+                          const txt = fabs
+                            .map((f) => [f.code, f.name].filter(Boolean).join(" "))
+                            .join(" + ");
+                          return ` · ${txt}`;
+                        })()}
                         {co.style_no ? ` · Estilo ${co.style_no}` : ""}{co.season ? ` · ${co.season}` : ""}
                       </p>
                       <div className="mt-1 flex items-center gap-3 text-[11px] text-gray-500 flex-wrap">
@@ -636,9 +828,19 @@ export default function CutOrders() {
                           {co.cut_date ? format(new Date(`${co.cut_date}T00:00:00`), "dd/MM/yyyy") : "—"}
                         </span>
                         <span>{Math.round(num(co.quantity)).toLocaleString()} pzas</span>
-                        {co.yield_per_piece != null && (
-                          <span>Rend: {Number(co.yield_per_piece).toLocaleString(undefined, { maximumFractionDigits: 4 })} m/pza</span>
-                        )}
+                        {(() => {
+                          const fabs = Array.isArray(co.fabrics) ? co.fabrics.filter((f) => f?.yield != null) : [];
+                          if (fabs.length > 1) {
+                            return (
+                              <span>
+                                Rend: {fabs.map((f) => Number(f.yield).toLocaleString(undefined, { maximumFractionDigits: 4 })).join(" / ")} m/pza
+                              </span>
+                            );
+                          }
+                          return co.yield_per_piece != null ? (
+                            <span>Rend: {Number(co.yield_per_piece).toLocaleString(undefined, { maximumFractionDigits: 4 })} m/pza</span>
+                          ) : null;
+                        })()}
                         {co.total_length != null && (
                           <span className="font-medium text-blue-700">Tela: {Number(co.total_length).toLocaleString(undefined, { maximumFractionDigits: 2 })} m</span>
                         )}
@@ -654,6 +856,17 @@ export default function CutOrders() {
                         </div>
                       )}
                     </div>
+
+                    <select
+                      value={co.priority || "normal"}
+                      onChange={(e) => changePriority(co.id, e.target.value)}
+                      title="Prioridad"
+                      className={`text-xs rounded-lg border px-2 py-1 outline-none font-medium ${priorityMeta(co.priority).ring}`}
+                    >
+                      <option value="urgent">Urgente</option>
+                      <option value="intermediate">Intermedia</option>
+                      <option value="normal">Normal</option>
+                    </select>
 
                     <select
                       value={co.status}

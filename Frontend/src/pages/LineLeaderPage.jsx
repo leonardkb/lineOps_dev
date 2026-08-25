@@ -10,6 +10,38 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Base32 (RFC 4648, sin relleno). El contenido del QR se codifica así para que
+// use SOLO letras A-Z y dígitos 2-7 — caracteres idénticos en cualquier
+// distribución de teclado. De ese modo un lector configurado en otro idioma no
+// puede convertir signos (" : { }) en basura al "teclear" el código.
+const _B32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function base32Encode(str) {
+  const bytes = new TextEncoder().encode(String(str));
+  let bits = 0, value = 0, out = "";
+  for (const b of bytes) {
+    value = (value << 8) | b;
+    bits += 8;
+    while (bits >= 5) { out += _B32_ALPHABET[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += _B32_ALPHABET[(value << (5 - bits)) & 31];
+  return out;
+}
+
+// Magnificación del QR en la etiqueta ZPL (dots por módulo en la ZD421). Más
+// pequeño = QR más chico. 3 ≈ 0.55" @203dpi. Súbelo a 4 si tu lector falla.
+const ZPL_QR_MAG = 3;
+
+// Contenido del QR (para pantalla y ZPL). Formato POSICIONAL compacto separado
+// por "|", luego Base32 con prefijo "FGW2". Compacto = la mitad de módulos que el
+// JSON (QR mucho más chico, ideal para etiquetas ZD421). Base32 usa solo A-Z/2-7,
+// a prueba de distribución de teclado. Orden FIJO (no reordenar sin cambiar el
+// backend): tn, wo, talla, color, po, qty, date, runId, seq.
+function ticketQrPayload(o) {
+  const f = (v) => String(v ?? "").replace(/\|/g, " ").trim();
+  const parts = [f(o.tn), f(o.wo), f(o.talla), f(o.color), f(o.po), f(o.qty), f(o.date), f(o.runId), f(o.seq)];
+  return "FGW2" + base32Encode(parts.join("|"));
+}
+
 // ---- Ticket helpers -------------------------------------------------------
 // Talla code -> human label. Seeded from the work-order size list; a `label`
 // coming from the backend always wins over this map, and unknown codes just
@@ -344,6 +376,11 @@ export default function LineLeaderPage() {
   // user edits; `tickets` holds the generated printable tickets (one per bundle).
   const [ticketBuilder, setTicketBuilder] = useState(null);
   const [tickets, setTickets] = useState(null);
+  // Confirming = persisting the printed tickets to the DB so the assigned
+  // quantity per size gets decreased next time this work order is opened.
+  const [confirmingTickets, setConfirmingTickets] = useState(false);
+  const [ticketsConfirmed, setTicketsConfirmed] = useState(false);
+  const [ticketConfirmMsg, setTicketConfirmMsg] = useState("");
 
   // Multi-style state
   const [styles, setStyles] = useState([]);
@@ -1019,7 +1056,11 @@ export default function LineLeaderPage() {
 
   function downloadTicketZPL(t) {
     const tallaTxt = t.label ? `${t.talla} ${t.label}` : t.talla;
-    const qrData = `WO:${t.workOrderNo}|RUN:${t.runId}|T:${t.talla}|CLR:${t.color || "-"}|PO:${t.customerPo || "-"}|Q:${t.qty}|S:${t.seq}/${t.total}`;
+    // Mismo QR Base32 que el ticket en pantalla (a prueba de distribución de teclado).
+    const qrData = ticketQrPayload({
+      tn: t.ticketNo, wo: t.workOrderNo, talla: t.talla, color: t.color,
+      po: t.customerPo, qty: t.qty, runId: t.runId, seq: t.seq, date: t.date,
+    });
 
     const zpl = `
 ^XA
@@ -1028,23 +1069,24 @@ export default function LineLeaderPage() {
 ^CI28
 ^MD25
 
-^FO30,26^A0N,44,44^FD${t.workOrderNo}^FS
-^FO30,78^GB760,3,3^FS
+^FO30,20^A0N,40,40^FD${t.workOrderNo}^FS
+^FO30,64^A0N,24,24^FD${t.ticketNo || ""}^FS
+^FO30,96^GB760,3,3^FS
 
-^FO30,96^A0N,30,30^FDEstilo: ${t.style}^FS
-^FO30,134^A0N,30,30^FDLinea: ${t.line}^FS
-^FO30,172^A0N,30,30^FDFecha: ${t.date}^FS
-^FO30,210^A0N,30,30^FDTalla: ${tallaTxt}^FS
-^FO30,248^A0N,30,30^FDColor: ${t.color || "-"}^FS
-^FO30,286^A0N,30,30^FDPO Cliente: ${t.customerPo || "-"}^FS
+^FO30,112^A0N,30,30^FDEstilo: ${t.style}^FS
+^FO30,150^A0N,30,30^FDLinea: ${t.line}^FS
+^FO30,188^A0N,30,30^FDFecha: ${t.date}^FS
+^FO30,226^A0N,30,30^FDTalla: ${tallaTxt}^FS
+^FO30,264^A0N,30,30^FDColor: ${t.color || "-"}^FS
+^FO30,302^A0N,30,30^FDPO Cliente: ${t.customerPo || "-"}^FS
 
-^FO30,338^A0N,26,26^FDCANTIDAD^FS
-^FO30,372^A0N,60,60^FD${t.qty}^FS
-^FO30,440^A0N,22,22^FDpiezas^FS
+^FO30,352^A0N,26,26^FDCANTIDAD^FS
+^FO30,386^A0N,60,60^FD${t.qty}^FS
+^FO30,454^A0N,22,22^FDpiezas^FS
 
-^FO540,96^BQN,2,6
-^FDQA,${qrData}^FS
-^FO540,330^A0N,20,20^FDTicket ${t.seq}/${t.total} · Corrida #${t.runId}^FS
+^FO540,112^BQN,2,${ZPL_QR_MAG}
+^FDMA,${qrData}^FS
+^FO540,346^A0N,20,20^FDTicket ${t.seq}/${t.total} · Corrida #${t.runId}^FS
 
 ^XZ
 `.trim();
@@ -1071,13 +1113,16 @@ export default function LineLeaderPage() {
     if (sizes.length) {
       rows = [...sizes].sort(compareSizes).map((s) => {
         const q = Math.max(0, Math.round(safeNum(s.quantity)));
+        // Total asignado por el merchant para esa talla (original, no el restante).
+        const assigned = Math.max(0, Math.round(safeNum(s.assignedQuantity ?? s.quantity)));
         const qtys = autoSplit(q, DEFAULT_BUNDLE);
         return {
           talla: s.talla || "—",
           label: labelForTalla(s.talla, s.label),   // resolved size label
           color: s.color || "",
           customerPo: s.customerPo || s.customer_po || "",
-          merchantQty: q,
+          assigned,                  // total del merchant (para el encabezado)
+          merchantQty: q,            // restante (tope de lo que se puede imprimir ahora)
           bundle: DEFAULT_BUNDLE,
           qtys,
           open: false,               // talla must be selected (opened) first
@@ -1088,7 +1133,7 @@ export default function LineLeaderPage() {
       // No merchant size breakdown for this work order: fall back to a single
       // editable row seeded with what the line has actually produced.
       const q = Math.max(0, Math.round(safeNum(finishedGarmentsTotal)));
-      rows = [{ talla: "—", label: "", color: "", customerPo: "", merchantQty: q, bundle: DEFAULT_BUNDLE, qtys: [q], open: true, sel: [true] }];
+      rows = [{ talla: "—", label: "", color: "", customerPo: "", assigned: q, merchantQty: q, bundle: DEFAULT_BUNDLE, qtys: [q], open: true, sel: [true] }];
     }
 
     setTickets(null);
@@ -1225,20 +1270,23 @@ export default function LineLeaderPage() {
       runId: currentStyle.run.id,
     };
 
+    // Sello de lote: distingue tickets de dos impresiones de la misma corrida, así
+    // el número de ticket es único aunque se regeneren. El almacén deduplica por él.
+    const batch = Date.now().toString(36).toUpperCase().slice(-4);
+
     const built = [];
     for (let i = 0; i < flat.length; i++) {
       const { talla, label, color, customerPo, qty } = flat[i];
-      const qrPayload = JSON.stringify({
-        wo: base.workOrderNo,
-        style: base.style,
-        talla,
-        label,
-        color,
-        po: customerPo,
-        qty,
-        runId: base.runId,
-        seq: i + 1,
-        date: base.date,
+      const seq = i + 1;
+      // Número de ticket: T-<corrida>-<lote>-<consecutivo>. Va impreso y dentro del QR.
+      const ticketNo = `T-${base.runId}-${batch}-${seq}`;
+      // El QR se codifica en Base32 (solo A-Z y 2-7) con el prefijo "FGW1". Así el
+      // contenido no lleva signos como { } " : que un lector con distribución de
+      // teclado distinta convertiría en basura (p. ej. " -> [ , : -> Ñ). El
+      // almacén reconoce el prefijo, decodifica y recupera el JSON exacto.
+      const qrPayload = ticketQrPayload({
+        tn: ticketNo, wo: base.workOrderNo, talla, color, po: customerPo,
+        qty, runId: base.runId, seq, date: base.date,
       });
       let qrDataUrl = "";
       try {
@@ -1246,11 +1294,123 @@ export default function LineLeaderPage() {
       } catch (e) {
         console.error("Error generando QR:", e);
       }
-      built.push({ ...base, talla, label, color, customerPo, qty, seq: i + 1, total: flat.length, qrDataUrl });
+      built.push({ ...base, ticketNo, talla, label, color, customerPo, qty, seq, total: flat.length, qrDataUrl });
     }
 
     setTicketBuilder(null);
+    setTicketsConfirmed(false);
+    setTicketConfirmMsg("");
     setTickets(built);
+  }
+
+  // Persist the generated tickets so the assigned quantity per size gets
+  // decreased on the next load of this work order. Aggregates the current
+  // `tickets` by talla+color+PO, saves them, then updates the in-memory size
+  // breakdown so reopening the builder immediately shows the reduced amounts.
+  async function confirmTickets() {
+    if (!tickets || !tickets.length) return;
+    if (!currentStyle?.run?.id) return;
+    const token = getToken();
+    if (!token) {
+      setTicketConfirmMsg("No estás autenticado. Inicia sesión de nuevo.");
+      return;
+    }
+
+    // Aggregate by talla+color+PO for the payload.
+    const agg = new Map();
+    for (const t of tickets) {
+      const talla = String(t.talla ?? "").trim();
+      if (!talla) continue;
+      const color = String(t.color ?? "").trim();
+      const customerPo = String(t.customerPo ?? "").trim();
+      const qty = Math.max(0, Math.floor(safeNum(t.qty)));
+      if (qty <= 0) continue;
+      const key = `${talla}||${color}||${customerPo}`;
+      const cur = agg.get(key) || { talla, color, customerPo, qty: 0, count: 0 };
+      cur.qty += qty;
+      cur.count += 1;
+      agg.set(key, cur);
+    }
+    const payload = [...agg.values()];
+    if (!payload.length) return;
+
+    setConfirmingTickets(true);
+    setTicketConfirmMsg("");
+    try {
+      const runId = currentStyle.run.id;
+      const json = await fetchJson(
+        `http://localhost:5000/api/lineleader/confirm-tickets/${runId}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ tickets: payload }),
+        }
+      );
+
+      if (!json.success) {
+        // Overflow (exceeds assigned) or other validation error.
+        setTicketConfirmMsg(json.error || "No se pudo guardar. Intenta de nuevo.");
+        return;
+      }
+
+      // El backend devuelve el restante real por talla (asignado − impreso).
+      // Lo usamos como fuente de verdad; si faltara para alguna clave, caemos al
+      // descuento local.
+      const remainByKey = new Map();
+      const printedByKey = new Map();
+      for (const r of (json.remaining || [])) {
+        const key = `${String(r.talla ?? "").trim()}||${String(r.color ?? "").trim()}||${String(r.customerPo ?? "").trim()}`;
+        remainByKey.set(key, Number(r.remaining) || 0);
+        printedByKey.set(key, Number(r.printed) || 0);
+      }
+
+      // Decrease the in-memory size quantities so reopening the builder shows
+      // the reduced "Asignado" without needing a full reload.
+      setStyles((prev) => {
+        if (!prev || !prev.length) return prev;
+        const idx = selectedStyleIndex;
+        const style = prev[idx];
+        if (!style || !Array.isArray(style.sizes)) return prev;
+        const decBy = new Map();
+        for (const p of payload) {
+          const key = `${p.talla}||${p.color}||${p.customerPo}`;
+          decBy.set(key, (decBy.get(key) || 0) + p.qty);
+        }
+        const sizes = style.sizes.map((s) => {
+          const key = `${s.talla}||${s.color || ""}||${s.customerPo || ""}`;
+          const dec = decBy.get(key) || 0;
+          if (!dec && !remainByKey.has(key)) return s;
+          const assigned = Number(s.assignedQuantity ?? s.quantity) || 0;
+          // Preferimos el valor autoritativo del backend cuando existe.
+          const remaining = remainByKey.has(key)
+            ? remainByKey.get(key)
+            : Math.max(0, (Number(s.quantity) || 0) - dec);
+          const printed = printedByKey.has(key)
+            ? printedByKey.get(key)
+            : (Number(s.printedQuantity) || 0) + dec;
+          return {
+            ...s,
+            assignedQuantity: assigned,
+            printedQuantity: printed,
+            quantity: remaining,
+          };
+        });
+        const next = [...prev];
+        next[idx] = { ...style, sizes };
+        return next;
+      });
+
+      setTicketsConfirmed(true);
+      const savedQty = json.savedQty ?? payload.reduce((a, p) => a + p.qty, 0);
+      const totalRemaining = (json.remaining || []).reduce((a, r) => a + (Number(r.remaining) || 0), 0);
+      setTicketConfirmMsg(
+        `✅ Guardado. Se descontaron ${savedQty} pzs de lo asignado. Faltan ${totalRemaining} pzs por producir.`
+      );
+    } catch (e) {
+      setTicketConfirmMsg(e.message || "Error de red al guardar.");
+    } finally {
+      setConfirmingTickets(false);
+    }
   }
 
   // Print every generated ticket, one per page, via a dedicated print window so
@@ -1268,6 +1428,7 @@ export default function LineLeaderPage() {
         <div class="head">
           <div class="label">TICKET DE PRODUCCIÓN</div>
           <div class="wo">${esc(t.workOrderNo)}</div>
+          ${t.ticketNo ? `<div class="tn">${esc(t.ticketNo)}</div>` : ""}
         </div>
         <div class="body">
           <div class="row"><span>Estilo</span><b>${esc(t.style)}</b></div>
@@ -1299,6 +1460,7 @@ export default function LineLeaderPage() {
         .head{background:#1a1a18;color:#fff;padding:14px 16px;text-align:center}
         .label{font-size:11px;letter-spacing:2px;color:#c9c9c2}
         .wo{font-size:22px;font-weight:600;margin-top:4px}
+        .tn{font-size:12px;margin-top:2px;color:#e6e6df;font-family:monospace}
         .body{padding:14px 16px}
         .row{display:flex;justify-content:space-between;padding:7px 0;font-size:13px;border-bottom:1px solid #eee}
         .row span{color:#6b6b64}
@@ -1977,7 +2139,7 @@ export default function LineLeaderPage() {
                             <span style={{ fontSize: 12, color: "#6b6b64" }}>PO: <b>{r.customerPo}</b></span>
                           ) : null}
                           <span style={{ fontSize: 13, color: "#6b6b64" }}>
-                            Asignado: <b>{r.merchantQty}</b> pzs
+                            Asignado: <b>{r.assigned}</b> pzs · Restante: <b style={{ color: r.merchantQty > 0 ? "#b45309" : "#16a34a" }}>{r.merchantQty}</b> pzs
                           </span>
                           {r.open && st.selectedCount > 0 && (
                             <span style={{ fontSize: 12, color: "#1a1a18", fontWeight: 700, background: "#ecece6", borderRadius: 6, padding: "1px 8px" }}>
@@ -1988,9 +2150,9 @@ export default function LineLeaderPage() {
                         {r.open && (
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                           <span style={{ fontSize: 12, color: "#6b6b64" }}>Paquete</span>
-                          <input
-                            type="number" min={1} value={r.bundle}
-                            onChange={(e) => setBundle(i, e.target.value)}
+                          <NumberField
+                            min={1} value={r.bundle}
+                            onChangeNumber={(n) => setBundle(i, n)}
                             style={{ width: 64, padding: "6px 8px", border: "1px solid #d8d8d2", borderRadius: 8, fontSize: 14 }}
                           />
                           <button
@@ -2049,9 +2211,9 @@ export default function LineLeaderPage() {
                                 style={{ width: 16, height: 16, cursor: "pointer" }}
                               />
                               <span style={{ fontSize: 11, color: "#9a9a92" }}>#{j + 1}</span>
-                              <input
-                                type="number" min={0} value={q}
-                                onChange={(e) => setTicketQty(i, j, e.target.value)}
+                              <NumberField
+                                min={0} value={q}
+                                onChangeNumber={(n) => setTicketQty(i, j, n)}
                                 style={{ width: 72, padding: "6px 8px", border: "none", fontSize: 15, fontWeight: 600, textAlign: "right", outline: "none", background: "transparent" }}
                               />
                               <button
@@ -2138,6 +2300,39 @@ export default function LineLeaderPage() {
             onClick={(e) => e.stopPropagation()}
             style={{ width: 380, maxWidth: "100%", maxHeight: "90vh", display: "flex", flexDirection: "column" }}
           >
+            {/* Confirmar y guardar: persiste los tickets impresos y descuenta
+                la cantidad asignada por talla para la próxima vez. */}
+            <button
+              onClick={confirmTickets}
+              disabled={confirmingTickets || ticketsConfirmed}
+              style={{
+                width: "100%", marginBottom: 8,
+                background: ticketsConfirmed ? "#4b7a3a" : (confirmingTickets ? "#8a8a82" : "#1f6f43"),
+                color: "#fff", border: "none", borderRadius: 10, padding: "12px",
+                fontSize: 15, fontWeight: 700,
+                cursor: confirmingTickets || ticketsConfirmed ? "default" : "pointer",
+              }}
+            >
+              {ticketsConfirmed
+                ? "✅ Guardado"
+                : confirmingTickets
+                ? "Guardando…"
+                : "✅ Confirmar y guardar"}
+            </button>
+            {ticketConfirmMsg && (
+              <div
+                style={{
+                  marginBottom: 10, fontSize: 12, fontWeight: 600,
+                  color: ticketsConfirmed ? "#2f5d24" : "#c0392b",
+                  background: ticketsConfirmed ? "#eef5ea" : "#fff5f5",
+                  border: `1px solid ${ticketsConfirmed ? "#cfe3c6" : "#f0c9c4"}`,
+                  borderRadius: 8, padding: "8px 10px",
+                }}
+              >
+                {ticketConfirmMsg}
+              </div>
+            )}
+
             <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
               <button
                 onClick={printAllTickets}
@@ -2174,6 +2369,9 @@ export default function LineLeaderPage() {
                       <div style={{ background: "#1a1a18", color: "#fff", padding: "14px 16px", textAlign: "center" }}>
                         <div style={{ fontSize: 11, letterSpacing: 2, color: "#c9c9c2" }}>TICKET DE PRODUCCIÓN</div>
                         <div style={{ fontSize: 22, fontWeight: 600, marginTop: 4 }}>{t.workOrderNo}</div>
+                        {t.ticketNo && (
+                          <div style={{ fontSize: 12, color: "#e6e6df", marginTop: 2, fontFamily: "monospace" }}>{t.ticketNo}</div>
+                        )}
                       </div>
 
                       <div style={{ padding: "14px 16px" }}>
@@ -2242,5 +2440,47 @@ export default function LineLeaderPage() {
         </div>
       )}
     </div>
+  );
+}
+// Campo numérico editable que SÍ se puede borrar. Los inputs controlados atados a
+// un número no permiten dejar el campo vacío (al borrar el "0"/"1" vuelve solo),
+// lo que causa cosas como "070". Este componente mantiene el texto mientras se
+// edita (permitiendo vacío), entrega SIEMPRE un número al modelo, y al salir
+// normaliza al mínimo. Al enfocar selecciona todo, así escribir reemplaza.
+function NumberField({ value, onChangeNumber, min = 0, style, ...props }) {
+  const [text, setText] = useState(value == null ? "" : String(value));
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setText(value == null ? "" : String(value));
+  }, [value]);
+
+  const commit = (raw) => {
+    const digits = String(raw).replace(/[^\d]/g, "");
+    if (digits === "") return min;
+    return Math.max(min, parseInt(digits, 10));
+  };
+
+  return (
+    <input
+      {...props}
+      type="text"
+      inputMode="numeric"
+      pattern="[0-9]*"
+      value={text}
+      style={style}
+      onFocus={(e) => { focused.current = true; e.target.select(); }}
+      onChange={(e) => {
+        const digits = e.target.value.replace(/[^\d]/g, "");
+        setText(digits);                 // permite quedar vacío mientras se escribe
+        onChangeNumber(commit(digits));  // el modelo siempre recibe un número
+      }}
+      onBlur={(e) => {
+        focused.current = false;
+        const n = commit(e.target.value);
+        setText(String(n));              // al salir, muestra el número normalizado
+        onChangeNumber(n);
+      }}
+    />
   );
 }

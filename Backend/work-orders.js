@@ -222,6 +222,8 @@ const PACKING_KEYWORDS = ["pack", "emp", "termin", "finish"];
 // 0 y la app sigue funcionando (la barra de produccion se queda en cero) en vez
 // de tronar cada consulta del planeador.
 let PRODUCED_SUBQUERY = "0::numeric AS produced_quantity";
+// Igual que PRODUCED_SUBQUERY pero sin alias, para incrustarla como escalar.
+let PRODUCED_SUBQUERY_BARE = "0::numeric";
 
 // Resolvidos en resolveProducedSubquery() y guardados a nivel de modulo para que
 // producedByLineFor() reutilice EXACTAMENTE la misma deteccion (mismo enlace
@@ -315,6 +317,19 @@ async function detectProducedSubquery(client) {
     ), 0) AS produced_quantity
   `;
 
+  // Misma subconsulta sin el alias, para usarla como escalar dentro de otra
+  // expresion (p.ej. pending_to_assign en la lista de ordenes).
+  PRODUCED_SUBQUERY_BARE = `
+    COALESCE((
+      SELECT SUM(se.sewed_qty)
+        FROM operation_sewed_entries se
+        JOIN operator_operations oo ON oo.id = se.operation_id
+        JOIN line_runs lr           ON lr.id = se.run_id
+       WHERE ${link.on}
+         AND (${likes})
+    ), 0)
+  `;
+
   // Guardar para el desglose por linea (finished-warehouse los reutiliza).
   RESOLVED_RUN_LINK = link;
   PACKING_LIKES_SQL = likes;
@@ -346,12 +361,24 @@ let producedResolution = null;
 async function ensureProducedResolved(client) {
   if (RESOLVED_RUN_LINK) return;              // ya resuelto en este proceso
   if (!producedResolution) {
-    producedResolution = detectProducedSubquery(client).catch((err) => {
-      // Se limpia el memo para reintentar en la siguiente peticion en vez de
-      // quedarse en 0 para siempre por un error transitorio de conexion.
-      producedResolution = null;
-      console.warn("\u26a0\ufe0f  detectProducedSubquery fallo:", err.message);
-    });
+    producedResolution = detectProducedSubquery(client)
+      .catch((err) => {
+        // Error duro (p.ej. conexion): se loguea y se deja caer al finally, que
+        // limpia el memo para reintentar en la siguiente peticion.
+        console.warn("\u26a0\ufe0f  detectProducedSubquery fallo:", err.message);
+      })
+      .finally(() => {
+        // CLAVE EN LAMBDA: detectProducedSubquery NO lanza cuando faltan las
+        // tablas o no encuentra el enlace hacia la orden; solo hace warn y
+        // regresa, dejando RESOLVED_RUN_LINK en null. Si dejaramos el memo
+        // "resuelto" en ese estado, el contenedor entero se quedaria con
+        // PRODUCED_SUBQUERY = "0::numeric" de por vida (producido = 0 en la lista
+        // Y en el recalculo de estado). Eso pasa cuando la PRIMERA peticion que
+        // toca produccion en ese contenedor corre antes de que el search_path del
+        // tenant este puesto. Limpiando el memo cuando NO se resolvio, la
+        // siguiente peticion (ya con el schema correcto) vuelve a intentar.
+        if (!RESOLVED_RUN_LINK) producedResolution = null;
+      });
   }
   await producedResolution;
 }
@@ -437,7 +464,20 @@ function registerWorkOrders(app, deps) {
           ${LINES_SUBQUERY},
           MAX(mc.photo_filename) as master_code_photo_filename,
           COALESCE(SUM(la.assigned_quantity) FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) as assigned_quantity,
-          ${PRODUCED_SUBQUERY}
+          ${PRODUCED_SUBQUERY},
+          -- Lo que REALMENTE falta por planear. No es target - assigned: una
+          -- pieza ya cosida no hay que volver a asignarla aunque su fila de
+          -- asignacion ya no exista. Con 1,251 producidas de 1,500 y 0
+          -- asignadas, faltan 249 por planear, no 1,500.
+          GREATEST(
+            COALESCE(wo.total_to_produce, wo.quantity, 0)
+              - GREATEST(
+                  COALESCE(SUM(la.assigned_quantity)
+                    FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0),
+                  (SELECT ${PRODUCED_SUBQUERY_BARE})
+                ),
+            0
+          )::numeric AS pending_to_assign
         FROM work_orders wo
         LEFT JOIN line_assignments la ON la.work_order_id = wo.id
         LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
@@ -826,9 +866,20 @@ function registerWorkOrders(app, deps) {
         );
       }
       // assigned_quantity tiene CHECK (> 0): una celda sin nada cosido no se
-      // puede dejar en cero, hay que borrarla.
+      // puede dejar en cero. Antes se BORRABA, y ahi estaba el bug: si el
+      // lookup por celda regresaba 0 (captura bajo otra fecha/linea) se borraban
+      // filas que SI tenian produccion, y SUM(assigned_quantity) perdia piezas
+      // para siempre -> "Asignado 0 / 1,500" con 1,251 ya cosidas.
+      // Ahora se CANCELA: la fila sobrevive (auditable, y assigned_quantity
+      // sigue > 0), pero queda fuera de todos los SUM, que filtran
+      // 'cancelled'. El efecto sobre el pool del tablero es identico al borrado.
       if (toDelete.length) {
-        await client.query(`DELETE FROM line_assignments WHERE id = ANY($1)`, [toDelete]);
+        await client.query(
+          `UPDATE line_assignments
+              SET status = 'cancelled', produced_quantity = 0, updated_at = now()
+            WHERE id = ANY($1)`,
+          [toDelete]
+        );
       }
 
       await client.query("COMMIT");
@@ -844,7 +895,8 @@ function registerWorkOrders(app, deps) {
         produced,
         balance,
         updated: toUpdate.length,
-        deleted: toDelete.length,
+        deleted: toDelete.length,   // ahora = canceladas, no borradas
+        cancelled: toDelete.length,
         colors: parts.filter((r) => r.color).map((r) => r.color),
       });
     } catch (err) {
@@ -1585,6 +1637,272 @@ async function producedQuantityFor(client, workOrderId) {
   return Number(rows[0]?.produced_quantity) || 0;
 }
 
+// Recalcula el ESTADO de la ORDEN a partir de lo PRODUCIDO, con la misma
+// aritmetica que ve el planeador en OrderStatus.jsx:
+//   • producido > 0                          -> 'in_progress' (En proceso)
+//   • producido >= asignado  (y asignado>0)  -> 'completed'   (Terminada)
+//
+// La produccion SOLO empuja hacia adelante (pending/assigned -> in_progress ->
+// completed): nunca "descompleta" ni degrada una orden. Es el mismo criterio de
+// una sola direccion que autoCompleteDay, para no pelear con el flujo manual del
+// planeador si despues corrige una captura hacia abajo. No toca canceladas y es
+// idempotente.
+//
+// CONTRA QUE SE CIERRA UNA ORDEN
+// ------------------------------
+// 'target'   -> COALESCE(total_to_produce, quantity): la MISMA meta que el
+//               planeador ve en la barra "Producido X / Y" de OrderStatus.jsx.
+//               La pastilla y la barra ya no pueden contradecirse.
+// 'assigned' -> comportamiento anterior (cerraba en cuanto lo producido
+//               alcanzaba lo que estuviera puesto en el tablero, aunque fuera
+//               una fraccion de la orden). Se conserva solo como escape.
+const COMPLETION_BASIS = "target";
+
+// Orden de avance para garantizar que la produccion solo suba el estado.
+const WO_STATUS_RANK = { pending: 0, assigned: 1, in_progress: 2, completed: 3 };
+
+// La produccion empuja hacia adelante, con UNA excepcion: si una orden quedo en
+// 'completed' y lo producido ya no alcanza la meta (correccion a la baja del
+// piso, o una orden que se cerro mal en el pasado), se devuelve a 'in_progress'.
+// Nunca degrada por debajo de 'in_progress' y nunca degrada si la deteccion de
+// produccion no resolvio (produced=0 de mentiras -> demotion masiva).
+const ALLOW_COMPLETED_DOWNGRADE = true;
+
+// UNICA definicion del estado de una orden. La usan tanto el recalculo por
+// captura de piso (refreshWorkOrderStatusFromProduction) como el recalculo
+// masivo (POST /api/work-orders/recalculate-status en server1.js), para que no
+// vuelvan a existir dos reglas distintas de "Completada".
+//
+//   producido >= meta (meta > 0)          -> 'completed'
+//   producido > 0 o alguna celda corriendo -> 'in_progress'
+//   hay algo asignado                      -> 'assigned'
+//   nada                                   -> 'pending'
+//
+// OJO: el hecho de que todas las line_assignments esten marcadas 'completed' YA
+// NO cierra la orden por si solo. Esas banderas se ponen por celda (orden+linea+
+// dia) comparando la produccion DE ESE DIA, y su suma puede no cuadrar con el
+// total de la orden; era justo el camino por el que una orden con 3,498 de 4,800
+// aparecia como "Completada".
+function computeWorkOrderStatus({
+  target = 0,
+  assigned = 0,
+  produced = 0,
+  activeCount = 0,
+  inProgressCount = 0,
+} = {}) {
+  const goal = COMPLETION_BASIS === "assigned" ? Number(assigned) || 0 : Number(target) || 0;
+  const prod = Number(produced) || 0;
+  if (goal > 0 && prod >= goal) return "completed";
+  if (prod > 0 || Number(inProgressCount) > 0) return "in_progress";
+  if ((Number(assigned) || 0) > 0 || Number(activeCount) > 0) return "assigned";
+  return "pending";
+}
+
+// Devuelve { changed:true, from, to } si movio el estado, o { changed:false }.
+async function refreshWorkOrderStatusFromProduction(client, workOrderId) {
+  const wo = Number(workOrderId);
+  if (!Number.isFinite(wo)) return { changed: false };
+
+  await ensureProducedResolved(client);
+
+  // Estado actual, meta y total asignado (mismo filtro que la lista de ordenes).
+  const { rows } = await client.query(
+    `SELECT wo.status,
+            COALESCE(wo.total_to_produce, wo.quantity, 0) AS target,
+            COALESCE(SUM(la.assigned_quantity)
+              FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) AS assigned
+       FROM work_orders wo
+       LEFT JOIN line_assignments la ON la.work_order_id = wo.id
+      WHERE wo.id = $1
+      GROUP BY wo.id`,
+    [wo]
+  );
+  const row = rows[0];
+  if (!row) return { changed: false };
+
+  const current = row.status;
+  // La produccion no manda sobre ordenes canceladas.
+  if (current === "cancelled") return { changed: false };
+
+  const assigned = Number(row.assigned) || 0;
+  const target = Number(row.target) || 0;
+  const produced = await producedQuantityFor(client, wo);
+
+  const desired = computeWorkOrderStatus({ target, assigned, produced });
+
+  // Diagnóstico (visible en CloudWatch). Si en AWS ves aquí produced=0 pero la
+  // línea sí capturó, el problema es la resolución de PRODUCED_SUBQUERY en ese
+  // contenedor Lambda (RESOLVED_RUN_LINK), no este cálculo de estado.
+  console.log(
+    `[wo-status] id=${wo} produced=${produced} assigned=${assigned} ` +
+    `target=${target} basis=${COMPLETION_BASIS} current=${current} desired=${desired} ` +
+    `linkResolved=${Boolean(RESOLVED_RUN_LINK)}`
+  );
+
+  const forward = (WO_STATUS_RANK[desired] ?? 0) > (WO_STATUS_RANK[current] ?? 0);
+
+  // Unica degradacion permitida: sacar de 'completed' una orden que ya no llega
+  // a la meta. Requiere que la deteccion de produccion haya resuelto, porque si
+  // no produced es 0 para TODAS las ordenes y esto las abriria todas.
+  const undoBadCompletion =
+    ALLOW_COMPLETED_DOWNGRADE &&
+    current === "completed" &&
+    desired !== "completed" &&
+    Boolean(RESOLVED_RUN_LINK);
+
+  if (!forward && !undoBadCompletion) {
+    return { changed: false, from: current, to: current };
+  }
+
+  // Al reabrir, nunca caer por debajo de 'in_progress': la orden ya tuvo piso.
+  const next = undoBadCompletion && !forward ? "in_progress" : desired;
+  if (next === current) return { changed: false, from: current, to: current };
+
+  await client.query(
+    `UPDATE work_orders SET status = $1, updated_at = now() WHERE id = $2`,
+    [next, wo]
+  );
+  return { changed: true, from: current, to: next };
+}
+
+// Producido de VARIAS ordenes en una sola consulta (mismo PRODUCED_SUBQUERY que
+// usa la lista y producedQuantityFor). Evita el N+1 del recalculo masivo.
+// Devuelve Map<work_order_id, producido>.
+async function producedQuantityForMany(client, workOrderIds) {
+  await ensureProducedResolved(client);
+  const ids = (workOrderIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
+  const out = new Map();
+  if (ids.length === 0) return out;
+  const { rows } = await client.query(
+    `SELECT wo.id, ${PRODUCED_SUBQUERY} FROM work_orders wo WHERE wo.id = ANY($1)`,
+    [ids]
+  );
+  rows.forEach((r) => out.set(Number(r.id), Number(r.produced_quantity) || 0));
+  return out;
+}
+
+// ¿La deteccion de produccion resolvio en este contenedor? Si es false,
+// produced vale 0 para todo y NADIE debe degradar estados con ese dato.
+function isProducedResolved() {
+  return Boolean(RESOLVED_RUN_LINK);
+}
+
+// ---------------------------------------------------------------------------
+// reconcileAssignmentsFromProduction
+//
+// Reconstruye las asignaciones que se perdieron cuando una fila con produccion
+// fue BORRADA (settle-day viejo, DELETE /api/line-assignments/:id, o el
+// delete-and-reinsert de /move que se quedo a medias). El sintoma es una orden
+// con "Asignado 0 / 1,500" y 1,251 ya producidas: las piezas existen en el piso
+// pero ya no existen en el tablero, asi que el planeador vuelve a asignar 1,500
+// y se produce de mas.
+//
+// La produccion SI sobrevive (line_runs + operation_sewed_entries), asi que la
+// celda se puede reconstruir exactamente: para cada (orden, linea, dia) con
+// produccion pero sin fila viva, se inserta una fila 'completed' con
+// assigned_quantity = produced_quantity = lo cosido ese dia.
+//
+// Solo AGREGA lo que falta; nunca toca ni encoge una fila existente. Idempotente.
+// dryRun: true devuelve el plan sin escribir.
+// ---------------------------------------------------------------------------
+async function reconcileAssignmentsFromProduction(client, { workOrderIds = null, dryRun = false } = {}) {
+  await ensureProducedResolved(client);
+  if (!RESOLVED_RUN_LINK || !PACKING_LIKES_SQL) {
+    const e = new Error(
+      "No se puede reconciliar: la captura de piso no esta ligada a las ordenes (produced sin resolver)."
+    );
+    e.statusCode = 409;
+    throw e;
+  }
+
+  // Produccion real por celda.
+  const cells = await producedByLineDayForMany(client, { workOrderIds });
+  if (cells.length === 0) return { scanned: 0, created: [], createdQty: 0 };
+
+  const ids = [...new Set(cells.map((c) => c.work_order_id))];
+
+  // Filas de asignacion vivas por celda, para no duplicar.
+  const { rows: alive } = await client.query(
+    `SELECT work_order_id,
+            line_no,
+            to_char(assigned_date, 'YYYY-MM-DD') AS day,
+            COALESCE(SUM(assigned_quantity), 0) AS assigned
+       FROM line_assignments
+      WHERE work_order_id = ANY($1)
+        AND status NOT IN ('cancelled', 'rejected')
+      GROUP BY work_order_id, line_no, assigned_date`,
+    [ids]
+  );
+  const key = (w, l, d) => `${w}|${String(l)}|${d}`;
+  const assignedByCell = new Map(
+    alive.map((r) => [key(r.work_order_id, r.line_no, r.day), Number(r.assigned) || 0])
+  );
+
+  // Solo reconstruir en ordenes donde el total asignado se quedo CORTO frente a
+  // lo producido. Si la orden cuadra, una celda descuadrada es un movimiento
+  // legitimo del planeador (produjo en la linea 10 lo que estaba planeado en la
+  // 14) y no hay piezas perdidas que reponer.
+  const { rows: totals } = await client.query(
+    `SELECT wo.id,
+            COALESCE(SUM(la.assigned_quantity)
+              FILTER (WHERE la.status NOT IN ('cancelled', 'rejected')), 0) AS assigned,
+            (SELECT ${PRODUCED_SUBQUERY_BARE}) AS produced
+       FROM work_orders wo
+       LEFT JOIN line_assignments la ON la.work_order_id = wo.id
+      WHERE wo.id = ANY($1) AND wo.status <> 'cancelled'
+      GROUP BY wo.id`,
+    [ids]
+  );
+  const shortfall = new Map();
+  totals.forEach((r) => {
+    const gap = (Number(r.produced) || 0) - (Number(r.assigned) || 0);
+    if (gap > 0) shortfall.set(Number(r.id), gap);
+  });
+  if (shortfall.size === 0) return { scanned: cells.length, created: [], createdQty: 0 };
+
+  const plan = [];
+  for (const c of cells) {
+    if (!shortfall.has(c.work_order_id)) continue;
+    if (c.produced <= 0) continue;
+    const already = assignedByCell.get(key(c.work_order_id, c.line_no, c.day)) || 0;
+    const missing = c.produced - already;
+    if (missing <= 0) continue;
+    plan.push({
+      work_order_id: c.work_order_id,
+      line_no: String(c.line_no),
+      day: c.day,
+      quantity: missing,
+      last_reported_at: c.last_reported_at,
+    });
+  }
+  if (plan.length === 0 || dryRun) {
+    return {
+      scanned: cells.length,
+      created: plan,
+      createdQty: plan.reduce((s, p) => s + p.quantity, 0),
+      dryRun: Boolean(dryRun),
+    };
+  }
+
+  for (const p of plan) {
+    await client.query(
+      `INSERT INTO line_assignments
+         (work_order_id, line_no, assigned_date, assigned_quantity,
+          planned_start_date, planned_end_date, status, produced_quantity,
+          completed_at, created_at, updated_at)
+       VALUES ($1, $2, $3::date, $4, $3::date, $3::date, 'completed', $4, $5, now(), now())`,
+      [p.work_order_id, p.line_no, p.day, p.quantity, p.last_reported_at || null]
+    );
+  }
+
+  return {
+    scanned: cells.length,
+    created: plan,
+    createdQty: plan.reduce((s, p) => s + p.quantity, 0),
+    dryRun: false,
+  };
+}
+
 // Produccion terminada por LINEA para VARIAS ordenes en una sola consulta (evita
 // N+1 en el dashboard). Regresa Map<work_order_id, [{ line_no, finished,
 // last_reported_at }]>. Mismo enlace y mismas operaciones de empaque/terminado
@@ -1786,7 +2104,12 @@ async function autoCompleteDay(client, { workOrderId, lineNo, day }) {
 registerWorkOrders.initSchema = initSchema;
 registerWorkOrders.autoCompleteDay = autoCompleteDay;
 registerWorkOrders.producedQuantityFor = producedQuantityFor;
+registerWorkOrders.refreshWorkOrderStatusFromProduction = refreshWorkOrderStatusFromProduction;
 registerWorkOrders.producedByLineFor = producedByLineFor;
 registerWorkOrders.producedByLineForMany = producedByLineForMany;
 registerWorkOrders.producedByLineDayForMany = producedByLineDayForMany;
+registerWorkOrders.producedQuantityForMany = producedQuantityForMany;
+registerWorkOrders.reconcileAssignmentsFromProduction = reconcileAssignmentsFromProduction;
+registerWorkOrders.computeWorkOrderStatus = computeWorkOrderStatus;
+registerWorkOrders.isProducedResolved = isProducedResolved;
 module.exports = registerWorkOrders;

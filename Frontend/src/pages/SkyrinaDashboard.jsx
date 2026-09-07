@@ -4,7 +4,6 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import NavSkyrina from '../components/NavSkyrina';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
 
 function toYMD(d) {
   if (!d) return "";
@@ -139,6 +138,25 @@ const debugRunDataStructure = (runData) => {
 // Inside the loop where you fetch run details, add:
 // debugRunDataStructure(detailRes.data);
 
+
+// Objetivo total is per STYLE, not per run. Same-style/different-color runs share
+// one capacity (identical operators/hours/SAM/efficiency), so their target counts
+// ONCE; different styles each contribute their own target. Production (finished/
+// Cosido) still sums across every run, since each color actually sews pieces.
+const sumTargetByStyle = (runs, getTarget) => {
+  const byStyle = new Map();
+  for (const run of runs || []) {
+    const t = Number(getTarget(run)) || 0;
+    if (!(t > 0) || !isFinite(t)) continue;
+    const key = String(run.style ?? "");
+    // Runs of the same style should have equal targets; MAX guards against a
+    // stray 0/partial while still counting the style only once.
+    byStyle.set(key, Math.max(byStyle.get(key) || 0, t));
+  }
+  let total = 0;
+  for (const v of byStyle.values()) total += v;
+  return total;
+};
 
 // Also update the calculateLineTotalFinished function to ensure proper number handling
 const calculateLineTotalFinished = (runs) => {
@@ -417,7 +435,7 @@ export default function SkyrinaDashboard() {
       return;
     }
 
-    axios.get(`${API_BASE}/api/me`, {
+    axios.get(`http://localhost:5000/api/me`, {
       headers: { Authorization: `Bearer ${token}` }
     })
       .then(res => {
@@ -467,7 +485,8 @@ export default function SkyrinaDashboard() {
     return () => clearInterval(timer);
   }, [autoRefresh, date]);
 
-// Replace the fetchAllRunDetails useEffect in SkyrinaDashboard.jsx
+  // Fetch all run details for each line - grouped by line
+// Fetch all run details for each line - grouped by line
 useEffect(() => {
   const fetchAllRunDetails = async () => {
     if (!lineData.length || !date) return;
@@ -478,7 +497,7 @@ useEffect(() => {
     try {
       // Use batch endpoint instead of individual requests
       const lines = lineData.map(line => line.lineNo);
-      const batchRes = await axios.post(`${API_BASE}/api/batch/line-runs-data`, 
+      const batchRes = await axios.post(`http://localhost:5000/api/batch/line-runs-data`, 
         { lines, date },
         { headers }
       );
@@ -490,6 +509,10 @@ useEffect(() => {
         
         let totalWeightedRealtimeEff = 0;
         let totalWeightedRealtimeTarget = 0;
+        // Denominator for global RT efficiency, deduped by (line, style): a color
+        // split shares one crew, so its realtime target is counted once, not per
+        // color. The numerator (rtEff × rtTarget = production) stays per-run.
+        const rtWeightTargetByLineStyle = new Map();
         
         for (const lineNo in batchData) {
           const runs = batchData[lineNo];
@@ -516,15 +539,19 @@ useEffect(() => {
             const rtTarget = computeRealtimeTarget(runData, date);
             const dailyEff = calculateActualDailyEfficiency(runData);
             
-            // ... rest of your processing logic remains the same
             if (rtTarget > 0 && rtEff !== null) {
               totalWeightedRealtimeEff += rtEff * rtTarget;
-              totalWeightedRealtimeTarget += rtTarget;
+              const rtKey = `${lineNo}||${run.style ?? ""}`;
+              rtWeightTargetByLineStyle.set(
+                rtKey,
+                Math.max(rtWeightTargetByLineStyle.get(rtKey) || 0, rtTarget)
+              );
             }
             
             lineRuns.push({
               runId: run.id,
               style: run.style,
+              color: run.color,
               targetPcs: run.target_pcs,
               finishedGarments: finishedGarments,
               realtimeTarget: rtTarget,
@@ -540,15 +567,21 @@ useEffect(() => {
           
           newRunDataMap[lineNo] = lineRuns;
           if (lineRuns.length > 0) {
-            const firstRun = lineRuns[0];
-            const lineRealtimeTarget = computeRealtimeTarget(firstRun.runData, date);
-            lineTargets[lineNo] = lineRealtimeTarget;
+            // One realtime objetivo per style (was: first run only, which
+            // under-counted multi-style lines and double-counted color splits).
+            lineTargets[lineNo] = sumTargetByStyle(lineRuns, (r) => r.realtimeTarget);
           }
         }
         
         setRunDataMap(newRunDataMap);
         setGlobalRealtimeTarget(Object.values(lineTargets).reduce((a, b) => a + b, 0));
-        
+
+        // Sum one realtime target per (line, style) for the global RT efficiency.
+        totalWeightedRealtimeTarget = [...rtWeightTargetByLineStyle.values()].reduce(
+          (a, b) => a + b,
+          0
+        );
+
         if (!productionEnded && totalWeightedRealtimeTarget > 0) {
           const correctGlobalRealtimeEfficiency = totalWeightedRealtimeEff / totalWeightedRealtimeTarget;
           setGlobalRealtimeEfficiency(Math.round(correctGlobalRealtimeEfficiency * 100) / 100);
@@ -573,9 +606,9 @@ useEffect(() => {
     const headers = { Authorization: `Bearer ${token}` };
     try {
       const [summaryRes, lineRes, assignmentsRes] = await Promise.all([
-        axios.get(`${API_BASE}/api/supervisor/summary?date=${selectedDate}`, { headers }),
-        axios.get(`${API_BASE}/api/supervisor/line-performance?date=${selectedDate}`, { headers }),
-        axios.get(`${API_BASE}/api/supervisor/assignments?date=${selectedDate}`, { headers })
+        axios.get(`http://localhost:5000/api/supervisor/summary?date=${selectedDate}`, { headers }),
+        axios.get(`http://localhost:5000/api/supervisor/line-performance?date=${selectedDate}`, { headers }),
+        axios.get(`http://localhost:5000/api/supervisor/assignments?date=${selectedDate}`, { headers })
       ]);
       if (summaryRes.data.success) setSummary(summaryRes.data.summary);
       if (lineRes.data.success) setLineData(lineRes.data.lines);
@@ -699,38 +732,21 @@ useEffect(() => {
     return total;
   };
 
-  // Calculate total target for a line (daily or realtime based on production status)
+  // Calculate total target for a line (daily or realtime based on production status).
+  // Counted once per style (same style/different color is one objetivo).
   const calculateLineTotalTarget = (runs) => {
     if (!runs || runs.length === 0) return 0;
-    
-    let totalTarget = 0;
-    let hasValidTarget = false;
-    
-    for (const run of runs) {
-      if (!run.hasProductionData) continue;
-      
-      // If production has ended, always use daily target
-      if (productionEnded) {
-        if (run.targetPcs > 0 && !isNaN(run.targetPcs) && isFinite(run.targetPcs)) {
-          totalTarget += run.targetPcs;
-          hasValidTarget = true;
-        }
-      } 
-      // During production, use realtime target if available
-      else {
-        if (run.realtimeTarget > 0 && !isNaN(run.realtimeTarget) && isFinite(run.realtimeTarget)) {
-          totalTarget += run.realtimeTarget;
-          hasValidTarget = true;
-        } 
-        // Fall back to daily target if realtime target is 0
-        else if (run.targetPcs > 0 && !isNaN(run.targetPcs) && isFinite(run.targetPcs)) {
-          totalTarget += run.targetPcs;
-          hasValidTarget = true;
-        }
+
+    const effectiveTarget = (run) => {
+      if (!run.hasProductionData) return 0;
+      if (productionEnded) return Number(run.targetPcs) || 0;
+      if (run.realtimeTarget > 0 && !isNaN(run.realtimeTarget) && isFinite(run.realtimeTarget)) {
+        return Number(run.realtimeTarget);
       }
-    }
-    
-    return hasValidTarget ? totalTarget : 0;
+      return Number(run.targetPcs) || 0;
+    };
+
+    return sumTargetByStyle(runs, effectiveTarget);
   };
 
   // Prepare line data with calculated efficiency for sorting
@@ -794,6 +810,28 @@ const prepareSortedLines = () => {
         totalRealtimeTarget += targetPcs; // Fallback to daily target
       }
     }
+    
+    // Objetivo total per style: same style/different color counts once, different
+    // styles sum. Capacity is per style too — a color split shares ONE crew, so
+    // available minutes and the RT-weighting target are counted once per style
+    // (12 operators for BLA + 12 for NEG of the same style = 12, not 24). The
+    // numerators (SAM output, weighted efficiency) stay per-run, so production
+    // still sums across every color.
+    totalDailyTarget = sumTargetByStyle(validRuns, (r) => r.targetPcs);
+    totalRealtimeTarget = sumTargetByStyle(validRuns, (r) =>
+      r.realtimeTarget > 0 && isFinite(r.realtimeTarget) ? r.realtimeTarget : r.targetPcs
+    );
+    totalAvailableMinutesDaily = sumTargetByStyle(validRuns, (r) =>
+      r.operatorsCount > 0 && r.workingHours > 0 && r.sam > 0
+        ? r.operatorsCount * r.workingHours * 60
+        : 0
+    );
+    totalRealtimeTargetForWeighting = sumTargetByStyle(
+      validRuns.filter(
+        (r) => !productionEnded && (r.realtimeEff || 0) > 0 && (r.realtimeTarget || 0) > 0
+      ),
+      (r) => r.realtimeTarget
+    );
     
     // Calculate daily efficiency (weighted by available minutes)
     const lineDailyEfficiency = totalAvailableMinutesDaily > 0 
@@ -992,6 +1030,18 @@ const isProductionEnded = (selectedDate) => {
               const { lineNo, runs, efficiency, displayLabel } = item;
               const lineTotalFinished = calculateLineTotalFinished(runs);
               const lineTotalTarget = calculateLineTotalTarget(runs);
+
+              // Same style across the line's runs is shown once; the runs are
+              // told apart by color (e.g. "DAMCHA01 · BLA / NEG"). Only when the
+              // styles genuinely differ do we list the styles.
+              const uniqueStyles = [...new Set(runs.map((r) => r.style).filter(Boolean))];
+              const runColors = runs.map((r) => r.color).filter(Boolean);
+              const styleLabel =
+                uniqueStyles.length === 1
+                  ? runColors.length
+                    ? `${uniqueStyles[0]} · ${runColors.join(" / ")}`
+                    : uniqueStyles[0]
+                  : uniqueStyles.join(" / ");
               
               const displayEfficiency = efficiency;
               const status = getLineStatus(displayEfficiency);
@@ -1021,8 +1071,8 @@ const isProductionEnded = (selectedDate) => {
                       </div>
                     </div>
                     
-                    <div className="text-xs font-medium text-gray-600 truncate" title={runs.map(r => r.style).join(', ')}>
-                      {runs.map(r => r.style).join(' / ')}
+                    <div className="text-xs font-medium text-gray-600 truncate" title={styleLabel}>
+                      {styleLabel}
                     </div>
                   </div>
 

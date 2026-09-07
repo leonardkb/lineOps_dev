@@ -146,6 +146,13 @@ export default function ViewEditOperationPlanner({
     setRows(initialRows || []);
   }, [initialRows]);
 
+  // Al cambiar de corrida (p. ej. al alternar de color) se descarta cualquier
+  // edición en curso para no aplicarla sobre los datos del otro color.
+  useEffect(() => {
+    setEditingRowId(null);
+    setSaveMessage("");
+  }, [runId]);
+
   // Calculate capacity per hour for each row based on t1-t5 times
   const computedRows = useMemo(() => {
     // Group rows by operator to calculate multi-operation capacity

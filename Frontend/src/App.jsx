@@ -19,6 +19,18 @@ import MerchantPage from "./pages/merchant/MerchantPage";
 import WorkOrderForm from "./components/merchant/WorkOrderForm";
 import NuevaOrdenWizard from "./components/merchant/NuevaOrdenWizard";
 import CuttingApp from "./pages/Corte/CuttingApp";
+import FinishedWarehouse from "./pages/FWHS/FinishedWarehouse";
+import AdminUsers from "./pages/AdminUsers";
+import QualityHead from "./pages/quality_head/QualityHead";
+import MerchantAnalytics from "./pages/MerchantAnalytics";
+import CutOrderAnalytics from "./pages/Corte/CutOrderAnalytics";
+import FinishedWarehouseAnalytics from "./pages/FWHS/FinishedWarehouseAnalytics";
+import PreOrdenesPage from "./components/merchant/PreOrdenesPage";
+import PreOrdenWizard from "./components/merchant/Preordenwizard";
+import SupermarketPlanBoard from "./components/Supermarket/SupermarketPlanBoard";
+import SupermarketPage from "./pages/supermarket/SupermarketPage";
+import PlannerAnalytics from "./components/planner/PlannerAnalytics";
+import VerificadorPage from "./pages/VerificadorPage";
 export default function App() {
   return (
     <Router>
@@ -43,6 +55,17 @@ export default function App() {
         <Route path="/work-order-form" element={<WorkOrderForm />} /> {/*work order form route */}
         <Route path="/nuevo-orden-wizard"  element={<NuevaOrdenWizard/>} /> {/*new work order wizard route */}
         <Route path="/cutting" element={<CuttingApp />} /> {/*cutting app route */}
+        <Route path="/users" element={<AdminUsers />} /> {/*users route */}
+        <Route path="/fws" element={<FinishedWarehouse />} /> {/*finished warehouse route */}
+        <Route path="/quality-head" element={<QualityHead />} /> {/*quality head route */}
+        <Route path ="merchant-analytics" element={<MerchantAnalytics/>} /> {/*merchant analytics route */}
+        <Route path='/cut-order-analytics' element={<CutOrderAnalytics/>} /> {/*cut order analytics route */}
+        <Route path='/fwh-analytics' element={<FinishedWarehouseAnalytics/>} /> {/*finished warehouse analytics route */}
+        <Route path='/pre-ordenes' element={<PreOrdenesPage/>} /> {/*pre-orders route */}
+        <Route path='/pre-orden-wizard' element ={<PreOrdenWizard/>}/>
+        <Route path='/supermarket-plan' element={<SupermarketPage/>} /> {/*supermarket plan route */}
+        <Route path='/planner-analytics' element={<PlannerAnalytics/>} /> {/*planner analytics route */}
+        <Route path ='/verificador' element={<VerificadorPage/>} /> {/*verificador route */}
       </Routes>
     </Router>
   );

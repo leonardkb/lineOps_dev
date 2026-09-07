@@ -1,5 +1,5 @@
 import { Link, useNavigate, useLocation } from "react-router-dom";
-import { LayoutDashboard, Plus, RefreshCw, LogOut, Tag } from "lucide-react";
+import { LayoutDashboard, Plus, RefreshCw, LogOut, Tag, ClipboardList } from "lucide-react";
 
 export default function MerchantNavbar({
   title,
@@ -63,7 +63,19 @@ export default function MerchantNavbar({
             Dashboard
           </Link>
 
-          
+          {/* Abre el wizard de pre-orden (estilo · cliente · piezas). El listado
+              vive en la pestaña "Pre-órdenes" del dashboard. */}
+          <Link
+            to="/pre-orden-wizard"
+            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition-all ${
+              isActive("/pre-orden-wizard") || isActive("/pre-ordenes")
+                ? "bg-white text-slate-900"
+                : "bg-white/10 hover:bg-white/20 text-white"
+            }`}
+          >
+            <ClipboardList size={14} />
+            Nueva Pre-orden
+          </Link>
 
           <Link
             to="/nuevo-orden-wizard"

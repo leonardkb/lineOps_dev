@@ -6,7 +6,6 @@ import {
 } from 'recharts';
 import NavDashboard from '../components/NavDashboard';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
 
 function toYMD(d) {
   if (!d) return "";
@@ -14,6 +13,25 @@ function toYMD(d) {
   if (Number.isNaN(dt.getTime())) return String(d).slice(0, 10);
   return dt.toISOString().slice(0, 10);
 }
+
+// Objetivo total is per STYLE, not per run. Same-style/different-color runs share
+// one crew (identical operators/hours/SAM/efficiency), so their target/capacity
+// counts ONCE; different styles each contribute their own. Production (finished/
+// Cosido) still sums across every run, since each color actually sews pieces.
+const sumTargetByStyle = (runs, getTarget) => {
+  const byStyle = new Map();
+  for (const run of runs || []) {
+    const t = Number(getTarget(run)) || 0;
+    if (!(t > 0) || !isFinite(t)) continue;
+    const key = String(run.style ?? "");
+    // Runs of the same style should have equal targets; MAX guards against a
+    // stray 0/partial while still counting the style only once.
+    byStyle.set(key, Math.max(byStyle.get(key) || 0, t));
+  }
+  let total = 0;
+  for (const v of byStyle.values()) total += v;
+  return total;
+};
 
 // Helper function to calculate finished garments (from packing operations)
 const calculateFinishedGarments = (runData) => {
@@ -225,7 +243,7 @@ export default function Dashboard() {
       return;
     }
 
-    axios.get(`${API_BASE}/api/me`, {
+    axios.get(`http://localhost:5000/api/me`, {
       headers: { Authorization: `Bearer ${token}` }
     })
       .then(res => {
@@ -258,15 +276,15 @@ useEffect(() => {
     const newEfficiencies = {};
     const newRealtimeEfficiencies = {};
     
-    // For global calculation - weighted average based on SAM
-    let totalSAMOutputSum = 0;
-    let totalAvailableMinutesSum = 0;
+    // For global RT efficiency: numerator (rtEff × rtTarget = production) stays
+    // per run; the denominator is deduped by (line, style) so a color split
+    // shares one crew target instead of being counted once per color.
     let globalWeightedEff = 0;
-    let globalTargets = 0;
+    const rtWeightTargetByLineStyle = new Map();
     
     for (const line of lineData) {
       try {
-        const runsRes = await axios.get(`${API_BASE}/api/line-runs/${line.lineNo}`, { headers });
+        const runsRes = await axios.get(`http://localhost:5000/api/line-runs/${line.lineNo}`, { headers });
         if (!runsRes.data.success) continue;
         
         const runsForDate = runsRes.data.runs.filter(r => toYMD(r.run_date) === date);
@@ -278,76 +296,84 @@ useEffect(() => {
         let totalSewed = 0;
         let totalTarget = 0;
         
-        // For line-level weighted calculation
+        // For line-level weighted calculation (numerator; RT-target denominator
+        // is deduped per style after the loop).
         let lineWeightedEff = 0;
-        let lineTargets = 0;
         
         for (const run of runsForDate) {
-          const detailRes = await axios.get(`${API_BASE}/api/get-run-data/${run.id}`, { headers });
+          const detailRes = await axios.get(`http://localhost:5000/api/get-run-data/${run.id}`, { headers });
           if (!detailRes.data.success) continue;
-          
+
+          const finishedGarments = calculateFinishedGarments(detailRes.data);
+          const dailyEff = calculateDailyEfficiency(detailRes.data);
+          const rtEff = calculateRealtimeEfficiency(detailRes.data, date);
+          const rtTarget = computeRealtimeTarget(detailRes.data, date);
+
           lineRuns.push({
             ...detailRes.data,
             runId: run.id,
-            style: run.style
+            style: run.style,
+            color: detailRes.data.run?.color ?? "",
+            finishedGarments,
+            dailyEff,
+            realtimeEff: rtEff,
+            realtimeTarget: rtTarget,
           });
-          
-          const finishedGarments = calculateFinishedGarments(detailRes.data);
-          const dailyEff = calculateDailyEfficiency(detailRes.data);
+
           totalSewed += finishedGarments;
           totalTarget += Number(detailRes.data.run?.target_pcs || 0);
-          
-          // Calculate real-time efficiency and target for this run
-          const rtEff = calculateRealtimeEfficiency(detailRes.data, date);
-          const rtTarget = computeRealtimeTarget(detailRes.data, date);
-          
-          // Accumulate for weighted global daily efficiency
-          const operatorsCount = detailRes.data.run?.operators_count || 0;
-          const workingHours = detailRes.data.run?.working_hours || 0;
-          const sam = detailRes.data.run?.sam_minutes || 0;
-          totalSAMOutputSum += finishedGarments * sam;
-          totalAvailableMinutesSum += operatorsCount * workingHours * 60;
-          
-          // Add to line weighted calculation
+
+          // Line RT efficiency numerator (production); denominator deduped below.
           if (rtTarget > 0 && rtEff !== null) {
             lineWeightedEff += rtEff * rtTarget;
-            lineTargets += rtTarget;
           }
-          
-          // Add to global weighted calculation
+
+          // Global RT efficiency: numerator per run, denominator deduped per
+          // (line, style) so same-style/different-color counts once, not per color.
           if (rtTarget > 0 && rtEff !== null) {
             globalWeightedEff += rtEff * rtTarget;
-            globalTargets += rtTarget;
+            const rtKey = `${line.lineNo}||${run.style ?? ""}`;
+            rtWeightTargetByLineStyle.set(
+              rtKey,
+              Math.max(rtWeightTargetByLineStyle.get(rtKey) || 0, rtTarget)
+            );
           }
         }
         
         newRunData[line.lineNo] = lineRuns;
-        
-        // Calculate real-time target based on first run's slots (assuming same schedule)
+
         if (lineRuns.length > 0) {
-          const rt = computeRealtimeTarget(lineRuns[0], date);
-          newTargets[line.lineNo] = rt;
-          
-          // Calculate line real-time efficiency using weighted average
+          // One realtime objetivo per style (same style/diff color = one crew),
+          // instead of just the first run (which under-counted multi-style lines).
+          newTargets[line.lineNo] = sumTargetByStyle(lineRuns, (r) => r.realtimeTarget);
+
+          // Line RT efficiency: weighted numerator / target deduped per style.
+          const lineTargets = sumTargetByStyle(
+            lineRuns.filter((r) => r.realtimeTarget > 0 && r.realtimeEff !== null),
+            (r) => r.realtimeTarget
+          );
           const lineEff = lineTargets > 0 ? lineWeightedEff / lineTargets : 0;
           newRealtimeEfficiencies[line.lineNo] = Math.round(lineEff * 100) / 100;
         } else {
           newTargets[line.lineNo] = 0;
           newRealtimeEfficiencies[line.lineNo] = 0;
         }
-        
-        // Calculate overall efficiency for the line using weighted average
-        let lineTotalSAMOutput = 0;
-        let lineTotalAvailableMinutes = 0;
-        for (const run of lineRuns) {
-          const sewed = calculateFinishedGarments(run);
-          const operatorsCount = run.run?.operators_count || 0;
-          const workingHours = run.run?.working_hours || 0;
-          const sam = run.run?.sam_minutes || 0;
-          lineTotalSAMOutput += sewed * sam;
-          lineTotalAvailableMinutes += operatorsCount * workingHours * 60;
-        }
-        const efficiency = lineTotalAvailableMinutes > 0 ? (lineTotalSAMOutput / lineTotalAvailableMinutes) * 100 : 0;
+
+        // Line daily efficiency: SAM output sums across colors (production), but
+        // crew capacity (available minutes) is counted once per style.
+        const lineTotalSAMOutput = lineRuns.reduce(
+          (s, r) => s + calculateFinishedGarments(r) * (r.run?.sam_minutes || 0),
+          0
+        );
+        const lineTotalAvailableMinutes = sumTargetByStyle(lineRuns, (r) => {
+          const o = r.run?.operators_count || 0;
+          const h = r.run?.working_hours || 0;
+          const sm = r.run?.sam_minutes || 0;
+          return o > 0 && h > 0 && sm > 0 ? o * h * 60 : 0;
+        });
+        const efficiency = lineTotalAvailableMinutes > 0
+          ? (lineTotalSAMOutput / lineTotalAvailableMinutes) * 100
+          : 0;
         newEfficiencies[line.lineNo] = Math.round(efficiency * 100) / 100;
         
       } catch (err) {
@@ -362,8 +388,10 @@ useEffect(() => {
     
     const targetSum = Object.values(newTargets).reduce((a, b) => a + b, 0);
     setGlobalRealtimeTarget(targetSum);
-    
-    // Calculate global real-time efficiency using weighted average
+
+    // Global RT efficiency: denominator sums one realtime target per (line, style)
+    // — color splits share one crew — while the numerator stays per run.
+    const globalTargets = [...rtWeightTargetByLineStyle.values()].reduce((a, b) => a + b, 0);
     const globalEff = globalTargets > 0 ? globalWeightedEff / globalTargets : 0;
     setGlobalRealtimeEfficiency(Math.round(globalEff * 100) / 100);
     
@@ -388,9 +416,9 @@ useEffect(() => {
     const headers = { Authorization: `Bearer ${token}` };
     try {
       const [summaryRes, lineRes, assignmentsRes] = await Promise.all([
-        axios.get(`${API_BASE}/api/supervisor/summary?date=${selectedDate}`, { headers }),
-        axios.get(`${API_BASE}/api/supervisor/line-performance?date=${selectedDate}`, { headers }),
-        axios.get(`${API_BASE}/api/supervisor/assignments?date=${selectedDate}`, { headers })
+        axios.get(`http://localhost:5000/api/supervisor/summary?date=${selectedDate}`, { headers }),
+        axios.get(`http://localhost:5000/api/supervisor/line-performance?date=${selectedDate}`, { headers }),
+        axios.get(`http://localhost:5000/api/supervisor/assignments?date=${selectedDate}`, { headers })
       ]);
       if (summaryRes.data.success) setSummary(summaryRes.data.summary);
       if (lineRes.data.success) setLineData(lineRes.data.lines);
@@ -649,73 +677,111 @@ useEffect(() => {
                       return numA - numB;
                     });
                     
-                    // Map to chart data with proper aggregation
+                    // Map to chart data with proper aggregation.
+                    // Same style/different color = one crew: target and capacity
+                    // count once per style; production (Cosido) sums across colors.
                     return sortedLineNos.map(lineNo => {
                       // Get all runs for this line
                       const runs = lineRunData[lineNo] || [];
-                      
-                      // Aggregate totals across all styles/runs for this line
-                      const aggregatedData = runs.reduce((acc, run) => {
-                        const sewed = calculateFinishedGarments(run);
-                        const realtimeTarget = computeRealtimeTarget(run, date);
-                        const realtimeEff = calculateRealtimeEfficiency(run, date);
-                        const operatorsCount = run.run?.operators_count || 0;
-                        const workingHours = run.run?.working_hours || 0;
-                        const sam = run.run?.sam_minutes || 0;
-                        const totalSAMOutput = sewed * sam;
-                        const availableMinutes = operatorsCount * workingHours * 60;
-                        
+
+                      // Tooltip breakdown, grouped into crews: same style/different
+                      // color = one row ("DAMCHA01 · NEG / BLA"). Production sums
+                      // across colors; target and capacity count once.
+                      const crewMap = new Map();
+                      for (const run of runs) {
+                        const key = String(run.style ?? '');
+                        if (!crewMap.has(key)) crewMap.set(key, []);
+                        crewMap.get(key).push(run);
+                      }
+                      const styles = [...crewMap.entries()].map(([style, groupRuns]) => {
+                        const colors = groupRuns
+                          .map(r => r.run?.color || r.color || '')
+                          .filter(Boolean);
+
+                        // Production sums across colors
+                        const sewed = groupRuns.reduce((s, r) => s + calculateFinishedGarments(r), 0);
+
+                        // One crew → target/capacity counted once (max across colors)
+                        const realtimeTarget = groupRuns.reduce(
+                          (m, r) => Math.max(m, computeRealtimeTarget(r, date)), 0
+                        );
+                        const samOutput = groupRuns.reduce(
+                          (s, r) => s + calculateFinishedGarments(r) * (r.run?.sam_minutes || 0), 0
+                        );
+                        const availableMinutes = groupRuns.reduce((m, r) => {
+                          const o = r.run?.operators_count || 0;
+                          const h = r.run?.working_hours || 0;
+                          const sm = r.run?.sam_minutes || 0;
+                          return Math.max(m, (o > 0 && h > 0 && sm > 0) ? o * h * 60 : 0);
+                        }, 0);
+                        const efficiency = availableMinutes > 0 ? (samOutput / availableMinutes) * 100 : 0;
+
+                        // Realtime eff: target-weighted, denominator deduped (one crew)
+                        const rtValid = groupRuns
+                          .map(r => ({ e: calculateRealtimeEfficiency(r, date), t: computeRealtimeTarget(r, date) }))
+                          .filter(x => x.e !== null && x.t > 0);
+                        const rtNum = rtValid.reduce((s, x) => s + x.e * x.t, 0);
+                        const rtDen = rtValid.length ? Math.max(...rtValid.map(x => x.t)) : 0;
+                        const realtimeEfficiency = rtDen > 0 ? rtNum / rtDen : null;
+
                         return {
-                          totalSewed: acc.totalSewed + sewed,
-                          realtimeTarget: acc.realtimeTarget + realtimeTarget,
-                          realtimeEfficiency: acc.realtimeEfficiency + (realtimeEff !== null ? realtimeEff : 0),
-                          totalSAMOutput: acc.totalSAMOutput + totalSAMOutput,
-                          availableMinutes: acc.availableMinutes + availableMinutes,
-                          operatorCount: acc.operatorCount + operatorsCount,
-                          runCount: acc.runCount + 1,
-                          // Store individual style data for tooltip
-                          styles: [...acc.styles, {
-                            name: run.style,
-                            sewed,
-                            realtimeTarget,
-                            realtimeEfficiency: realtimeEff,
-                            efficiency: availableMinutes > 0 ? (totalSAMOutput / availableMinutes) * 100 : 0,
-                            sam,
-                            operators: operatorsCount
-                          }]
+                          name: style,
+                          colors,
+                          label: colors.length ? `${style} · ${colors.join(' / ')}` : style,
+                          sewed,
+                          realtimeTarget,
+                          realtimeEfficiency,
+                          efficiency,
                         };
-                      }, {
-                        totalSewed: 0,
-                        realtimeTarget: 0,
-                        realtimeEfficiency: 0,
-                        totalSAMOutput: 0,
-                        availableMinutes: 0,
-                        operatorCount: 0,
-                        runCount: 0,
-                        styles: []
                       });
 
-                      // Calculate weighted average efficiency for the line
-                      const efficiency = aggregatedData.availableMinutes > 0 
-                        ? (aggregatedData.totalSAMOutput / aggregatedData.availableMinutes) * 100 
+                      // Production sums across every color
+                      const totalSewed = runs.reduce((s, run) => s + calculateFinishedGarments(run), 0);
+
+                      // Objetivo (ahora): one realtime target per style
+                      const realtimeTarget = sumTargetByStyle(runs, run => computeRealtimeTarget(run, date));
+
+                      // Daily efficiency: SAM output per run / crew capacity per style
+                      const totalSAMOutput = runs.reduce(
+                        (s, run) => s + calculateFinishedGarments(run) * (run.run?.sam_minutes || 0),
+                        0
+                      );
+                      const availableMinutes = sumTargetByStyle(runs, run => {
+                        const o = run.run?.operators_count || 0;
+                        const h = run.run?.working_hours || 0;
+                        const sm = run.run?.sam_minutes || 0;
+                        return o > 0 && h > 0 && sm > 0 ? o * h * 60 : 0;
+                      });
+                      const efficiency = availableMinutes > 0
+                        ? (totalSAMOutput / availableMinutes) * 100
                         : 0;
-                      
-                      // Average real-time efficiency across runs (only count non-null values)
-                      const validRealtimeEffs = aggregatedData.styles
-                        .filter(s => s.realtimeEfficiency !== null)
-                        .map(s => s.realtimeEfficiency);
-                      const avgRealtimeEfficiency = validRealtimeEffs.length > 0 
-                        ? validRealtimeEffs.reduce((a, b) => a + b, 0) / validRealtimeEffs.length
-                        : productionEnded ? efficiency : 0;
+
+                      // Realtime efficiency: target-weighted, denominator deduped per style
+                      const rtValid = runs.filter(run => {
+                        const rtE = calculateRealtimeEfficiency(run, date);
+                        const rtT = computeRealtimeTarget(run, date);
+                        return rtE !== null && rtT > 0;
+                      });
+                      const rtNumerator = rtValid.reduce(
+                        (s, run) => s + calculateRealtimeEfficiency(run, date) * computeRealtimeTarget(run, date),
+                        0
+                      );
+                      const rtDenominator = sumTargetByStyle(rtValid, run => computeRealtimeTarget(run, date));
+                      const avgRealtimeEfficiency = rtDenominator > 0
+                        ? rtNumerator / rtDenominator
+                        : (productionEnded ? efficiency : 0);
+
+                      // Count distinct styles (a color split is one style)
+                      const uniqueStyles = [...new Set(runs.map(r => r.style).filter(Boolean))];
 
                       return {
                         lineNo: lineNo,
-                        totalSewed: aggregatedData.totalSewed,
-                        realtimeTarget: aggregatedData.realtimeTarget,
+                        totalSewed,
+                        realtimeTarget,
                         efficiency: Math.round(efficiency * 100) / 100,
                         realtimeEfficiency: Math.round(avgRealtimeEfficiency * 100) / 100,
-                        styleCount: runs.length,
-                        styles: aggregatedData.styles.sort((a, b) => a.name.localeCompare(b.name))
+                        styleCount: uniqueStyles.length,
+                        styles: styles.sort((a, b) => (a.name || '').localeCompare(b.name || ''))
                       };
                     });
                   })()}
@@ -767,7 +833,7 @@ useEffect(() => {
                             {data.styles.map((style, idx) => (
                               <div key={idx} className="mb-4 last:mb-0">
                                 <p className="font-semibold text-gray-800 text-base mb-2">
-                                  {style.name}
+                                  {style.label || style.name}
                                 </p>
                                 <div className="grid grid-cols-2 gap-3">
                                   <div className="bg-purple-50 p-3 rounded-lg">
@@ -933,29 +999,80 @@ useEffect(() => {
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-              {Object.entries(lineRunData).map(([lineNo, runs]) => (
-                runs.map((run, idx) => {
-                  const realtimeTarget = computeRealtimeTarget(run, date);
-                  const sewed = calculateFinishedGarments(run);
-                  const realtimeEff = calculateRealtimeEfficiency(run, date);
-                  const dailyEff = calculateDailyEfficiency(run);
-                  
+              {Object.entries(lineRunData).map(([lineNo, runs]) => {
+                // Group this line's runs by style → one crew card per style.
+                // Same style/different color share ONE crew: target and capacity
+                // count once, production (Cosido) sums across colors.
+                const crewMap = new Map();
+                for (const run of runs) {
+                  const key = String(run.style ?? '');
+                  if (!crewMap.has(key)) crewMap.set(key, []);
+                  crewMap.get(key).push(run);
+                }
+
+                const crews = [...crewMap.entries()].map(([style, groupRuns]) => {
+                  const colors = groupRuns
+                    .map(r => r.run?.color || r.color || '')
+                    .filter(Boolean);
+
+                  // Production sums across colors
+                  const sewed = groupRuns.reduce((s, r) => s + calculateFinishedGarments(r), 0);
+
+                  // One crew → target and capacity counted once (max across colors,
+                  // which are identical; max guards a stray 0/partial).
+                  const realtimeTarget = groupRuns.reduce(
+                    (m, r) => Math.max(m, computeRealtimeTarget(r, date)), 0
+                  );
+                  const samOutput = groupRuns.reduce(
+                    (s, r) => s + calculateFinishedGarments(r) * (r.run?.sam_minutes || 0), 0
+                  );
+                  const availableMinutes = groupRuns.reduce((m, r) => {
+                    const o = r.run?.operators_count || 0;
+                    const h = r.run?.working_hours || 0;
+                    const sm = r.run?.sam_minutes || 0;
+                    return Math.max(m, (o > 0 && h > 0 && sm > 0) ? o * h * 60 : 0);
+                  }, 0);
+                  const dailyEff = availableMinutes > 0 ? (samOutput / availableMinutes) * 100 : 0;
+
+                  // Realtime efficiency: target-weighted with a single (deduped) crew target.
+                  const rtValid = groupRuns
+                    .map(r => ({ e: calculateRealtimeEfficiency(r, date), t: computeRealtimeTarget(r, date) }))
+                    .filter(x => x.e !== null && x.t > 0);
+                  const rtNum = rtValid.reduce((s, x) => s + x.e * x.t, 0);
+                  const rtDen = rtValid.length ? Math.max(...rtValid.map(x => x.t)) : 0;
+                  const realtimeEff = rtDen > 0 ? rtNum / rtDen : null;
+
+                  return {
+                    style,
+                    colors,
+                    runIds: groupRuns.map(r => r.runId),
+                    sewed,
+                    realtimeTarget,
+                    dailyEff,
+                    realtimeEff,
+                  };
+                });
+
+                return crews.map((crew, idx) => {
+                  const realtimeTarget = crew.realtimeTarget;
+                  const sewed = crew.sewed;
+                  const realtimeEff = crew.realtimeEff;
+                  const dailyEff = crew.dailyEff;
+
                   // After 5:36 PM, show daily efficiency instead of real-time
                   const displayEfficiency = productionEnded ? dailyEff : (realtimeEff !== null ? realtimeEff : dailyEff);
                   const efficiencyLabel = productionEnded ? 'Efficiency' : 'Eff RT';
-                  
+
                   const variance = sewed - realtimeTarget;
                   const variancePct = realtimeTarget > 0 ? (variance / realtimeTarget) * 100 : 0;
                   const status = getLineStatus(variancePct, realtimeTarget);
-                  const achievementPct = realtimeTarget > 0 ? (sewed / realtimeTarget) * 100 : 0;
-                  
-                  // Calculate efficiency for this specific run
-                  const operatorsCount = run.run?.operators_count || 0;
-                  const workingHours = run.run?.working_hours || 0;
-                  const sam = run.run?.sam_minutes || 0;
-                  const availableMinutes = operatorsCount * workingHours * 60;
-                  const totalSAMOutput = sewed * sam;
-                  const efficiency = availableMinutes > 0 ? (totalSAMOutput / availableMinutes) * 100 : 0;
+
+                  // Combined crew label, e.g. "DAMCHA01 · BLA / NEG"
+                  const styleLabel = crew.colors.length
+                    ? `${crew.style} · ${crew.colors.join(' / ')}`
+                    : crew.style;
+                  const firstRunId = crew.runIds[0];
+                  const cardId = `${lineNo}-${crew.style}`;
 
                   const statusColors = {
                     red: 'border-red-500 bg-red-50',
@@ -968,15 +1085,15 @@ useEffect(() => {
 
                   return (
                     <div
-                      key={`${lineNo}-${run.runId}-${idx}`}
-                      onClick={() => navigate(`/admin-dashboard?line=${lineNo}&date=${date}&runId=${run.runId}`)}
-                      onMouseEnter={() => setHoveredCard(`${lineNo}-${run.runId}`)}
+                      key={`${cardId}-${idx}`}
+                      onClick={() => navigate(`/admin-dashboard?line=${lineNo}&date=${date}&runId=${firstRunId}`)}
+                      onMouseEnter={() => setHoveredCard(cardId)}
                       onMouseLeave={() => setHoveredCard(null)}
                       className={`group bg-white rounded-2xl shadow-lg 
                         hover:shadow-2xl transition-all duration-300
                         transform hover:-translate-y-2
                         cursor-pointer overflow-hidden border-2 ${
-                        hoveredCard === `${lineNo}-${run.runId}` ? statusColors[status.color] : 'border-transparent'
+                        hoveredCard === cardId ? statusColors[status.color] : 'border-transparent'
                       }`}
                     >
                       <div className="bg-gradient-to-r from-gray-900 to-gray-800 px-5 py-4">
@@ -984,7 +1101,7 @@ useEffect(() => {
                           <div className="flex items-center gap-2">
                             <span className="text-white text-lg font-bold">Línea {lineNo}</span>
                             <span className="text-xs bg-white/20 text-white px-2 py-1 rounded-full">
-                              {run.style}
+                              {styleLabel}
                             </span>
                           </div>
                           <div className="bg-white/20 px-3 py-1 rounded-full">
@@ -1050,8 +1167,8 @@ useEffect(() => {
                       </div>
                     </div>
                   );
-                })
-              ))}
+                });
+              })}
             </div>
           </div>
         )}

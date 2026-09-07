@@ -36,7 +36,8 @@ export default function LoginPage() {
 
       console.log("User role raw:", user?.role, "normalized:", roleNorm);
 
-      if (roleNorm === "lineleader") {
+      if (roleNorm === "lineleader") 
+      {
         navigate("/lineleader", { replace: true });
       } else if (roleNorm === "supervisor") {
         navigate("/admin", { replace: true });
@@ -55,7 +56,17 @@ export default function LoginPage() {
       }else if(roleNorm === "merchant") {
         navigate("/merchant-dashboard", { replace: true });
       }else if(roleNorm === "corte") {
-        navigate("/cutting-dashboard", { replace: true });
+        navigate("/cutting", { replace: true });
+      }else if(roleNorm === "admin") {
+        navigate("/users", { replace: true });
+      }else if(roleNorm === "finishedwarehouse") {
+        navigate("/fws", { replace: true });
+      }else if(roleNorm === "qualityhead") {
+        navigate("/quality-head", { replace: true });
+      }else if(roleNorm === "supermarcado") {
+        navigate("/supermarket-plan", { replace: true });
+      }else if(roleNorm === "verificador") {
+        navigate("/verificador", { replace: true });
       }
       else {
         navigate("/", { replace: true });

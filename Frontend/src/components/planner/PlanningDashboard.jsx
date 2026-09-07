@@ -133,10 +133,10 @@ export default function PlanningDashboard() {
 
   const getStatusColor = (status) => {
     switch (status) {
-      case 'pending': return 'bg-yellow-100 text-yellow-700';
-      case 'assigned': return 'bg-blue-100 text-blue-700';
-      case 'in_progress': return 'bg-purple-100 text-purple-700';
-      case 'completed': return 'bg-green-100 text-green-700';
+      case 'pending': return 'bg-yellow-100 text-yellow-600';
+      case 'assigned': return 'bg-blue-100 text-blue-800';
+      case 'in_progress': return 'bg-purple-100 text-purple-800';
+      case 'completed': return 'bg-green-100 text-green-600';
       default: return 'bg-gray-100 text-gray-700';
     }
   };
@@ -295,7 +295,8 @@ export default function PlanningDashboard() {
                 {/* Work orders assigned to this line on the selected date */}
                 {(() => {
                   const orders = ordersForLine(line.line_no);
-                  if (orders.length === 0) {
+                  if (orders.length === 0)
+                     {
                     return (
                       <p className="mt-2 text-xs text-gray-400 italic">Sin órdenes asignadas este día</p>
                     );

@@ -8,6 +8,10 @@ import OrderStatus from "../components/planner/OrderStatus";
 import CutOrders from "../components/planner/CutOrders";
 import LineAssignmentForm from "../components/planner/LineAssignmentForm";
 import PlanBoard from "../components/planner/PlanBoard";
+import HolidaysManager from "../components/planner/HolidaysManager";
+
+// Tabs that stand on their own — switching to one drops the selected order.
+const STANDALONE_TABS = ["dashboard", "list", "planboard", "status", "cut", "holidays"];
 
 export default function AdvancedPlanningPage() {
   const [activeTab, setActiveTab] = useState("dashboard");
@@ -66,6 +70,7 @@ export default function AdvancedPlanningPage() {
     { id: "planboard", label: "Plan Board", visible: true },
     { id: "status", label: "Estado de Órdenes", visible: true },
     { id: "cut", label: "Corte", visible: true },
+    { id: "holidays", label: "Días Festivos", visible: true },
     // Hidden contextual tabs
     { id: "edit", label: "Editar Orden", visible: woMode === "edit" && selectedWorkOrder !== null },
     { id: "assign", label: "Asignar", visible: woMode === "assign" && selectedWorkOrder !== null },
@@ -111,7 +116,7 @@ export default function AdvancedPlanningPage() {
                   key={tab.id}
                   onClick={() => {
                     // The always-visible tabs are not tied to a selected order.
-                    if (["dashboard", "list", "planboard", "status", "cut"].includes(tab.id)) {
+                    if (STANDALONE_TABS.includes(tab.id)) {
                       clearSelection();
                     }
                     setActiveTab(tab.id);
@@ -138,6 +143,9 @@ export default function AdvancedPlanningPage() {
           {activeTab === "status" && <OrderStatus />}
 
           {activeTab === "cut" && <CutOrders />}
+
+          {/* Non-working days: block them here, the Plan Board honours them */}
+          {activeTab === "holidays" && <HolidaysManager />}
 
           {activeTab === "list" && (
             <WorkOrderList

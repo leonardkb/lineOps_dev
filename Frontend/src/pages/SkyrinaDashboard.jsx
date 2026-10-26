@@ -1,5 +1,5 @@
 // SkyrinaDashboard.jsx
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import NavSkyrina from '../components/NavSkyrina';
@@ -407,7 +407,15 @@ const getStatusBgColor = (color) => {
   return colorMap[color] || 'bg-gray-50';
 };
 
-export default function SkyrinaDashboard() {
+// Roles that can open the dashboard on its own page (/skyrina) vs. the ones
+// that also see it embedded as a tab in Planificación Avanzada.
+const PAGE_ROLES = ['supervisor', 'skyrina'];
+const EMBED_ROLES = ['planner', 'supervisor', 'skyrina', 'master', 'soporte_it'];
+
+// embedded = true -> rendered inside AdvancedPlanningPage as the "Eficiencia"
+// tab: no NavSkyrina, no full-screen shell, compact layout sized to the
+// space left in the window so every line fits without scrolling.
+export default function SkyrinaDashboard({ embedded = false } = {}) {
   const navigate = useNavigate();
   const [user, setUser] = useState(null);
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
@@ -428,10 +436,28 @@ export default function SkyrinaDashboard() {
   const [countdown, setCountdown] = useState(300);
   const [lastRefreshed, setLastRefreshed] = useState(new Date());
 
+  // --- embedded layout: fill the rest of the window, never scroll the page ---
+  const embedRef = useRef(null);
+  const [embedHeight, setEmbedHeight] = useState(640);
+  const [showContrib, setShowContrib] = useState(false);
+  useLayoutEffect(() => {
+    if (!embedded) return undefined;
+    const fit = () => {
+      const el = embedRef.current;
+      if (!el) return;
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      setEmbedHeight(Math.max(460, window.innerHeight - top - 12));
+    };
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  });
+
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) {
-      navigate('/', { replace: true });
+      if (embedded) { setError('Sesión no encontrada. Vuelva a iniciar sesión.'); setLoading(false); }
+      else navigate('/', { replace: true });
       return;
     }
 
@@ -440,7 +466,12 @@ export default function SkyrinaDashboard() {
     })
       .then(res => {
         const user = res.data.user;
-        if (user.role !== 'supervisor' && user.role !== 'skyrina') {
+        if (embedded && !EMBED_ROLES.includes(user.role)) {
+          setError('Su usuario no tiene acceso al tablero de eficiencia.');
+          setLoading(false);
+          return;
+        }
+        if (!embedded && !PAGE_ROLES.includes(user.role)) {
           if (user.role === 'line_leader') {
             navigate('/lineleader', { replace: true });
           } else {
@@ -452,6 +483,11 @@ export default function SkyrinaDashboard() {
         fetchDashboardData(date);
       })
       .catch(() => {
+        if (embedded) {
+          setError('No se pudo validar la sesión.');
+          setLoading(false);
+          return;
+        }
         localStorage.removeItem('token');
         localStorage.removeItem('user');
         navigate('/', { replace: true });
@@ -552,6 +588,9 @@ useEffect(() => {
               runId: run.id,
               style: run.style,
               color: run.color,
+              workOrderId: run.work_order_id ?? null,
+              workOrderNo: run.work_order_no ?? null,
+              workOrderStyle: run.work_order_style ?? null,
               targetPcs: run.target_pcs,
               finishedGarments: finishedGarments,
               realtimeTarget: rtTarget,
@@ -926,6 +965,283 @@ const isProductionEnded = (selectedDate) => {
 // Update the line card rendering section to use the new item properties
 // In the line cards section, make sure you're using item.totalTarget and item.totalFinished
 
+  // ---------------------------------------------------------------------------
+  // Embedded (planner tab) layout — same data, cards and colors as the Skyrina
+  // page, packed to fit the visible area: KPIs on one slim row, the line grid
+  // stretches to fill what's left, and Contribuciones opens as a side panel
+  // instead of sitting below the grid.
+  // ---------------------------------------------------------------------------
+  function renderEmbedded() {
+    const sorted = Object.keys(runDataMap).length > 0 ? prepareSortedLines() : [];
+    const n = sorted.length;
+    const cols = Math.min(10, Math.max(5, Math.ceil(n / 4)));
+    const rows = Math.max(1, Math.ceil(n / cols));
+    const fitsWithoutScroll = rows <= 5;
+    const gridHeight = embedHeight - 44 - 64 - 16; // toolbar + KPI row + gaps
+    const rowHeight = (gridHeight - (rows - 1) * 8) / rows;
+    const roomy = rowHeight >= 140;
+
+    const kpis = summary ? [
+      { label: 'Meta', value: formatNumber(summary.totalTarget) },
+      {
+        label: 'Meta RT',
+        value: formatNumber(globalRealtimeTarget),
+        sub: `${summary.totalTarget > 0 ? ((globalRealtimeTarget / summary.totalTarget) * 100).toFixed(1) : 0}%`,
+      },
+      { label: 'Tot prod', value: formatNumber(summary.totalSewed) },
+      productionEnded
+        ? { label: 'Eff RT', value: 'FIN', cls: 'text-gray-400' }
+        : { label: 'Eff RT', value: `${formatDecimal(globalRealtimeEfficiency)}%`, cls: getEfficiencyColor(globalRealtimeEfficiency) },
+      { label: 'Diario', value: `${formatDecimal(globalDailyEfficiency)}%`, cls: getEfficiencyColor(globalDailyEfficiency) },
+      { label: 'Cump', value: `${formatNumber(summary.targetAchievement)}%` },
+    ] : [];
+
+    return (
+      <div
+        ref={embedRef}
+        style={{ height: embedHeight }}
+        className="relative flex flex-col gap-2 overflow-hidden"
+      >
+        {/* Toolbar */}
+        <div className="flex h-10 shrink-0 items-center gap-3">
+          <h2 className="text-base font-semibold text-gray-900">Eficiencia diaria</h2>
+          <span
+            className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+              productionEnded ? 'bg-gray-100 text-gray-600' : 'bg-green-50 text-green-700'
+            }`}
+          >
+            {productionEnded ? 'Final del día' : '● En vivo'}
+          </span>
+
+          <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
+            <span className="hidden lg:inline">Act. {formatTime(lastRefreshed)}</span>
+            <input
+              type="date"
+              value={date}
+              onChange={handleDateChange}
+              className="h-8 rounded-md border border-gray-300 bg-white px-2 text-sm text-gray-800 focus:border-gray-500 focus:outline-none"
+              aria-label="Fecha"
+            />
+            <button
+              type="button"
+              onClick={toggleAutoRefresh}
+              className={`h-8 rounded-md border px-2.5 font-medium ${
+                autoRefresh ? 'border-green-200 bg-green-50 text-green-700' : 'border-gray-300 bg-white text-gray-600'
+              }`}
+              title="Actualizar automáticamente cada 5 minutos"
+            >
+              {autoRefresh ? `Auto ${formatCountdown(countdown)}` : 'Auto apagado'}
+            </button>
+            <button
+              type="button"
+              onClick={manualRefresh}
+              disabled={loading}
+              className="h-8 rounded-md border border-gray-300 bg-white px-2.5 font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              {loading ? 'Cargando…' : 'Actualizar'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowContrib((v) => !v)}
+              disabled={assignments.length === 0}
+              className={`h-8 rounded-md border px-2.5 font-medium disabled:opacity-40 ${
+                showContrib ? 'border-gray-900 bg-gray-900 text-white' : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+              }`}
+            >
+              Contribuciones ({assignments.length})
+            </button>
+          </div>
+        </div>
+
+        {error && (
+          <div className="shrink-0 rounded-lg border border-red-300 bg-red-50 px-3 py-1.5 text-xs text-red-700">⚠️ {error}</div>
+        )}
+
+        {/* KPI row */}
+        {!loading && summary && (
+          <div className="grid h-16 shrink-0 grid-cols-6 gap-2">
+            {kpis.map((k) => (
+              <div key={k.label} className="flex items-center justify-between rounded-lg border border-gray-200 bg-white px-3 shadow-sm">
+                <span className="text-[11px] font-bold uppercase text-blue-900">{k.label}</span>
+                <span className="text-right">
+                  <span className={`block text-xl font-bold leading-tight ${k.cls || 'text-gray-900'}`}>{k.value}</span>
+                  {k.sub && <span className="block text-[10px] leading-none text-gray-500">{k.sub}</span>}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Line grid — stretches to the remaining height */}
+        <div className={`min-h-0 flex-1 ${fitsWithoutScroll ? 'overflow-hidden' : 'overflow-y-auto'}`}>
+          {loading && (
+            <div className="h-full animate-pulse rounded-lg bg-white p-4">
+              <div className="mb-3 h-5 w-1/4 rounded bg-gray-200" />
+              <div className="h-[80%] rounded bg-gray-100" />
+            </div>
+          )}
+
+          {!loading && n === 0 && (
+            <div className="flex h-full items-center justify-center rounded-lg border border-gray-200 bg-white text-base font-medium text-gray-500">
+              No se encontraron datos para esta fecha
+            </div>
+          )}
+
+          {!loading && n > 0 && (
+            <div
+              className="grid h-full gap-2"
+              style={{
+                gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+                gridTemplateRows: fitsWithoutScroll
+                  ? `repeat(${rows}, minmax(0, 1fr))`
+                  : undefined,
+                gridAutoRows: fitsWithoutScroll ? undefined : '120px',
+              }}
+            >
+              {sorted.map((item) => {
+                const { lineNo, runs, efficiency, displayLabel } = item;
+                const lineTotalFinished = calculateLineTotalFinished(runs);
+                const lineTotalTarget = calculateLineTotalTarget(runs);
+                const uniqueStyles = [...new Set(runs.map((r) => r.style).filter(Boolean))];
+                const runColors = runs.map((r) => r.color).filter(Boolean);
+                const styleLabel =
+                  uniqueStyles.length === 1
+                    ? runColors.length
+                      ? `${uniqueStyles[0]} · ${runColors.join(' / ')}`
+                      : uniqueStyles[0]
+                    : uniqueStyles.join(' / ');
+                const workOrderNos = [...new Set(runs.map((r) => r.workOrderNo).filter(Boolean))];
+                const status = getLineStatus(efficiency);
+                const variance = lineTotalFinished - lineTotalTarget;
+                const variancePercent = lineTotalTarget > 0 ? Math.abs((variance / lineTotalTarget) * 100) : 0;
+                const varCls = variance > 0 ? 'text-green-600' : variance < 0 ? 'text-red-600' : 'text-gray-600';
+
+                return (
+                  <div
+                    key={lineNo}
+                    className={`flex min-h-0 flex-col overflow-hidden rounded-lg border-y border-r border-gray-200 border-l-4 bg-white shadow-sm ${getStatusColor(status.color)}`}
+                    title={[`L${lineNo}`, styleLabel, ...workOrderNos].filter(Boolean).join(' · ')}
+                  >
+                    {/* Header */}
+                    <div className="flex items-center gap-1.5 border-b border-gray-100 bg-gradient-to-r from-gray-50 to-white px-2 py-1">
+                      <span className={`shrink-0 font-bold text-gray-900 ${roomy ? 'text-base' : 'text-sm'}`}>L{lineNo}</span>
+                      {workOrderNos.length > 0 ? (
+                        <span className="flex min-w-0 items-center gap-1">
+                          <span className="min-w-0 truncate rounded bg-gray-100 px-1 py-0.5 text-[10px] font-semibold text-gray-700">
+                            {workOrderNos[0]}
+                          </span>
+                          {workOrderNos.length > 1 && (
+                            <span className="shrink-0 text-[10px] text-gray-400">+{workOrderNos.length - 1}</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="text-[10px] italic text-gray-300">Sin orden</span>
+                      )}
+                      <span className={`ml-auto shrink-0 rounded-full px-1 text-[10px] ${getStatusBgColor(status.color)}`}>
+                        {status.icon}
+                      </span>
+                    </div>
+
+                    {/* Body */}
+                    <div className="flex min-h-0 flex-1 flex-col justify-between gap-1 px-2 py-1">
+                      <div className="truncate text-[11px] font-medium text-gray-600">{styleLabel || '—'}</div>
+
+                      <div>
+                        <div className="flex items-baseline justify-between">
+                          <span className="text-[10px] text-gray-500">{displayLabel}</span>
+                          <span className={`font-bold leading-none ${roomy ? 'text-2xl' : 'text-lg'} ${getEfficiencyColor(efficiency)}`}>
+                            {efficiency.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="mt-1 h-1.5 w-full rounded-full bg-gray-200">
+                          <div
+                            className={`h-1.5 rounded-full transition-all duration-500 ${getProgressBarColor(efficiency)}`}
+                            style={{ width: `${Math.min(efficiency, 100)}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-1 text-center leading-tight">
+                        <div>
+                          <div className="text-[9px] text-gray-500">Obj RT</div>
+                          <div className="text-xs font-bold text-gray-900">{formatNumber(lineTotalTarget)}</div>
+                        </div>
+                        <div>
+                          <div className="text-[9px] text-gray-500">Cosido</div>
+                          <div className="text-xs font-bold text-gray-900">{formatNumber(lineTotalFinished)}</div>
+                        </div>
+                        <div>
+                          <div className="text-[9px] text-gray-500">Var {variancePercent.toFixed(0)}%</div>
+                          <div className={`font-mono text-xs font-bold ${varCls}`}>
+                            {variance > 0 ? '↑+' : variance < 0 ? '↓' : '→'}{formatNumber(Math.abs(variance))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Contribuciones — side panel over the grid */}
+        {showContrib && assignments.length > 0 && (
+          <div className="absolute bottom-0 right-0 top-12 z-20 flex w-[380px] max-w-full flex-col rounded-lg border border-gray-200 bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-gray-100 px-3 py-2">
+              <span className="text-sm font-bold text-gray-900">Contribuciones</span>
+              <button
+                type="button"
+                onClick={() => setShowContrib(false)}
+                className="rounded px-2 py-0.5 text-xs text-gray-500 hover:bg-gray-100"
+              >
+                Cerrar
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white">
+                  <tr className="border-b border-gray-200 text-gray-500">
+                    <th className="px-3 py-2 text-left">Línea</th>
+                    <th className="px-3 py-2 text-left">Operador lento</th>
+                    <th className="px-3 py-2 text-left">Ayudado por</th>
+                    <th className="px-3 py-2 text-right">Piezas</th>
+                  </tr>
+                </thead>
+                <tbody className="text-gray-900">
+                  {assignments.map((a, idx) => (
+                    <tr key={idx} className="border-b border-gray-100">
+                      <td className="px-3 py-1.5">{a.line_no}</td>
+                      <td className="px-3 py-1.5">
+                        {a.source_operator_no} {a.source_operator_name ? `(${a.source_operator_name})` : ''}
+                      </td>
+                      <td className="px-3 py-1.5">
+                        {a.target_operator_no} {a.target_operator_name ? `(${a.target_operator_name})` : ''}
+                      </td>
+                      <td className="px-3 py-1.5 text-right font-bold">{Math.round(a.total_helped_pieces)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (!user && embedded) {
+    return (
+      <div className="rounded-xl border border-gray-200 bg-white p-8 text-center text-sm text-gray-500">
+        {error ? <span className="text-red-600">⚠️ {error}</span> : 'Cargando eficiencia diaria…'}
+      </div>
+    );
+  }
+
+  if (embedded) {
+    return renderEmbedded();
+  }
+
   if (!user) {
     return (
       <div className="flex justify-center items-center h-screen bg-gradient-to-br from-gray-50 to-gray-100">
@@ -1042,6 +1358,13 @@ const isProductionEnded = (selectedDate) => {
                     ? `${uniqueStyles[0]} · ${runColors.join(" / ")}`
                     : uniqueStyles[0]
                   : uniqueStyles.join(" / ");
+
+              // Work order(s) the line is producing for. A line can run several
+              // orders (multiple styles/colors), so dedupe and list them. Comes
+              // from line_runs.work_order_id -> work_orders (see batch endpoint).
+              const workOrderNos = [
+                ...new Set(runs.map((r) => r.workOrderNo).filter(Boolean)),
+              ];
               
               const displayEfficiency = efficiency;
               const status = getLineStatus(displayEfficiency);
@@ -1064,13 +1387,33 @@ const isProductionEnded = (selectedDate) => {
                     ${hoveredCard === cardId ? 'shadow-lg scale-[1.01]' : ''}`}
                 >
                   <div className="px-2 py-1.5 border-b border-gray-100 bg-gradient-to-r from-gray-50 to-white">
-                    <div className="flex justify-between items-center mb-0.5">
-                      <span className="font-bold text-base text-gray-900">L{lineNo}</span>
-                      <div className={`px-1.5 py-0.5 rounded-full text-[10px] font-medium ${getStatusBgColor(status.color)}`}>
+                    <div className="flex justify-between items-start gap-1 mb-0.5">
+                      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 min-w-0">
+                        <span className="font-bold text-base text-gray-900 shrink-0">L{lineNo}</span>
+                        {workOrderNos.length > 0 ? (
+                          <span className="flex flex-wrap items-center gap-1 min-w-0">
+                            <span className="text-gray-400 text-[10px] font-semibold shrink-0">WO</span>
+                            {workOrderNos.map((no) => (
+                              <span
+                                key={no}
+                                className="min-w-0 max-w-full truncate px-1.5 py-0.5 rounded bg-gray-100 text-[10px] font-semibold text-gray-700"
+                                title={no}
+                              >
+                                {no}
+                              </span>
+                            ))}
+                          </span>
+                        ) : (
+                          <span className="text-[10px] font-medium text-gray-300 italic shrink-0">
+                            Sin orden
+                          </span>
+                        )}
+                      </div>
+                      <div className={`px-1.5 py-0.5 rounded-full text-[10px] font-medium shrink-0 ${getStatusBgColor(status.color)}`}>
                         {status.icon}
                       </div>
                     </div>
-                    
+
                     <div className="text-xs font-medium text-gray-600 truncate" title={styleLabel}>
                       {styleLabel}
                     </div>

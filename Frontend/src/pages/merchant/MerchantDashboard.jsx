@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Hash, Users, Shirt, ClipboardList, RefreshCw, Check, AlertCircle, Search, Factory, Layers, Gauge, PackageCheck, FileText } from "lucide-react";
+import { Hash, Users, Shirt, ClipboardList, RefreshCw, Check, AlertCircle, Search, Factory, Layers, Gauge, PackageCheck, FileText, CheckCircle2, AlertTriangle, CalendarClock, MinusCircle, ArrowUpDown, Truck, Info, Scissors } from "lucide-react";
 import StatCard from "../../components/merchant/StatCard";
 import FilterBar from "../../components/merchant/Filterbar";
 import MasterCodeCard from "../../components/merchant/MasterCodeCard";
@@ -10,6 +10,7 @@ import WorkOrderTable from "../../components/merchant/WorkOrderTable";
 import WorkOrderEditModal from "../../components/merchant/WorkOrderEditModal";
 import MerchantPlanner from "../../components/merchant/MerchantPlanner";
 import PreOrdenesPanel from "../../components/merchant/PreOrdenesPanel";
+import StylesTab from "../../components/merchant/StylesTab";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import MerchantNavbar from "../../components/merchant/MerchantNavbar";
 
@@ -79,15 +80,18 @@ const DEMO_ANALYTICS = {
     { id: 1, work_order_no: "SKM0001-INV-DAMPAN01", customer_name: "Inverdibol", customer_po: "PO-5521",
       style_code: "DAMPAN01", estilo: "FN2808", color: "NEG, BLA", status: "in_progress",
       target_quantity: 780, assigned_quantity: 780, produced_quantity: 420,
-      assigned: true, assigned_lines: "1, 3", assigned_days: 2, first_assigned_day: "2026-08-04" },
+      assigned: true, assigned_lines: "1, 3", assigned_days: 2,
+      first_assigned_day: "2026-08-04", last_assigned_day: "2026-08-06", commitment_date: "2026-08-15" },
     { id: 3, work_order_no: "SKM0003-INV-CABTSH02", customer_name: "Inverdibol", customer_po: "PO-5540",
       style_code: "CABTSH02", estilo: "FN3110", color: "BLA", status: "completed",
       target_quantity: 500, assigned_quantity: 500, produced_quantity: 500,
-      assigned: true, assigned_lines: "2", assigned_days: 3, first_assigned_day: "2026-07-28" },
+      assigned: true, assigned_lines: "2", assigned_days: 3,
+      first_assigned_day: "2026-07-28", last_assigned_day: "2026-07-30", commitment_date: "2026-07-25" },
     { id: 2, work_order_no: "SKM0002-ZAR-NNALEG03", customer_name: "Zara México", customer_po: "ZR-118",
       style_code: "NNALEG03", estilo: "KD1201", color: "ROS", status: "pending",
       target_quantity: 300, assigned_quantity: 0, produced_quantity: 0,
-      assigned: false, assigned_lines: null, assigned_days: 0, first_assigned_day: null },
+      assigned: false, assigned_lines: null, assigned_days: 0,
+      first_assigned_day: null, last_assigned_day: null, commitment_date: "2026-08-30" },
   ],
 };
 
@@ -129,13 +133,106 @@ function ProducedVsAssigned({ produced, assigned, target }) {
   );
 }
 
+/* ---- Fechas de plan vs entrega del merchant ------------------------------ */
+// Mismos criterios que el panel del CEO (Analíticas → Estado de órdenes):
+// inicio/fin de plan = mín/máx assigned_date; entrega = commitment_date.
+const DEAD = new Set(["cancelled", "rejected"]);
+const ymd = (s) => (s ? String(s).slice(0, 10) : "");
+const fmtDate = (s) => {
+  const k = ymd(s);
+  if (!k) return null;
+  const d = new Date(`${k}T00:00:00`);
+  return isNaN(d) ? null : d.toLocaleDateString("es-MX", { day: "2-digit", month: "short", year: "2-digit" });
+};
+const daysBetween = (aStr, bStr) => {
+  const a = new Date(`${ymd(aStr)}T00:00:00`);
+  const b = new Date(`${ymd(bStr)}T00:00:00`);
+  if (isNaN(a) || isNaN(b)) return null;
+  return Math.round((b - a) / 86400000);
+};
+
+// Veredicto de entrega: el fin de plan debe caer antes o el mismo día que la
+// fecha de entrega del merchant, si no la orden va atrasada.
+const DELIV = {
+  ontime:  { label: "A tiempo",    accent: "bg-emerald-400", chip: "bg-emerald-50 text-emerald-700 ring-emerald-600/20", Icon: CheckCircle2 },
+  late:    { label: "Atrasada",    accent: "bg-rose-400",    chip: "bg-rose-50 text-rose-700 ring-rose-600/20",          Icon: AlertTriangle },
+  sinplan: { label: "Por planear", accent: "bg-amber-300",   chip: "bg-amber-50 text-amber-700 ring-amber-600/20",       Icon: CalendarClock },
+  nofecha: { label: "Sin fecha",   accent: "bg-slate-200",   chip: "bg-slate-100 text-slate-500 ring-slate-500/20",      Icon: MinusCircle },
+};
+const delivMeta = (d) => DELIV[d] || DELIV.nofecha;
+
+function DeliveryChip({ deliv }) {
+  const cfg = delivMeta(deliv);
+  const Icon = cfg.Icon;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium ring-1 whitespace-nowrap ${cfg.chip}`}>
+      {Icon && <Icon size={13} />}{cfg.label}
+    </span>
+  );
+}
+
+// Δ días: +N (rojo) va atrasada, -N / 0 (verde) va a tiempo, — sin datos.
+function DeltaDays({ delta }) {
+  const tone = delta == null ? "text-slate-300" : delta > 0 ? "text-rose-600" : "text-emerald-600";
+  const text = delta == null ? "—" : delta > 0 ? `+${delta}` : `${delta}`;
+  return <span className={`tabular-nums font-medium ${tone}`}>{text}</span>;
+}
+
+// Barra de distribución con leyenda en línea (a tiempo / atrasadas / por planear).
+function DistributionBar({ segments }) {
+  const total = segments.reduce((s, x) => s + x.count, 0) || 1;
+  return (
+    <div className="flex items-center gap-3 flex-1 min-w-[220px]">
+      <div className="flex-1 h-2.5 rounded-full overflow-hidden bg-slate-100 flex">
+        {segments.map((s, i) => (
+          <span key={i} className={s.cls} style={{ width: `${(s.count / total) * 100}%` }} title={`${s.label}: ${s.count}`} />
+        ))}
+      </div>
+      <div className="flex items-center gap-3 shrink-0 flex-wrap">
+        {segments.map((s, i) => (
+          <span key={i} className="inline-flex items-center gap-1.5 text-[11px] text-slate-500">
+            <span className={`w-2 h-2 rounded-full ${s.cls}`} />{s.label}<b className="text-slate-700 tabular-nums">{s.count}</b>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Filtro segmentado compacto (Todas / A tiempo / Atrasadas / Por planear).
+function Segmented({ value, onChange, options }) {
+  return (
+    <div className="inline-flex p-0.5 rounded-lg bg-slate-100 border border-slate-200">
+      {options.map((o) => {
+        const active = value === o.v;
+        const Icon = o.Icon;
+        return (
+          <button
+            key={o.v}
+            type="button"
+            onClick={() => onChange(o.v)}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md transition whitespace-nowrap
+              ${active ? "bg-white text-slate-900 shadow-sm font-medium" : "text-slate-500 hover:text-slate-800"}`}
+          >
+            {Icon && <Icon size={14} />}{o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function MerchantDashboard() {
-  const [tab, setTab] = useState("master"); // "master" | "pre" | "po" | "plan" | "estado"
+  const [tab, setTab] = useState("master"); // "master" | "estilos" | "pre" | "po" | "plan" | "estado"
 
   // Pre-órdenes: el panel se monta al abrir su pestaña, pero los conteos se
   // piden al cargar el dashboard para que el KPI y el badge no salgan en 0.
   const [preCounts, setPreCounts] = useState({ pending: 0, converted: 0, cancelled: 0, all: 0 });
   const [preRefresh, setPreRefresh] = useState(0);
+  // Estilos: count for the badge / KPI (filled on mount, then kept in sync by
+  // the tab itself) and a refresh token the navbar's refresh button bumps.
+  const [styleCount, setStyleCount] = useState(0);
+  const [stylesRefresh, setStylesRefresh] = useState(0);
 
   const [records, setRecords] = useState([]);
   const [orders, setOrders] = useState([]);
@@ -148,6 +245,9 @@ export default function MerchantDashboard() {
   const [analyticsLoading, setAnalyticsLoading] = useState(true);
   const [estadoQuery, setEstadoQuery] = useState("");
   const [estadoStatus, setEstadoStatus] = useState("all");
+  const [estadoDeliv, setEstadoDeliv] = useState("all"); // "all" | "ontime" | "late" | "unplanned"
+  const [estadoWorst, setEstadoWorst] = useState(true);  // más atrasadas primero
+  const [assignments, setAssignments] = useState([]);    // fechas de plan (inicio/fin) por orden
   const [view, setView] = useState("grid"); // "grid" | "table"
   const [selected, setSelected] = useState(null);
   const [editingRecord, setEditingRecord] = useState(null);
@@ -247,6 +347,24 @@ export default function MerchantDashboard() {
     }
   };
 
+  // Asignaciones de línea: dan el inicio (mín. assigned_date) y el fin de plan
+  // (máx. assigned_date) por orden, con los que se compara la fecha de entrega
+  // del merchant. Mismo endpoint de solo lectura que usa el panel del CEO.
+  const fetchAssignments = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/line-assignments`, { headers: authHeaders() });
+      if (!res.ok) {
+        if (res.status === 401) { window.location.href = '/login'; return; }
+        throw new Error(`API error: ${res.status}`);
+      }
+      const data = await res.json();
+      setAssignments(data?.success ? (data.assignments || []) : []);
+    } catch (err) {
+      console.error("Assignments fetch error:", err);
+      setAssignments([]); // el detalle demo ya trae fechas propias para previsualizar
+    }
+  };
+
   // Solo los conteos por estado (el panel trae el detalle cuando se abre).
   const fetchPreCounts = async () => {
     try {
@@ -257,10 +375,28 @@ export default function MerchantDashboard() {
     } catch { /* el dashboard sigue funcionando sin pre-órdenes */ }
   };
 
+  // Conteo de estilos para la pestaña y el KPI, sin tener que abrir la pestaña.
+  const fetchStyleCount = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/style-orders`, { headers: authHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+      setStyleCount((data.orders || []).length);
+    } catch { /* sin backend de estilos: se queda en 0 */ }
+  };
+
+  // La pestaña Estilos avisa cada vez que recarga (al volver del wizard, tras
+  // convertir a pre-orden…). Se aprovecha para refrescar el conteo de
+  // pre-órdenes, que cambia cuando un estilo se convierte.
+  const handleStyleCount = (n) => {
+    setStyleCount(n);
+    fetchPreCounts();
+  };
+
   // Permite entrar directo a una pestaña: /merchant-dashboard?tab=pre
   useEffect(() => {
     const t = new URLSearchParams(window.location.search).get("tab");
-    if (["master", "pre", "po", "estado", "plan"].includes(t)) setTab(t);
+    if (["master", "estilos", "pre", "po", "estado", "plan"].includes(t)) setTab(t);
   }, []);
 
   // Master codes: refetch (debounced) when filters change.
@@ -271,11 +407,12 @@ export default function MerchantDashboard() {
   }, [filters.q, filters.tipo, filters.modelo, filters.cliente]);
 
   // Orders + PO tracking: load once on mount.
-  useEffect(() => { fetchOrders(); fetchAnalytics(); fetchPreCounts(); }, []);
+  useEffect(() => { fetchOrders(); fetchAnalytics(); fetchAssignments(); fetchPreCounts(); fetchStyleCount(); }, []);
 
   const refreshAll = () => {
-    fetchRecords(); fetchOrders(); fetchAnalytics(); fetchPreCounts();
+    fetchRecords(); fetchOrders(); fetchAnalytics(); fetchAssignments(); fetchPreCounts(); fetchStyleCount();
     setPreRefresh((n) => n + 1);          // recarga el panel si está abierto
+    setStylesRefresh((n) => n + 1);       // y la pestaña de estilos
   };
 
   const filtered = useMemo(() => {
@@ -301,18 +438,93 @@ export default function MerchantDashboard() {
     );
   }, [orders, poQuery]);
 
-  const estadoRows = useMemo(() => {
+  // Inicio/fin de producción por orden. El planner fija planned_start_date /
+  // planned_end_date al asignar la orden (y los expande mín.→máx. si abarca
+  // varios días); si faltaran, se cae a la fecha asignada. Sin canceladas/rechazadas.
+  const planByWo = useMemo(() => {
+    const m = new Map();
+    for (const a of assignments) {
+      if (DEAD.has(String(a.status || "").toLowerCase())) continue;
+      const no = String(a.work_order_no || "").trim().toUpperCase();
+      if (!no) continue;
+      const ad = ymd(a.assigned_date);
+      const startC = ymd(a.planned_start_date) || ad;  // día en que arranca producción
+      const finishC = ymd(a.planned_end_date) || ad;   // día en que termina
+      if (!startC && !finishC) continue;
+      let p = m.get(no);
+      if (!p) { p = { start: startC || finishC, finish: finishC || startC }; m.set(no, p); }
+      if (startC && (!p.start || startC < p.start)) p.start = startC;
+      if (finishC && (!p.finish || finishC > p.finish)) p.finish = finishC;
+    }
+    return m;
+  }, [assignments]);
+
+  // Fecha de entrega del merchant (commitment_date) por orden, desde las POs ya cargadas.
+  const commitmentByWo = useMemo(() => {
+    const m = new Map();
+    for (const o of orders) {
+      const no = String(o.work_order_no || "").trim().toUpperCase();
+      if (no && o.commitment_date) m.set(no, ymd(o.commitment_date));
+    }
+    return m;
+  }, [orders]);
+
+  // Detalle enriquecido con inicio de producción, fin, entrega del merchant, Δ días
+  // y veredicto. Se prefieren los campos que ya trae el detalle; si no, se derivan
+  // de las asignaciones/POs. planned_start_date es el día en que arranca producción.
+  const estadoBase = useMemo(() => {
     const rows = analytics?.detail || [];
-    const q = estadoQuery.trim().toUpperCase();
-    return rows.filter((r) => {
-      if (estadoStatus !== "all" && r.status !== estadoStatus) return false;
-      if (q) {
-        const hay = `${r.work_order_no} ${r.customer_name || ""} ${r.customer_po || ""} ${r.style_code || ""} ${r.estilo || ""} ${r.color || ""}`.toUpperCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
+    return rows.map((r) => {
+      const no = String(r.work_order_no || "").trim().toUpperCase();
+      const plan = planByWo.get(no);
+      const planStart = ymd(r.planned_start_date) || ymd(r.first_assigned_day) || plan?.start || "";
+      const planFinish = ymd(r.planned_end_date) || ymd(r.last_assigned_day) || plan?.finish || "";
+      const merchantDate = ymd(r.commitment_date) || commitmentByWo.get(no) || "";
+      let deliv;
+      if (!merchantDate) deliv = "nofecha";
+      else if (!planFinish) deliv = "sinplan";
+      else deliv = daysBetween(merchantDate, planFinish) > 0 ? "late" : "ontime";
+      const delta = merchantDate && planFinish ? daysBetween(merchantDate, planFinish) : null;
+      return { ...r, planStart, planFinish, merchantDate, deliv, delta };
     });
-  }, [analytics, estadoQuery, estadoStatus]);
+  }, [analytics, planByWo, commitmentByWo]);
+
+  const estadoRows = useMemo(() => {
+    const q = estadoQuery.trim().toUpperCase();
+    const rank = { late: 0, sinplan: 1, nofecha: 2, ontime: 3 };
+    return estadoBase
+      .filter((r) => {
+        if (estadoStatus !== "all" && r.status !== estadoStatus) return false;
+        if (estadoDeliv === "late" && r.deliv !== "late") return false;
+        if (estadoDeliv === "ontime" && r.deliv !== "ontime") return false;
+        if (estadoDeliv === "unplanned" && !(r.deliv === "sinplan" || r.deliv === "nofecha")) return false;
+        if (q) {
+          const hay = `${r.work_order_no} ${r.customer_name || ""} ${r.customer_po || ""} ${r.style_code || ""} ${r.estilo || ""} ${r.color || ""}`.toUpperCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      })
+      .slice()
+      .sort((a, b) => {
+        if (rank[a.deliv] !== rank[b.deliv]) return rank[a.deliv] - rank[b.deliv];
+        const da = a.delta == null ? -Infinity : a.delta;
+        const db = b.delta == null ? -Infinity : b.delta;
+        return estadoWorst ? db - da : da - db; // más atrasadas primero
+      });
+  }, [estadoBase, estadoQuery, estadoStatus, estadoDeliv, estadoWorst]);
+
+  // Conteos de entrega para KPIs y barra de distribución (sin canceladas/rechazadas).
+  const delivSummary = useMemo(() => {
+    let ontime = 0, late = 0, pend = 0;
+    for (const r of estadoBase) {
+      if (DEAD.has(String(r.status || "").toLowerCase())) continue;
+      if (r.deliv === "ontime") ontime++;
+      else if (r.deliv === "late") late++;
+      else pend++; // sinplan + nofecha
+    }
+    const judged = ontime + late;
+    return { ontime, late, pend, pct: judged ? Math.round((ontime / judged) * 100) : 0 };
+  }, [estadoBase]);
 
   const estadoSummary = useMemo(() => {
     const rows = analytics?.detail || [];
@@ -436,7 +648,8 @@ export default function MerchantDashboard() {
 
       <main className="max-w-7xl mx-auto px-6 py-8 space-y-6">
         {/* KPIs */}
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
+          <StatCard icon={Scissors} label="Estilos" value={styleCount} />
           <StatCard icon={Hash} label="Códigos maestros" value={stats.total} />
           <StatCard icon={Users} label="Clientes" value={stats.clients} />
           <StatCard icon={Shirt} label="Modelos distintos" value={stats.models} />
@@ -445,8 +658,9 @@ export default function MerchantDashboard() {
         </div>
 
         {/* View switch: master codes vs POs */}
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <TabButton id="master" label="Códigos maestros" count={records.length} />
+          <TabButton id="estilos" label="Estilos" count={styleCount} />
           <TabButton id="pre" label="Pre-órdenes" count={preCounts.pending ?? 0} />
           <TabButton id="po" label="Órdenes de producción" count={orders.length} />
           <TabButton id="estado" label="Seguimiento" count={analytics?.detail?.length ?? 0} />
@@ -502,6 +716,25 @@ export default function MerchantDashboard() {
           </>
         )}
 
+        {/* ---------------- ESTILOS ----------------
+            Crear estilo (número → BOM → tallas → confección → colorway →
+            imagen) y, ya completo: muestras, costeo y convertir a pre-orden.
+            El wizard se abre a pantalla completa sobre el dashboard. */}
+        {tab === "estilos" && (
+          <StylesTab
+            embedded
+            reloadToken={stylesRefresh}
+            onCount={handleStyleCount}
+            // "Órdenes" on a style → the PO tab, searched by the style number
+            // (or by one PO number when a single PO chip was clicked)
+            onOpenOrders={(style, poNo) => {
+              setPoQuery(poNo || style.styleCode || "");
+              setTab("po");
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
+          />
+        )}
+
         {/* ---------------- PRE-ÓRDENES ---------------- */}
         {tab === "pre" && (
           <PreOrdenesPanel
@@ -552,7 +785,15 @@ export default function MerchantDashboard() {
         {/* ---------------- PO TRACKING (estado · líneas · producido vs asignado) ---------------- */}
         {tab === "estado" && (
           <>
-            {/* KPIs for tracking */}
+            {/* KPIs de entrega: fin de plan vs fecha de entrega del merchant */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <StatCard icon={CheckCircle2} label="A tiempo" value={delivSummary.ontime} />
+              <StatCard icon={AlertTriangle} label="Atrasadas" value={delivSummary.late} />
+              <StatCard icon={CalendarClock} label="Por planear" value={delivSummary.pend} />
+              <StatCard icon={Truck} label="% a tiempo" value={`${delivSummary.pct}%`} />
+            </div>
+
+            {/* KPIs de asignación / producción */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               <StatCard icon={ClipboardList} label="POs en seguimiento" value={estadoSummary.total} />
               <StatCard icon={Layers} label="Asignadas a línea" value={`${estadoSummary.assignedPos} / ${estadoSummary.total}`} />
@@ -561,27 +802,61 @@ export default function MerchantDashboard() {
             </div>
 
             {/* Filters */}
-            <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-3 flex flex-col sm:flex-row gap-2">
-              <div className="relative flex-1">
-                <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  value={estadoQuery}
-                  onChange={(e) => setEstadoQuery(e.target.value)}
-                  placeholder="Buscar por N° de orden, cliente, estilo, color…"
-                  className="w-full rounded-lg border border-slate-300 pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+            <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-3 flex flex-col gap-2">
+              <div className="flex flex-col lg:flex-row gap-2 lg:items-center">
+                <Segmented
+                  value={estadoDeliv}
+                  onChange={setEstadoDeliv}
+                  options={[
+                    { v: "all", label: "Todas" },
+                    { v: "ontime", label: "A tiempo", Icon: CheckCircle2 },
+                    { v: "late", label: "Atrasadas", Icon: AlertTriangle },
+                    { v: "unplanned", label: "Por planear", Icon: CalendarClock },
+                  ]}
                 />
+                <div className="relative flex-1 lg:ml-auto lg:max-w-sm">
+                  <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="text"
+                    value={estadoQuery}
+                    onChange={(e) => setEstadoQuery(e.target.value)}
+                    placeholder="Buscar por N° de orden, cliente, estilo, color…"
+                    className="w-full rounded-lg border border-slate-300 pl-9 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+                  />
+                </div>
+                <select
+                  value={estadoStatus}
+                  onChange={(e) => setEstadoStatus(e.target.value)}
+                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-900"
+                >
+                  <option value="all">Todos los estados</option>
+                  {Object.keys(STATUS_META).map((s) => (
+                    <option key={s} value={s}>{STATUS_META[s].label}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setEstadoWorst((v) => !v)}
+                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50"
+                >
+                  <ArrowUpDown size={15} />
+                  {estadoWorst ? "Peores primero" : "Mejores primero"}
+                </button>
               </div>
-              <select
-                value={estadoStatus}
-                onChange={(e) => setEstadoStatus(e.target.value)}
-                className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-slate-900"
-              >
-                <option value="all">Todos los estados</option>
-                {Object.keys(STATUS_META).map((s) => (
-                  <option key={s} value={s}>{STATUS_META[s].label}</option>
-                ))}
-              </select>
+
+              {/* Distribución de entrega + regla */}
+              <div className="flex flex-col md:flex-row md:items-center gap-2 pt-1 border-t border-slate-100">
+                <DistributionBar
+                  segments={[
+                    { count: delivSummary.ontime, cls: "bg-emerald-500", label: "A tiempo" },
+                    { count: delivSummary.late, cls: "bg-rose-500", label: "Atrasadas" },
+                    { count: delivSummary.pend, cls: "bg-amber-300", label: "Por planear" },
+                  ]}
+                />
+                <span className="inline-flex items-center gap-1 text-[11px] text-slate-400 shrink-0">
+                  <Info size={13} /> El fin de plan debe caer <b className="text-slate-600 font-medium">antes o el mismo día</b> que la entrega del merchant.
+                </span>
+              </div>
             </div>
 
             {analyticsLoading ? (
@@ -604,17 +879,24 @@ export default function MerchantDashboard() {
                   <table className="w-full text-sm">
                     <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
                       <tr>
+                        <th className="w-1 p-0" />
                         <th className="px-4 py-3 font-medium">Orden</th>
                         <th className="px-4 py-3 font-medium">Estilo / color</th>
                         <th className="px-4 py-3 font-medium">Estado</th>
                         <th className="px-4 py-3 font-medium">Líneas asignadas</th>
                         <th className="px-4 py-3 font-medium text-right">Asignado</th>
                         <th className="px-4 py-3 font-medium">Producido vs asignado</th>
+                        <th className="px-4 py-3 font-medium text-right">Entrega merchant</th>
+                        <th className="px-4 py-3 font-medium text-right">Inicio prod.</th>
+                        <th className="px-4 py-3 font-medium text-right">Fin de plan</th>
+                        <th className="px-4 py-3 font-medium text-right">Δ días</th>
+                        <th className="px-4 py-3 font-medium text-right">Entrega</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {estadoRows.map((r) => (
                         <tr key={r.id || r.work_order_no} className="align-top hover:bg-slate-50">
+                          <td className={`w-1 p-0 ${delivMeta(r.deliv).accent}`} />
                           <td className="px-4 py-3">
                             <span className="font-mono font-semibold text-slate-800">{r.work_order_no}</span>
                             <span className="block text-[11px] text-slate-400 truncate max-w-[200px]">
@@ -642,6 +924,21 @@ export default function MerchantDashboard() {
                               assigned={r.assigned_quantity}
                               target={r.target_quantity}
                             />
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap tabular-nums text-slate-700">
+                            {fmtDate(r.merchantDate) || <span className="text-slate-300">sin fecha</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap tabular-nums text-slate-700">
+                            {fmtDate(r.planStart) || <span className="text-slate-300">sin asignar</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap tabular-nums text-slate-800">
+                            {fmtDate(r.planFinish) || <span className="text-slate-300">sin plan</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap">
+                            <DeltaDays delta={r.delta} />
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap">
+                            <DeliveryChip deliv={r.deliv} />
                           </td>
                         </tr>
                       ))}

@@ -22,8 +22,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   ScanLine, Camera, CameraOff, RefreshCw, Loader2, AlertCircle, CheckCircle2,
-  Trash2, Package, Boxes, ClipboardList, Clock, ArrowLeft, X,
-  PackageCheck, ShieldCheck, Lock,
+  Trash2, Package, Boxes, ClipboardList, Clock, ArrowLeft, X, PackageCheck,
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 
@@ -90,7 +89,7 @@ function beep(kind = "ok") {
 
 export default function FinishedWarehouseScan({ onNavigate = null }) {
   const [rows, setRows] = useState([]);
-  const [totals, setTotals] = useState({ tickets: 0, pieces: 0 });
+  const [totals, setTotals] = useState({ tickets: 0, pieces: 0, pending: 0, pendingPieces: 0, checkedIn: 0 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -99,9 +98,9 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
   const [flash, setFlash] = useState(null); // { kind: "ok"|"dup"|"err", ticket, msg }
   const [onlyToday, setOnlyToday] = useState(true);
 
-  // Check-in (verificación de piezas -> inventario)
-  const [checkinOpen, setCheckinOpen] = useState(false);
-  const [checkingIn, setCheckingIn] = useState(false);
+  // Check-in a inventario: ticket pendiente de confirmación (null = cerrado) + estado.
+  const [confirmTicket, setConfirmTicket] = useState(null);
+  const [checkinBusy, setCheckinBusy] = useState(false);
 
   const inputRef = useRef(null);
   const submitLock = useRef(false);
@@ -113,7 +112,7 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
       const qs = onlyToday ? `?date=${new Date().toISOString().slice(0, 10)}` : "";
       const d = await api(`/api/finished-warehouse/scanned-tickets${qs}`);
       setRows(d.tickets || []);
-      setTotals(d.totals || { tickets: 0, pieces: 0 });
+      setTotals(d.totals || { tickets: 0, pieces: 0, pending: 0, pendingPieces: 0, checkedIn: 0 });
     } catch (e) {
       setError(e.message || "No se pudieron cargar los tickets");
     } finally {
@@ -160,7 +159,13 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
         beep("ok");
         setFlash({ kind: "ok", ticket: t, msg: "Ticket registrado" });
         setRows((prev) => [{ ...t, _flash: Date.now() }, ...prev.filter((r) => r.id !== t.id)]);
-        setTotals((prev) => ({ tickets: prev.tickets + 1, pieces: prev.pieces + (Number(t.pieces) || 0) }));
+        setTotals((prev) => ({
+          ...prev,
+          tickets: prev.tickets + 1,
+          pieces: prev.pieces + (Number(t.pieces) || 0),
+          pending: (prev.pending || 0) + (t.checked_in_at ? 0 : 1),
+          pendingPieces: (prev.pendingPieces || 0) + (t.checked_in_at ? 0 : (Number(t.pieces) || 0)),
+        }));
       }
     } catch (e) {
       beep("err");
@@ -195,57 +200,49 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
       await api(`/api/finished-warehouse/scanned-tickets/${row.id}`, { method: "DELETE" });
       setRows((prev) => prev.filter((r) => r.id !== row.id));
       setTotals((prev) => ({
+        ...prev,
         tickets: Math.max(0, prev.tickets - 1),
         pieces: Math.max(0, prev.pieces - (Number(row.pieces) || 0)),
+        pending: Math.max(0, (prev.pending || 0) - (row.checked_in_at ? 0 : 1)),
+        pendingPieces: Math.max(0, (prev.pendingPieces || 0) - (row.checked_in_at ? 0 : (Number(row.pieces) || 0))),
+        checkedIn: Math.max(0, (prev.checkedIn || 0) - (row.checked_in_at ? 1 : 0)),
       }));
     } catch (e) {
       setError(e.message || "No se pudo quitar el ticket");
     }
   };
 
-  // Tickets pendientes de verificar (aún no movidos a inventario).
-  const pending = useMemo(() => rows.filter((r) => !r.checked_in), [rows]);
-  const pendingPieces = useMemo(
-    () => pending.reduce((s, r) => s + (Number(r.pieces) || 0), 0),
-    [pending]
-  );
-
-  // Check-in: confirma que las piezas fueron verificadas y las suma al inventario.
-  const doCheckIn = useCallback(async () => {
-    const ids = pending.map((r) => r.id);
-    if (ids.length === 0) return;
-    setCheckingIn(true);
+  // Confirmar la entrada del ticket al inventario. Suma sus piezas al inventario
+  // en el servidor y marca el ticket como ingresado aquí.
+  const doCheckIn = async () => {
+    const t = confirmTicket;
+    if (!t || checkinBusy) return;
+    setCheckinBusy(true);
     try {
-      const d = await api("/api/finished-warehouse/check-in", {
-        method: "POST",
-        body: JSON.stringify({ ids }),
-      });
-      const doneIds = new Set((d.tickets || []).map((t) => t.id));
-      setRows((prev) =>
-        prev.map((r) =>
-          doneIds.has(r.id)
-            ? { ...r, checked_in: true, checked_in_at: new Date().toISOString(), _flash: Date.now() }
-            : r
-        )
-      );
+      const d = await api(`/api/finished-warehouse/scanned-tickets/${t.id}/check-in`, { method: "POST" });
+      const checkedAt = d.ticket?.checked_in_at || new Date().toISOString();
+      const wasAlready = !!d.alreadyCheckedIn;
+      setRows((prev) => prev.map((r) => (r.id === t.id ? { ...r, checked_in_at: checkedAt, _flash: Date.now() } : r)));
       setTotals((prev) => ({
         ...prev,
-        pendingTickets: 0,
-        pendingPieces: 0,
-        checkedInTickets: (prev.checkedInTickets || 0) + (d.checkedIn || 0),
-        checkedInPieces: (prev.checkedInPieces || 0) + (d.pieces || 0),
+        pending: Math.max(0, (prev.pending || 0) - (wasAlready ? 0 : 1)),
+        pendingPieces: Math.max(0, (prev.pendingPieces || 0) - (wasAlready ? 0 : (Number(t.pieces) || 0))),
+        checkedIn: (prev.checkedIn || 0) + (wasAlready ? 0 : 1),
       }));
+      // Si el ticket ingresado es el que muestra la tarjeta de escaneo, refléjalo.
+      setFlash((f) => (f && f.ticket && f.ticket.id === t.id
+        ? { ...f, ticket: { ...f.ticket, checked_in_at: checkedAt } }
+        : f));
       beep("ok");
-      setFlash({ kind: "ok", ticket: null, msg: d.message || `Se verificaron ${d.checkedIn} ticket(s) y se movieron al inventario.` });
-      setCheckinOpen(false);
+      setConfirmTicket(null);
     } catch (e) {
-      beep("err");
-      setFlash({ kind: "err", ticket: null, msg: e.message || "No se pudo completar el check-in." });
+      setError(e.message || "No se pudo registrar la entrada al inventario");
+      setConfirmTicket(null);
     } finally {
-      setCheckingIn(false);
+      setCheckinBusy(false);
       focusInput();
     }
-  }, [pending, focusInput]);
+  };
 
   // Resumen por orden de trabajo (tickets + piezas).
   const byOrder = useMemo(() => {
@@ -279,23 +276,17 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
           <h1 className="text-lg font-semibold text-gray-900">Escaneo de tickets</h1>
           <p className="text-sm text-gray-500">Escanee cada ticket de producción; el sistema registra su información y la hora de escaneo.</p>
         </div>
-        <button
-          onClick={() => setCheckinOpen(true)}
-          disabled={pending.length === 0}
-          title={pending.length === 0 ? "No hay tickets pendientes por verificar" : "Verificar piezas y moverlas al inventario"}
-          className="ml-auto inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-        >
-          <PackageCheck className="w-4 h-4" />
-          Check-in
-          {pending.length > 0 && (
-            <span className="ml-0.5 inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1 rounded-full bg-white/20 text-xs font-bold">
-              {pending.length}
-            </span>
-          )}
-        </button>
+        {onNavigate && (
+          <button
+            onClick={() => onNavigate("inventario")}
+            className="ml-auto inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50"
+          >
+            <Boxes className="w-4 h-4" /> Inventario
+          </button>
+        )}
         <button
           onClick={load}
-          className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50"
+          className={`${onNavigate ? "" : "ml-auto "}inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50`}
         >
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Actualizar
         </button>
@@ -352,6 +343,22 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
                   <span>{num(flash.ticket.pieces)} pzas</span>
                 </div>
               )}
+
+              {/* Check-in a inventario, justo después de un escaneo correcto. */}
+              {flash.ticket && flash.kind !== "err" && (
+                flash.ticket.checked_in_at ? (
+                  <div className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700">
+                    <PackageCheck className="w-4 h-4" /> Ya está en inventario
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmTicket(flash.ticket)}
+                    className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-700"
+                  >
+                    <PackageCheck className="w-4 h-4" /> Ingresar a inventario
+                  </button>
+                )
+              )}
             </div>
             <button onClick={() => setFlash(null)} className="ml-auto text-current/60 hover:text-current">
               <X className="w-4 h-4" />
@@ -361,9 +368,10 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
       </section>
 
       {/* Summary tiles */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <Tile icon={ClipboardList} label={onlyToday ? "Tickets hoy" : "Tickets"} value={totals.tickets} accent="indigo" />
         <Tile icon={Package} label="Piezas escaneadas" value={totals.pieces} accent="emerald" />
+        <Tile icon={PackageCheck} label="Pendientes de entrada" value={totals.pending} accent="amber" />
         <Tile icon={Boxes} label="Órdenes distintas" value={byOrder.length} accent="gray" />
         <div className="bg-white rounded-xl border shadow-sm p-3 flex items-center">
           <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
@@ -425,8 +433,8 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
                   <th className="px-3 py-2 font-medium">Color</th>
                   <th className="px-3 py-2 font-medium">Fecha</th>
                   <th className="px-3 py-2 font-medium">Hora escaneo</th>
-                  <th className="px-3 py-2 font-medium">Estado</th>
                   <th className="px-3 py-2 font-medium text-right">Piezas</th>
+                  <th className="px-3 py-2 font-medium">Estado</th>
                   <th className="px-3 py-2" />
                 </tr>
               </thead>
@@ -453,42 +461,42 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
                         <Clock className="w-3 h-3 text-gray-400" />{fmtTime(r.scanned_at)}
                       </span>
                     </td>
+                    <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">{num(r.pieces)}</td>
                     <td className="px-3 py-2">
-                      {r.checked_in ? (
-                        <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 bg-emerald-50 rounded-full px-2 py-0.5">
+                      {r.checked_in_at ? (
+                        <span className="inline-flex items-center gap-1 text-xs rounded-full px-2 py-0.5 font-medium bg-emerald-50 text-emerald-700">
                           <PackageCheck className="w-3 h-3" /> En inventario
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 rounded-full px-2 py-0.5">
-                          <Clock className="w-3 h-3" /> Pendiente
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">{num(r.pieces)}</td>
-                    <td className="px-3 py-2 text-right">
-                      {r.checked_in ? (
-                        <span className="text-gray-300" title="Verificado — ya está en inventario">
-                          <Lock className="w-4 h-4 inline" />
-                        </span>
-                      ) : (
                         <button
-                          onClick={() => removeRow(r)}
-                          className="text-gray-300 hover:text-red-500"
-                          title="Quitar ticket"
+                          onClick={() => setConfirmTicket(r)}
+                          className="inline-flex items-center gap-1 text-xs rounded-lg px-2 py-1 font-medium bg-emerald-600 text-white hover:bg-emerald-700"
+                          title="Ingresar las piezas de este ticket al inventario"
                         >
-                          <Trash2 className="w-4 h-4" />
+                          <PackageCheck className="w-3.5 h-3.5" /> Check-in
                         </button>
                       )}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        onClick={() => removeRow(r)}
+                        disabled={!!r.checked_in_at}
+                        className="text-gray-300 hover:text-red-500 disabled:opacity-30 disabled:hover:text-gray-300"
+                        title={r.checked_in_at ? "Ya ingresado; no se puede quitar" : "Quitar ticket"}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
                     </td>
                   </tr>
                 ))}
               </tbody>
               <tfoot>
                 <tr className="border-t bg-gray-50/60 text-sm">
-                  <td className="px-3 py-2 font-medium text-gray-500" colSpan={9}>Total</td>
+                  <td className="px-3 py-2 font-medium text-gray-500" colSpan={8}>Total</td>
                   <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">
                     {num(rows.reduce((s, r) => s + (Number(r.pieces) || 0), 0))}
                   </td>
+                  <td />
                   <td />
                 </tr>
               </tfoot>
@@ -497,65 +505,68 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
         )}
       </section>
 
-      {/* Check-in confirmation modal */}
-      {checkinOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-          onClick={() => !checkingIn && setCheckinOpen(false)}
-        >
-          <div
-            className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-start gap-3 p-5 border-b">
-              <div className="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
-                <ShieldCheck className="w-5 h-5" />
-              </div>
-              <div className="min-w-0">
-                <h3 className="text-base font-semibold text-gray-900">Confirmar check-in de piezas</h3>
-                <p className="text-sm text-gray-500 mt-0.5">
-                  Confirme que las piezas de estos tickets fueron <span className="font-medium text-gray-700">verificadas físicamente</span>. Al confirmar, se moverán al inventario de producto terminado.
-                </p>
-              </div>
-            </div>
+      {/* Verificación de entrada a inventario */}
+      {confirmTicket && (
+        <CheckInModal
+          ticket={confirmTicket}
+          busy={checkinBusy}
+          onConfirm={doCheckIn}
+          onCancel={() => !checkinBusy && setConfirmTicket(null)}
+        />
+      )}
+    </div>
+  );
+}
 
-            <div className="p-5 space-y-3">
-              <div className="grid grid-cols-2 gap-3">
-                <div className="rounded-xl border bg-gray-50 p-3">
-                  <div className="text-xs text-gray-500">Tickets por verificar</div>
-                  <div className="mt-1 text-2xl font-semibold text-gray-900">{num(pending.length)}</div>
-                </div>
-                <div className="rounded-xl border bg-emerald-50 p-3">
-                  <div className="text-xs text-emerald-700">Piezas a inventario</div>
-                  <div className="mt-1 text-2xl font-semibold text-emerald-800">{num(pendingPieces)}</div>
-                </div>
-              </div>
-              <div className="flex items-start gap-2 text-xs text-amber-700 bg-amber-50 rounded-lg px-3 py-2">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>Una vez verificados, estos tickets ya no podrán quitarse del registro, porque sus piezas quedarán sumadas al inventario.</span>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-2 p-4 bg-gray-50 border-t">
-              <button
-                onClick={() => setCheckinOpen(false)}
-                disabled={checkingIn}
-                className="px-4 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={doCheckIn}
-                disabled={checkingIn || pending.length === 0}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-700 disabled:bg-gray-300"
-              >
-                {checkingIn ? <Loader2 className="w-4 h-4 animate-spin" /> : <PackageCheck className="w-4 h-4" />}
-                Verificar y mover a inventario
-              </button>
-            </div>
+// Modal de verificación: confirma que las piezas del ticket entren al inventario.
+function CheckInModal({ ticket, busy, onConfirm, onCancel }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={(e) => { e.stopPropagation(); onCancel(); }}
+    >
+      <div
+        className="w-full max-w-sm bg-white rounded-2xl shadow-xl overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 pt-5 pb-3 flex items-start gap-3">
+          <span className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+            <PackageCheck className="w-5 h-5" />
+          </span>
+          <div className="min-w-0">
+            <h3 className="text-base font-semibold text-gray-900">Ingresar a inventario</h3>
+            <p className="text-sm text-gray-500 mt-0.5">
+              Se sumarán <b className="text-gray-900">{num(ticket.pieces)}</b> pzas al inventario de producto terminado.
+            </p>
           </div>
         </div>
-      )}
+
+        <div className="mx-5 mb-1 rounded-lg border bg-gray-50 px-3 py-2 text-xs font-mono text-gray-700 flex flex-wrap gap-x-3 gap-y-0.5">
+          <span className="font-semibold text-gray-900">{ticket.folio || ticket.ticket_no || "—"}</span>
+          {ticket.customer_name && <span>{ticket.customer_name}</span>}
+          <span>OT {ticket.work_order_no || "—"}</span>
+          <span>PO {ticket.customer_po || "—"}</span>
+          <span>{sizeText(ticket)}</span>
+          <span>{ticket.color || "—"}</span>
+        </div>
+
+        <div className="px-5 py-4 flex items-center justify-end gap-2">
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            className="px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+          >
+            Cancelar
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 disabled:bg-emerald-300"
+          >
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} OK
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -653,6 +664,7 @@ function CameraScanner({ onScan }) {
 
 function Tile({ icon: Icon, label, value, accent = "gray" }) {
   const accents = {
+    amber: "text-amber-600 bg-amber-50",
     emerald: "text-emerald-600 bg-emerald-50",
     indigo: "text-indigo-600 bg-indigo-50",
     gray: "text-gray-600 bg-gray-100",

@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import { colorForWO } from "../../lib/workOrderColors";
+import { buildTicketUrl } from "./ticketCode";
 
 /* ======================================================================== */
 /* Helpers compartibles (candidatos a lib/cutting/marcadas.js)              */
@@ -39,6 +40,7 @@ const rnd2 = (v) => num(v).toLocaleString(undefined, { maximumFractionDigits: 2 
 const SIZE_LABELS = {
   "130": "XXXS", "132": "XXS", "134": "XS", "136": "S", "138": "M",
   "140": "L", "142": "XL", "144": "XXL",
+  "146": "XXXL", "148": "S-T", "150": "M-T", "152": "L-T", "154": "XL-T", "156": "2XL-T",
   "004": "I-XS", "006": "S", "008": "M", "010": "L",
 };
 const tallaLabel = (talla) => {
@@ -143,6 +145,8 @@ const buildMarkers = (co) => {
       fabricName: m.fabricName != null ? String(m.fabricName) : (co?.fabric || ""),
       longitud: m.longitud != null ? String(m.longitud) : "",
       yield: m.yield != null ? String(m.yield) : "",
+      efficiency: m.efficiency != null ? String(m.efficiency) : "",
+      comment: m.comment != null ? String(m.comment) : "",
       done: !!m.done,
       completedAt: m.completedAt || null,
       saved: true,
@@ -176,6 +180,8 @@ const serializeMarkers = (list) =>
     longitud: num(m.longitud),
     yield: markerYield(m),
     consumo: markerConsumo(m),
+    efficiency: m.efficiency === "" || m.efficiency == null ? null : num(m.efficiency),
+    comment: (m.comment || "").toString().trim() || null,
     panels: markerPanels(m),
     totalPieces: markerTotal(m),
     done: !!m.done,
@@ -508,6 +514,7 @@ export default function CutVerification() {
     const panelTickets = [];
     const mk = onlyMarker
       ? [{
+          id: onlyMarker.id,
           name: onlyMarker.name,
           fabricCode: onlyMarker.fabricCode,
           fabricName: onlyMarker.fabricName,
@@ -530,10 +537,10 @@ export default function CutVerification() {
           const quantity = pedidoMap.get(String(l.talla)) ?? 0;
           if (panels > 0) {
             for (let i = 1; i <= panels; i++) {
-              panelTickets.push({ talla: l.talla, quantity, panelNo: i, panelCount: panels, pieces: per, marker: m.name, tela: mTela });
+              panelTickets.push({ talla: l.talla, quantity, panelNo: i, panelCount: panels, pieces: per, marker: m.name, markerId: m.id, tela: mTela });
             }
           } else {
-            panelTickets.push({ talla: l.talla, quantity, panelNo: null, panelCount: null, pieces: per, marker: m.name, tela: mTela });
+            panelTickets.push({ talla: l.talla, quantity, panelNo: null, panelCount: null, pieces: per, marker: m.name, markerId: m.id, tela: mTela });
           }
         });
       });
@@ -565,9 +572,15 @@ export default function CutVerification() {
 
     const oneTicket = (t) => {
       const panelTag = t.panelCount ? `P${t.panelNo}/${t.panelCount}` : "";
-      const panelNum = t.panelCount ? `${t.panelNo} / ${t.panelCount}` : "—";
-      const qrData = encodeURIComponent(`${cutNo(co)}|${co.work_order_no || ""}|${co.color || ""}|${t.talla || ""}|${t.marker || ""}|P${t.panelNo || 1}`);
-      const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&margin=0&data=${qrData}`;
+      // QR = enlace a la tarjeta del ticket (TicketCard). Con la cámara del
+      // celular abre una tarjeta pequeña; el escáner de la app también lo lee.
+      const qrData = encodeURIComponent(buildTicketUrl({
+        cutId: co.id, workOrderNo: co.work_order_no, color: co.color, talla: t.talla,
+        marker: t.marker, markerId: t.markerId, panelNo: t.panelNo, panelCount: t.panelCount,
+        pieces: t.pieces,
+      }));
+      // ecc=L: QR menos denso, se lee mejor impreso en térmica a 15 mm.
+      const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=0&ecc=L&data=${qrData}`;
       const telaTxt = t.tela || [co.fabric_code, co.fabric].filter(Boolean).join(" ") || "—";
       return `
       <div class="ticket">
@@ -588,14 +601,17 @@ export default function CutVerification() {
           ${tallaLabel(t.talla) ? `<span class="sz">${esc(tallaLabel(t.talla))}</span>` : ""}
         </div>
 
-        <div class="pieces"><span class="pk">Piezas · panel</span><span class="pv">${rnd(t.pieces)}</span></div>
+        <div class="pieces">
+          <div class="pn"><span class="pk">Panel</span><span class="pnv">${t.panelCount ? `${t.panelNo}<small>/${t.panelCount}</small>` : "—"}</span></div>
+          <div class="pp"><span class="pk">Pzs/panel</span><span class="pv">${rnd(t.pieces)}</span></div>
+        </div>
 
         <div class="grid">
           <div class="c"><span class="l">Color</span><span class="v">${esc(co.color)}</span></div>
           <div class="c"><span class="l">Season</span><span class="v">${esc(co.season || "—")}</span></div>
           <div class="c stack">
             <div><span class="l">Pedido talla</span><span class="v">${rnd(t.quantity)}</span></div>
-            <div><span class="l">Panel</span><span class="v">${esc(panelNum)}</span></div>
+            <div><span class="l">Paneles talla</span><span class="v">${t.panelCount ? rnd(t.panelCount) : "—"}</span></div>
           </div>
           <div class="c"><span class="l">Marcada</span><span class="v">${esc(t.marker || "—")}</span></div>
           <div class="c wide"><span class="l">Tela</span><span class="v">${esc(telaTxt)}</span></div>
@@ -625,7 +641,7 @@ export default function CutVerification() {
         .who { flex:1; min-width:0; }
         .cust { font-size:8pt; font-weight:800; line-height:1.05; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .meta { font-family:ui-monospace,Consolas,monospace; font-size:6pt; color:var(--muted); line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .qr { width:13mm; height:13mm; flex:none; }
+        .qr { width:15mm; height:15mm; flex:none; image-rendering:pixelated; }
 
         .estilo { display:flex; align-items:baseline; gap:1.5mm; border-top:0.3mm solid var(--line); padding-top:0.8mm; }
         .estilo .k { font-size:6pt; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); flex:none; }
@@ -635,9 +651,14 @@ export default function CutVerification() {
         .talla .tv { font-size:13pt; font-weight:700; line-height:1; }
         .talla .sz { font-size:22pt; font-weight:800; line-height:1; border:0.4mm solid var(--line); border-radius:1.2mm; padding:0.2mm 2mm; }
 
-        .pieces { display:flex; align-items:baseline; justify-content:space-between; gap:1mm; border:0.5mm solid var(--line); border-radius:1mm; padding:0.8mm 2mm; }
-        .pieces .pk { font-size:6.5pt; text-transform:uppercase; letter-spacing:.05em; }
-        .pieces .pv { font-size:19pt; font-weight:800; line-height:1; }
+        .pieces { display:flex; align-items:stretch; border:0.5mm solid var(--line); border-radius:1mm; }
+        .pieces > div { flex:1; display:flex; flex-direction:column; justify-content:center; padding:0.5mm 1.5mm; line-height:1; }
+        .pieces .pn { background:#000; color:#fff; }
+        .pieces .pp { align-items:flex-end; }
+        .pieces .pk { font-size:5.5pt; text-transform:uppercase; letter-spacing:.05em; }
+        .pieces .pnv { font-size:16pt; font-weight:800; }
+        .pieces .pnv small { font-size:9pt; font-weight:700; }
+        .pieces .pv { font-size:16pt; font-weight:800; }
 
         .po1 { display:flex; align-items:baseline; gap:1.5mm; border-top:0.3mm solid var(--line); padding-top:0.8mm; }
         .po1 .l { font-size:6pt; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); flex:none; }
@@ -875,22 +896,37 @@ export default function CutVerification() {
                           </div>
                         </div>
 
-                        {/* Longitud · Rendimiento · Consumo (solo lectura) */}
-                        <div className={`px-3 py-2.5 border-b grid grid-cols-3 gap-2 ${locked ? "bg-green-50/40" : "bg-white"}`}>
-                          <div className="block">
-                            <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Longitud (m)</span>
-                            <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-right text-sm font-semibold text-gray-700">{rnd2(m.longitud)}</div>
+                        {/* Longitud · Eficiencia · Rendimiento · Consumo (solo lectura) */}
+                        <div className={`px-3 py-2.5 border-b ${locked ? "bg-green-50/40" : "bg-white"}`}>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            <div className="block">
+                              <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Longitud (m)</span>
+                              <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-right text-sm font-semibold text-gray-700">{rnd2(m.longitud)}</div>
+                            </div>
+                            <div className="block">
+                              <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Eficiencia (%)</span>
+                              <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-right text-sm font-semibold text-gray-700">
+                                {m.efficiency !== "" && m.efficiency != null ? `${rnd2(m.efficiency)}%` : "—"}
+                              </div>
+                            </div>
+                            <div className="block">
+                              <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Rendimiento (m/pza)</span>
+                              <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-right text-sm font-semibold text-gray-700">{rnd2(yieldVal)}</div>
+                              <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long + {TOLERANCE}) ÷ {rnd(panels)} panel(es)</span>
+                            </div>
+                            <div className="block">
+                              <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Consumo (m)</span>
+                              <div className="rounded-lg border border-blue-200 bg-blue-50/60 px-2 py-2 text-right text-sm font-bold text-blue-700">{rnd2(consumo)}</div>
+                              <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long ÷ {rnd(panels)}) × {rnd(tot)} pzas</span>
+                            </div>
                           </div>
-                          <div className="block">
-                            <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Rendimiento (m/pza)</span>
-                            <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-right text-sm font-semibold text-gray-700">{rnd2(yieldVal)}</div>
-                            <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long + {TOLERANCE}) ÷ {rnd(panels)} panel(es)</span>
-                          </div>
-                          <div className="block">
-                            <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Consumo (m)</span>
-                            <div className="rounded-lg border border-blue-200 bg-blue-50/60 px-2 py-2 text-right text-sm font-bold text-blue-700">{rnd2(consumo)}</div>
-                            <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long ÷ {rnd(panels)}) × {rnd(tot)} pzas</span>
-                          </div>
+
+                          {m.comment && m.comment.trim() && (
+                            <div className="block mt-2">
+                              <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Comentario</span>
+                              <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-sm text-gray-700 whitespace-pre-wrap">{m.comment}</div>
+                            </div>
+                          )}
                         </div>
 
                         {/* Tallas del trazo (solo lectura) */}

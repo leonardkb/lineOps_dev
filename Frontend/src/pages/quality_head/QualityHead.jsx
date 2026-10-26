@@ -14,7 +14,6 @@ import {
 import NavQuality from '../../components/quality/NavQuality';
 
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000';
 
 const fmt = (v) => {
   if (v == null || isNaN(v)) return '0';
@@ -33,12 +32,61 @@ const severityColor = (value, max) => {
 
 const TYPE_PALETTE = ['#dc2626', '#ea580c', '#d97706', '#ca8a04', '#65a30d', '#0891b2', '#2563eb', '#7c3aed', '#c026d3', '#db2777'];
 
-const todayStr = () => new Date().toISOString().split('T')[0];
+// Local-date helpers. toISOString() is UTC, which in Mexico City rolls over to
+// "tomorrow" every evening, so dates are formatted from local parts instead.
+const toYMD = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const parseYMD = (s) => new Date(s + 'T00:00:00');
+const todayStr = () => toYMD(new Date());
 const addDays = (dateStr, n) => {
-  const d = new Date(dateStr + 'T00:00:00');
+  const d = parseYMD(dateStr);
   d.setDate(d.getDate() + n);
-  return d.toISOString().split('T')[0];
+  return toYMD(d);
 };
+
+// Weeks run Monday–Sunday (ISO).
+const weekStart = (dateStr) => {
+  const d = parseYMD(dateStr);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return toYMD(d);
+};
+const isoWeekNumber = (dateStr) => {
+  const d = parseYMD(dateStr);
+  d.setDate(d.getDate() + 3 - ((d.getDay() + 6) % 7)); // Thursday of this week
+  const jan4 = new Date(d.getFullYear(), 0, 4);
+  return 1 + Math.round(((d - jan4) / 86400000 - 3 + ((jan4.getDay() + 6) % 7)) / 7);
+};
+const shortDate = (dateStr) =>
+  parseYMD(dateStr).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+// Start/end for period types that move with an anchor date.
+const periodRange = (period, anchor) => {
+  const a = parseYMD(anchor);
+  if (period === 'week') { const s = weekStart(anchor); return [s, addDays(s, 6)]; }
+  if (period === 'month') {
+    return [toYMD(new Date(a.getFullYear(), a.getMonth(), 1)), toYMD(new Date(a.getFullYear(), a.getMonth() + 1, 0))];
+  }
+  if (period === 'year') return [`${a.getFullYear()}-01-01`, `${a.getFullYear()}-12-31`];
+  return [anchor, anchor];
+};
+const shiftAnchor = (period, anchor, dir) => {
+  const a = parseYMD(anchor);
+  if (period === 'week') return addDays(anchor, 7 * dir);
+  if (period === 'month') return toYMD(new Date(a.getFullYear(), a.getMonth() + dir, 1));
+  if (period === 'year') return toYMD(new Date(a.getFullYear() + dir, 0, 1));
+  return anchor;
+};
+const periodLabel = (period, anchor) => {
+  const [s, e] = periodRange(period, anchor);
+  if (period === 'week') return `Week ${isoWeekNumber(s)}: ${shortDate(s)} – ${shortDate(e)}, ${parseYMD(e).getFullYear()}`;
+  if (period === 'month') return parseYMD(s).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  if (period === 'year') return String(parseYMD(s).getFullYear());
+  return s;
+};
+const STEPPED = ['week', 'month', 'year'];
+
+const selectCls =
+  'bg-white border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-red-500';
 
 function Kpi({ label, value, sub, tone = 'gray' }) {
   const tones = {
@@ -72,11 +120,13 @@ export default function QualityHead() {
   const navigate = useNavigate();
   const [user, setUser] = useState(null);
 
-  const [preset, setPreset] = useState('today');
-  const [startDate, setStartDate] = useState(todayStr());
-  const [endDate, setEndDate] = useState(todayStr());
+  const [preset, setPreset] = useState('today'); // today | yesterday | last7 | last30 | week | month | year | custom
+  const [anchor, setAnchor] = useState(todayStr()); // reference date for week / month / year
+  const [customStart, setCustomStart] = useState(todayStr());
+  const [customEnd, setCustomEnd] = useState(todayStr());
   const [lineFilter, setLineFilter] = useState('all');
   const [styleFilter, setStyleFilter] = useState('all');
+  const [clientFilter, setClientFilter] = useState('all');
   const [tab, setTab] = useState('records'); // records | reasons | inspectors
 
   const [data, setData] = useState(null);
@@ -86,7 +136,7 @@ export default function QualityHead() {
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) { navigate('/'); return; }
-    axios.get(`${API_BASE}/api/me`, { headers: { Authorization: `Bearer ${token}` } })
+    axios.get(`http://localhost:5000/api/me`, { headers: { Authorization: `Bearer ${token}` } })
       .then((res) => setUser(res.data.user))
       .catch(() => {
         localStorage.removeItem('token');
@@ -95,13 +145,24 @@ export default function QualityHead() {
       });
   }, [navigate]);
 
-  useEffect(() => {
+  const [startDate, endDate] = useMemo(() => {
     const t = todayStr();
-    if (preset === 'today') { setStartDate(t); setEndDate(t); }
-    else if (preset === 'yesterday') { const y = addDays(t, -1); setStartDate(y); setEndDate(y); }
-    else if (preset === 'last7') { setStartDate(addDays(t, -6)); setEndDate(t); }
-    else if (preset === 'last30') { setStartDate(addDays(t, -29)); setEndDate(t); }
-  }, [preset]);
+    if (preset === 'yesterday') { const y = addDays(t, -1); return [y, y]; }
+    if (preset === 'last7') return [addDays(t, -6), t];
+    if (preset === 'last30') return [addDays(t, -29), t];
+    if (STEPPED.includes(preset)) return periodRange(preset, anchor);
+    if (preset === 'custom') return [customStart, customEnd];
+    return [t, t];
+  }, [preset, anchor, customStart, customEnd]);
+
+  const changePreset = (next) => {
+    if (next === 'custom') { setCustomStart(startDate); setCustomEnd(endDate); }
+    if (STEPPED.includes(next)) setAnchor(todayStr());
+    setPreset(next);
+  };
+  // Don't step into a period that starts after today.
+  const canStepForward = STEPPED.includes(preset)
+    && periodRange(preset, shiftAnchor(preset, anchor, 1))[0] <= todayStr();
 
   const fetchData = useCallback(async () => {
     const token = localStorage.getItem('token');
@@ -112,7 +173,8 @@ export default function QualityHead() {
       const params = new URLSearchParams({ startDate, endDate });
       if (lineFilter !== 'all') params.append('line', lineFilter);
       if (styleFilter !== 'all') params.append('style', styleFilter);
-      const res = await axios.get(`${API_BASE}/api/quality/analytics?${params.toString()}`, {
+      if (clientFilter !== 'all') params.append('client', clientFilter);
+      const res = await axios.get(`http://localhost:5000/api/quality/analytics?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.data.success) setData(res.data);
@@ -122,9 +184,16 @@ export default function QualityHead() {
     } finally {
       setLoading(false);
     }
-  }, [startDate, endDate, lineFilter, styleFilter]);
+  }, [startDate, endDate, lineFilter, styleFilter, clientFilter]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
+
+  // The client list comes from the server so it doesn't shrink to the current
+  // selection. Keep the selected client listed even if the new period has none.
+  const clientOptions = useMemo(() => {
+    const list = data?.filterOptions?.clients || [];
+    return clientFilter !== 'all' && !list.includes(clientFilter) ? [clientFilter, ...list] : list;
+  }, [data, clientFilter]);
 
   const lineOptions = useMemo(() => (data?.byLine || []).map((r) => r.line_no), [data]);
   const styleOptions = useMemo(
@@ -143,7 +212,9 @@ export default function QualityHead() {
     () => Math.max(0, ...(data?.byLine || []).map((r) => r.total_defects)),
     [data]
   );
-  const rangeLabel = startDate === endDate ? startDate : `${startDate} → ${endDate}`;
+  const rangeLabel = STEPPED.includes(preset)
+    ? periodLabel(preset, anchor)
+    : startDate === endDate ? startDate : `${startDate} → ${endDate}`;
 
   return (
     <div className="lg:h-screen lg:overflow-hidden flex flex-col bg-gradient-to-br from-slate-50 to-gray-100">
@@ -162,28 +233,55 @@ export default function QualityHead() {
                 {rangeLabel}
                 {lineFilter !== 'all' && <> · Line {lineFilter}</>}
                 {styleFilter !== 'all' && <> · {styleFilter}</>}
+                {clientFilter !== 'all' && <> · {clientFilter}</>}
               </span>
             </h1>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <select value={preset} onChange={(e) => setPreset(e.target.value)}
-              className="bg-white border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-red-500">
+            <select value={preset} onChange={(e) => changePreset(e.target.value)} className={selectCls}>
               <option value="today">Today</option>
               <option value="yesterday">Yesterday</option>
               <option value="last7">Last 7 days</option>
               <option value="last30">Last 30 days</option>
+              <option value="week">Week</option>
+              <option value="month">Month</option>
+              <option value="year">Year</option>
               <option value="custom">Custom</option>
             </select>
+            {STEPPED.includes(preset) && (
+              <div className="flex items-center bg-white border border-gray-200 rounded-lg text-sm text-gray-700">
+                <button onClick={() => setAnchor(shiftAnchor(preset, anchor, -1))}
+                  aria-label={`Previous ${preset}`}
+                  className="px-2 py-1.5 rounded-l-lg hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-red-500">‹</button>
+                {preset === 'week' ? (
+                  <input type="date" value={anchor} max={todayStr()} title="Pick any day in the week"
+                    onChange={(e) => e.target.value && setAnchor(e.target.value)}
+                    className="px-1 py-1 text-sm bg-transparent focus:outline-none" />
+                ) : (
+                  <span className="px-2 py-1.5 font-medium tabular-nums min-w-[3.5rem] text-center">
+                    {preset === 'month' ? periodLabel('month', anchor) : anchor.slice(0, 4)}
+                  </span>
+                )}
+                <button onClick={() => setAnchor(shiftAnchor(preset, anchor, 1))} disabled={!canStepForward}
+                  aria-label={`Next ${preset}`}
+                  className="px-2 py-1.5 rounded-r-lg hover:bg-gray-100 disabled:text-gray-300 disabled:hover:bg-transparent focus:outline-none focus:ring-2 focus:ring-red-500">›</button>
+              </div>
+            )}
             {preset === 'custom' && (
               <>
-                <input type="date" value={startDate} max={endDate} onChange={(e) => setStartDate(e.target.value)}
+                <input type="date" value={customStart} max={customEnd} onChange={(e) => setCustomStart(e.target.value)}
                   className="bg-white border border-gray-200 rounded-lg px-2 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-red-500" />
                 <span className="text-gray-400 text-xs">to</span>
-                <input type="date" value={endDate} min={startDate} max={todayStr()} onChange={(e) => setEndDate(e.target.value)}
+                <input type="date" value={customEnd} min={customStart} max={todayStr()} onChange={(e) => setCustomEnd(e.target.value)}
                   className="bg-white border border-gray-200 rounded-lg px-2 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-red-500" />
               </>
             )}
+            <select value={clientFilter} onChange={(e) => setClientFilter(e.target.value)}
+              className={`${selectCls} max-w-[160px]`}>
+              <option value="all">All clients</option>
+              {clientOptions.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
             <select value={lineFilter} onChange={(e) => setLineFilter(e.target.value)}
               className="bg-white border border-gray-200 rounded-lg px-2.5 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-red-500">
               <option value="all">All lines</option>

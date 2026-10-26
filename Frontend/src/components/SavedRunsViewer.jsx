@@ -23,6 +23,15 @@ const normalizeDate = (dateStr) => {
   return dateStr;
 };
 
+// Show a DATE column as the calendar day it is. `new Date("2026-09-28")` is
+// UTC midnight, which in Mexico (UTC-6) renders as 9/27 — so format from the
+// YYYY-MM-DD part instead of converting through the local timezone.
+const formatRunDate = (dateStr) => {
+  const m = String(dateStr || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return dateStr ? new Date(dateStr).toLocaleDateString() : "";
+  return new Date(+m[1], +m[2] - 1, +m[3]).toLocaleDateString();
+};
+
 // A run is unique per (line_no, run_date, style, color). `style` stays the plain
 // estilo (e.g. "DAMBOD01") and `color` is stored as its own field (e.g. "BLA"),
 // so two colors of the same style can coexist as separate runs. This helper only
@@ -300,7 +309,7 @@ const handleBulkDelete = async () => {
     setMessage("");
     try {
       const token = localStorage.getItem("token");
-      const response = await fetch(`/api/run/${run.id}/confirm`, {
+      const response = await fetch(`http://localhost:5000/api/run/${run.id}/confirm`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -318,8 +327,10 @@ const handleBulkDelete = async () => {
     }
   };
 
-  const fetchLineRuns = async () => {
-    setLoading(true);
+  // `silent` refreshes the list without the full-page "Cargando..." state
+  // (used after edits so the color chips / total pick up new targets).
+  const fetchLineRuns = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     try {
       const token = localStorage.getItem("token");
       const response = await fetch("http://localhost:5000/api/line-runs", {
@@ -337,7 +348,7 @@ const handleBulkDelete = async () => {
     } catch (err) {
       setMessage(`❌ No se pudieron cargar las corridas: ${err.message}`);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -433,11 +444,18 @@ const handleBulkDelete = async () => {
       const data = await response.json();
 
       if (data.success) {
-        setMessage(`✅ Horas de trabajo actualizadas. Nueva meta: ${data.newTarget.toFixed(2)} piezas`);
         setShowEditWorkingHours(false);
         
         // Refresh the run data to show updated values
-        await handleSelectRun(selectedRun);
+        await handleSelectRun(selectedRun, { preservePanel: true });
+        await fetchLineRuns({ silent: true });
+        // Mostrar el mensaje después de refrescar (handleSelectRun lo limpia)
+        setMessage(
+          `✅ Horas de trabajo actualizadas. Nueva meta: ${data.newTarget.toFixed(2)} piezas` +
+            (data.syncedColorRuns > 0
+              ? ` (aplicado también a ${data.syncedColorRuns} color(es) más del mismo estilo)`
+              : "")
+        );
       } else {
         setMessage(`❌ Error: ${data.error}`);
       }
@@ -468,11 +486,19 @@ const handleBulkDelete = async () => {
       const data = await response.json();
 
       if (data.success) {
-        setMessage(`✅ Distribución de turnos actualizada. Nueva meta: ${data.newTarget.toFixed(2)} piezas`);
         setShowEditShiftSlots(false);
         
         // Refresh the run data to show updated values
-        await handleSelectRun(selectedRun);
+        await handleSelectRun(selectedRun, { preservePanel: true });
+        // Other colors' targets changed too — refresh the list silently
+        await fetchLineRuns({ silent: true });
+        // Mostrar el mensaje después de refrescar (handleSelectRun lo limpia)
+        setMessage(
+          `✅ Distribución de turnos actualizada. Nueva meta: ${data.newTarget.toFixed(2)} piezas` +
+            (data.syncedColorRuns > 0
+              ? ` (aplicado también a ${data.syncedColorRuns} color(es) más del mismo estilo)`
+              : "")
+        );
       } else {
         setMessage(`❌ Error: ${data.error}`);
       }
@@ -723,6 +749,7 @@ const getRowsFromData = () => {
           colors: [],
           totalTarget: 0,
           count: 0,
+          sams: [], // SAM distintos dentro del grupo (normalmente uno solo)
         });
       }
       const g = map.get(key);
@@ -731,6 +758,8 @@ const getRowsFromData = () => {
       if (color && !g.colors.includes(color)) g.colors.push(color);
       g.totalTarget += parseFloat(run.target_pcs) || 0;
       g.count += 1;
+      const sam = parseFloat(run.sam_minutes);
+      if (Number.isFinite(sam) && sam > 0 && !g.sams.includes(sam)) g.sams.push(sam);
     }
     return Array.from(map.values());
   })();
@@ -784,6 +813,15 @@ const getRowsFromData = () => {
   // Suma de metas de todos los colores de la corrida abierta. La tarjeta de la
   // lista muestra la meta total del grupo, mientras que el resumen muestra la
   // meta de un solo color; este dato reconcilia ambas cifras.
+  // Las horas de trabajo son del turno, no del color: todos los colores del
+  // mismo estilo comparten las mismas horas. Sólo el primer color creado
+  // (id más bajo) permite editarlas; el servidor copia el cambio a los demás.
+  const hoursOwnerRun =
+    currentColorRuns.length > 1
+      ? currentColorRuns.reduce((min, cr) => (Number(cr.id) < Number(min.id) ? cr : min))
+      : null;
+  const canEditHours = !hoursOwnerRun || String(hoursOwnerRun.id) === String(selectedRun);
+
   const currentColorTotal = currentColorRuns.reduce(
     (sum, cr) => sum + (parseFloat(cr.target_pcs) || 0),
     0
@@ -944,6 +982,10 @@ const getRowsFromData = () => {
   const isMerged = group.count > 1;  // ¿varios colores bajo una tarjeta?
   const isSelected = groupIds.length > 0 && groupIds.every((id) => selectedIds.has(id));
   const colorLabel = group.colors.length ? ` (${group.colors.join(", ")})` : "";
+  // SAM del grupo: si todos los colores comparten SAM se muestra uno; si no, se listan.
+  const samLabel = group.sams.length
+    ? group.sams.sort((a, b) => a - b).map((v) => v.toFixed(2)).join(" / ")
+    : "—";
   return (
   <div
     key={group.key}
@@ -983,11 +1025,16 @@ const getRowsFromData = () => {
           )}
         </div>
         <div className="text-xs text-gray-500">
-          {new Date(run.run_date).toLocaleDateString()}
+          {formatRunDate(run.run_date)}
         </div>
       </div>
       <div className="text-sm text-gray-600 mb-1">Estilo: {run.style}{colorLabel}</div>
       <div className="text-sm text-gray-600 mb-1">Operadores: {run.operators_count}</div>
+      <div className="mb-1">
+        <span className="inline-flex items-center gap-1 rounded-md border border-yellow-400 bg-yellow-100 px-2 py-0.5 text-sm font-bold text-yellow-900">
+          SAM: {samLabel} min
+        </span>
+      </div>
       <div className="text-sm text-gray-600">
         Meta{isMerged ? " total" : ""}: {isMerged ? group.totalTarget : run.target_pcs} pzas
       </div>
@@ -1162,7 +1209,7 @@ const getRowsFromData = () => {
       <div className="bg-gray-50 p-3 rounded-lg mb-4">
         <p className="text-sm font-medium text-gray-900">Línea: {runToDelete.line_no}</p>
         <p className="text-sm text-gray-600">Estilo: {runToDelete.style}</p>
-        <p className="text-sm text-gray-600">Fecha: {new Date(runToDelete.run_date).toLocaleDateString()}</p>
+        <p className="text-sm text-gray-600">Fecha: {formatRunDate(runToDelete.run_date)}</p>
       </div>
       <p className="text-xs text-red-600 mb-4">
         ⚠️ Esta acción eliminará permanentemente la corrida, incluyendo todos los operadores,
@@ -1242,7 +1289,7 @@ const getRowsFromData = () => {
                     {runData.run.line_no} • {styleWithColor(runData.run.style, runData.run.color)}
                   </h2>
                   <span className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-800">
-                    {new Date(runData.run.run_date).toLocaleDateString()}
+                    {formatRunDate(runData.run.run_date)}
                   </span>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-3 text-sm text-gray-600">
@@ -1256,16 +1303,24 @@ const getRowsFromData = () => {
                       ✎
                     </button>
                   </div>
-                  <span className="flex items-center gap-1">
-                    Horas trabajadas: {runData.run.working_hours}
-                    <button
-                      onClick={() => setShowEditShiftSlots(true)}
-                      className="ml-1 text-blue-600 hover:text-blue-800"
-                      title="Editar distribución de horas y descansos"
-                    >
-                      ✎
-                    </button>
-                  </span>
+                  {/* Con varios colores del mismo estilo, las horas sólo se
+                      muestran (y editan) en el color principal. */}
+                  {canEditHours && (
+                    <span className="flex items-center gap-1">
+                      Horas trabajadas: {runData.run.working_hours}
+                      <button
+                        onClick={() => setShowEditShiftSlots(true)}
+                        className="ml-1 text-blue-600 hover:text-blue-800"
+                        title={
+                          hoursOwnerRun
+                            ? "Editar distribución de horas y descansos (se aplica a todos los colores)"
+                            : "Editar distribución de horas y descansos"
+                        }
+                      >
+                        ✎
+                      </button>
+                    </span>
+                  )}
                   <span>SAM: {runData.run.sam_minutes} min</span>
                   <span className="flex items-center gap-1">
                     Eficiencia: {Math.round(runData.run.efficiency * 100)}%

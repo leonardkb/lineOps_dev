@@ -67,6 +67,8 @@ export default function LoginPage() {
         navigate("/supermarket-plan", { replace: true });
       }else if(roleNorm === "verificador") {
         navigate("/verificador", { replace: true });
+      }else if(roleNorm === "fabricwarehouse") {
+        navigate("/fabric-warehouse", { replace: true });
       }
       else {
         navigate("/", { replace: true });

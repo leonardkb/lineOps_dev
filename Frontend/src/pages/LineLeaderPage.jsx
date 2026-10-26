@@ -91,25 +91,198 @@ function compareSizes(a, b) {
   return String(a.color || "").localeCompare(String(b.color || ""));
 }
 
-// Split a total into bundles of at most `bundle` pieces. 100 @ 50 -> [50, 50];
-// 163 @ 50 -> [50, 50, 50, 13]. Every value is fully editable afterwards; this
-// only provides a sensible starting point.
-function autoSplit(total, bundle) {
-  const t = Math.max(0, Math.floor(safeNum(total)));
-  const b = Math.max(1, Math.floor(safeNum(bundle)));
-  if (t === 0) return [0];
-  const out = [];
-  let rem = t;
-  while (rem > 0) {
-    const q = Math.min(b, rem);
-    out.push(q);
-    rem -= q;
-  }
-  return out;
-}
-
 function normalizeRole(role) {
   return String(role || "").toLowerCase().trim().replace(/[\s_-]/g, "");
+}
+
+// ─── Baja eficiencia: configuración del aviso de las 4:45 p.m. ────────────────
+// A esta hora, si la eficiencia va por debajo del umbral, la página abre un
+// modal para que el jefe de línea explique el motivo.
+const EFF_REASON_THRESHOLD = 70; // %
+const EFF_REASON_HOUR = 16;      // 16 h = 4 p.m.
+const EFF_REASON_MINUTE = 45;    // :45  -> 4:45 p.m.
+const EFF_REASON_SNOOZE_MS = 15 * 60 * 1000; // "Más tarde" = 15 min
+
+// Motivos seleccionables. `code` debe coincidir con EFFICIENCY_REASON_CODES del
+// backend (server1.js). El orden sigue el pedido del usuario.
+const EFFICIENCY_REASONS = [
+  { code: "materials_missing",   label: "Materiales faltantes" },
+  { code: "trims_missing",       label: "Avíos faltantes (trims)" },
+  { code: "absents",             label: "Ausencias" },
+  { code: "inefficiencies",      label: "Ineficiencias" },
+  { code: "machine_no_function", label: "Máquina sin funcionar" },
+  { code: "change_style",        label: "Cambio de estilo" },
+];
+
+// Devuelve YYYY-MM-DD a partir de una fecha del backend (que puede llegar como
+// ISO con hora) o de hoy si no hay valor.
+function toYmd(dateLike) {
+  const s = String(dateLike || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const d = s ? new Date(s) : new Date();
+  if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  return d.toISOString().slice(0, 10);
+}
+
+// ¿La hora local ya alcanzó (o pasó) las 4:45 p.m.?
+function isAfterEffReasonTime(now = new Date()) {
+  const h = now.getHours();
+  const m = now.getMinutes();
+  return h > EFF_REASON_HOUR || (h === EFF_REASON_HOUR && m >= EFF_REASON_MINUTE);
+}
+
+/**
+ * Modal de motivo de baja eficiencia (< 60%).
+ * Muestra línea, jefe de línea y fecha, y pide seleccionar uno o varios motivos.
+ */
+function EfficiencyReasonModal({
+  visible,
+  lineNo,
+  jefeLinea,
+  date,
+  efficiency,
+  selected,
+  onToggle,
+  note,
+  onNoteChange,
+  actionPlan,
+  onActionPlanChange,
+  onSave,
+  onLater,
+  saving,
+  errorMsg,
+}) {
+  if (!visible) return null;
+
+  // "Ineficiencias" exige escribir qué se hará mañana para mejorar.
+  const inefficienciesSelected = selected.includes("inefficiencies");
+  const canSave =
+    selected.length > 0 &&
+    (!inefficienciesSelected || String(actionPlan || "").trim().length > 0);
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4">
+      <div className="w-full max-w-lg rounded-2xl bg-white shadow-2xl">
+        <div className="flex items-start gap-3 rounded-t-2xl border-b bg-red-50 p-5">
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-red-100">
+            <span className="text-xl">⚠️</span>
+          </div>
+          <div>
+            <div className="text-base font-semibold text-red-800">
+              Eficiencia por debajo del {EFF_REASON_THRESHOLD}%
+            </div>
+            <div className="mt-1 text-sm text-red-700">
+              Eficiencia actual:{" "}
+              <span className="font-bold">
+                {Number(efficiency ?? 0).toFixed(1)}%
+              </span>
+              . Por favor indica el motivo.
+            </div>
+          </div>
+        </div>
+
+        <div className="p-5">
+          {/* Línea · Jefe de línea · Fecha */}
+          <div className="mb-4 grid grid-cols-3 gap-3 rounded-xl border bg-gray-50 p-3 text-sm">
+            <div>
+              <div className="text-xs uppercase tracking-wider text-gray-500">Línea</div>
+              <div className="font-semibold text-gray-900">{lineNo || "—"}</div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wider text-gray-500">Jefe de línea</div>
+              <div className="font-semibold text-gray-900">{jefeLinea || "—"}</div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wider text-gray-500">Fecha</div>
+              <div className="font-semibold text-gray-900">{date || "—"}</div>
+            </div>
+          </div>
+
+          <div className="mb-2 text-sm font-medium text-gray-700">
+            Motivo(s) (puedes elegir varios):
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {EFFICIENCY_REASONS.map((r, idx) => {
+              const checked = selected.includes(r.code);
+              return (
+                <label
+                  key={r.code}
+                  className={`flex cursor-pointer items-center gap-3 rounded-xl border p-3 text-sm transition ${
+                    checked
+                      ? "border-red-400 bg-red-50 text-red-900"
+                      : "border-gray-200 hover:bg-gray-50 text-gray-800"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-red-600"
+                    checked={checked}
+                    onChange={() => onToggle(r.code)}
+                  />
+                  <span>
+                    <span className="mr-1 font-semibold text-gray-400">{idx + 1}.</span>
+                    {r.label}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+
+          {inefficienciesSelected ? (
+            <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-3">
+              <label className="mb-1 block text-sm font-semibold text-amber-900">
+                ¿Qué harás mañana para mejorar la eficiencia? (obligatorio)
+              </label>
+              <textarea
+                value={actionPlan}
+                onChange={(e) => onActionPlanChange(e.target.value)}
+                rows={3}
+                autoFocus
+                placeholder="Ej.: balancear la operación de pegado de cuello, revisar la máquina 12 antes de iniciar…"
+                className="w-full rounded-xl border border-amber-300 bg-white p-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+              />
+            </div>
+          ) : null}
+
+          <div className="mt-4">
+            <label className="mb-1 block text-sm font-medium text-gray-700">
+              Comentario (opcional)
+            </label>
+            <textarea
+              value={note}
+              onChange={(e) => onNoteChange(e.target.value)}
+              rows={2}
+              placeholder="Detalles adicionales…"
+              className="w-full rounded-xl border border-gray-300 p-2 text-sm focus:border-red-400 focus:outline-none focus:ring-1 focus:ring-red-400"
+            />
+          </div>
+
+          {errorMsg ? (
+            <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-2 text-sm text-red-700">
+              {errorMsg}
+            </div>
+          ) : null}
+
+          <div className="mt-5 flex items-center justify-end gap-3">
+            <button
+              onClick={onLater}
+              disabled={saving}
+              className="rounded-xl border bg-white px-4 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Más tarde
+            </button>
+            <button
+              onClick={onSave}
+              disabled={!canSave || saving}
+              className="rounded-xl bg-red-600 px-5 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving ? "Guardando…" : "Guardar motivo"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -378,9 +551,12 @@ export default function LineLeaderPage() {
   const [tickets, setTickets] = useState(null);
   // Confirming = persisting the printed tickets to the DB so the assigned
   // quantity per size gets decreased next time this work order is opened.
-  const [confirmingTickets, setConfirmingTickets] = useState(false);
   const [ticketsConfirmed, setTicketsConfirmed] = useState(false);
   const [ticketConfirmMsg, setTicketConfirmMsg] = useState("");
+  // Borrador: tickets generados pero AÚN NO guardados. Guarda la lista plana
+  // (lo que se envía al backend) y las filas del builder (para "Editar").
+  const [ticketDraft, setTicketDraft] = useState(null);
+  const [ticketSaving, setTicketSaving] = useState(false);
 
   // Multi-style state
   const [styles, setStyles] = useState([]);
@@ -397,6 +573,16 @@ export default function LineLeaderPage() {
   const [snoozeUntil, setSnoozeUntil] = useState(null);
   const alarmSoundRef = useRef(null);
   const alarmTimerRef = useRef(null);
+
+  // Baja eficiencia (aviso 4:45 p.m.)
+  const [effReasonOpen, setEffReasonOpen] = useState(false);
+  const [effReasonSelected, setEffReasonSelected] = useState([]);
+  const [effReasonNote, setEffReasonNote] = useState("");
+  const [effReasonActionPlan, setEffReasonActionPlan] = useState(""); // plan para mañana (Ineficiencias)
+  const [effReasonSaving, setEffReasonSaving] = useState(false);
+  const [effReasonError, setEffReasonError] = useState("");
+  const [effReasonSaved, setEffReasonSaved] = useState(false); // ya respondido hoy
+  const [effReasonSnoozeUntil, setEffReasonSnoozeUntil] = useState(0);
 
   // State for line balancing assignments
   const [assignments, setAssignments] = useState([]);
@@ -601,6 +787,162 @@ export default function LineLeaderPage() {
     const saved = localStorage.getItem("lineLeader_lastSaved");
     if (saved) setLastSavedTime(new Date(saved));
   }, []);
+
+  // ========== BAJA EFICIENCIA (aviso 4:45 p.m.) ==========
+  const currentRunId = currentStyle?.run?.id || null;
+  const effReasonDate = useMemo(() => toYmd(header.date), [header.date]);
+  const effJefeLinea = useMemo(
+    () => user?.full_name || user?.username || "",
+    [user]
+  );
+  const effLineNo = header.line || user?.line_number || "";
+  const effReasonKey = useMemo(
+    () => `effReason_${effLineNo}_${effReasonDate}_${currentRunId ?? ""}`,
+    [effLineNo, effReasonDate, currentRunId]
+  );
+
+  // Al cambiar de corrida: reinicia el modal y consulta si ya hay un motivo
+  // guardado (así no se vuelve a preguntar).
+  useEffect(() => {
+    setEffReasonOpen(false);
+    setEffReasonSelected([]);
+    setEffReasonNote("");
+    setEffReasonActionPlan("");
+    setEffReasonError("");
+    setEffReasonSnoozeUntil(0);
+
+    if (!currentRunId) {
+      setEffReasonSaved(false);
+      return;
+    }
+    if (localStorage.getItem(effReasonKey) === "done") {
+      setEffReasonSaved(true);
+      return;
+    }
+
+    let cancelled = false;
+    const token = getToken();
+    (async () => {
+      try {
+        const res = await fetch(`http://localhost:5000/api/lineleader/efficiency-reason/${currentRunId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) {
+          if (!cancelled) setEffReasonSaved(false);
+          return;
+        }
+        const json = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (json?.reason) {
+          setEffReasonSaved(true);
+          setEffReasonSelected(
+            Array.isArray(json.reason.reasons) ? json.reason.reasons : []
+          );
+          setEffReasonNote(json.reason.note || "");
+          setEffReasonActionPlan(json.reason.action_plan || "");
+          localStorage.setItem(effReasonKey, "done");
+        } else {
+          setEffReasonSaved(false);
+        }
+      } catch {
+        if (!cancelled) setEffReasonSaved(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentRunId, effReasonKey]);
+
+  // Revisa cada 30 s: a partir de las 4:45 p.m., si la eficiencia va por debajo
+  // del umbral y aún no se respondió, abre el modal.
+  useEffect(() => {
+    if (!currentRunId) return;
+    const check = () => {
+      if (effReasonSaved || effReasonOpen) return;
+      if (Date.now() < effReasonSnoozeUntil) return;
+      if (loading) return;
+      if (!isAfterEffReasonTime()) return;
+      if (!(elapsedMinutes > 0)) return; // los datos aún no están listos
+      if (realTimeEfficiency < EFF_REASON_THRESHOLD) {
+        setEffReasonOpen(true);
+      }
+    };
+    check();
+    const id = setInterval(check, 30000);
+    return () => clearInterval(id);
+  }, [
+    currentRunId,
+    effReasonSaved,
+    effReasonOpen,
+    effReasonSnoozeUntil,
+    loading,
+    elapsedMinutes,
+    realTimeEfficiency,
+  ]);
+
+  const toggleEffReason = (code) => {
+    setEffReasonError("");
+    setEffReasonSelected((prev) =>
+      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code]
+    );
+  };
+
+  const handleEffReasonLater = () => {
+    setEffReasonOpen(false);
+    setEffReasonSnoozeUntil(Date.now() + EFF_REASON_SNOOZE_MS);
+  };
+
+  async function handleSaveEffReason() {
+    if (!currentRunId) return;
+    if (effReasonSelected.length === 0) {
+      setEffReasonError("Selecciona al menos un motivo.");
+      return;
+    }
+    if (effReasonSelected.includes("inefficiencies") && !effReasonActionPlan.trim()) {
+      setEffReasonError("Escribe qué harás mañana para mejorar (Ineficiencias).");
+      return;
+    }
+    const token = getToken();
+    if (!token) {
+      setEffReasonError("Tu sesión expiró. Inicia sesión de nuevo.");
+      return;
+    }
+
+    setEffReasonSaving(true);
+    setEffReasonError("");
+    try {
+      const json = await fetchJson(
+        `http://localhost:5000/api/lineleader/efficiency-reason/${currentRunId}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            reasons: effReasonSelected,
+            note: effReasonNote.trim() || null,
+            action_plan: effReasonSelected.includes("inefficiencies")
+              ? effReasonActionPlan.trim()
+              : null,
+            efficiency: Math.round(realTimeEfficiency * 100) / 100,
+          }),
+        }
+      );
+      if (!json.success) {
+        setEffReasonError(json.error || "No se pudo guardar el motivo.");
+        return;
+      }
+      setEffReasonSaved(true);
+      setEffReasonOpen(false);
+      localStorage.setItem(effReasonKey, "done");
+      setSaveMsg("Motivo de baja eficiencia guardado.");
+    } catch (e) {
+      setEffReasonError(e.message || "No se pudo guardar el motivo.");
+    } finally {
+      setEffReasonSaving(false);
+    }
+  }
 
   // ========== FETCH DATA ==========
   useEffect(() => {
@@ -1107,12 +1449,11 @@ export default function LineLeaderPage() {
   }
 
   // ========== TICKET BUILDER ==========
-  // Opens the split configuration seeded from the merchant size breakdown.
-  // Each size gets an auto-split (bundles of `bundle`, default 50) that the user
-  // can freely edit; the sum per size may not exceed the merchant quantity.
+  // Flujo simple: el usuario marca la talla, escribe la cantidad que envía al
+  // almacén de terminado y guarda. Eso persiste el envío (descuenta lo
+  // asignado) y abre directamente la sección de tickets generados.
   function openTicketBuilder() {
     if (!currentStyle?.run) return;
-    const DEFAULT_BUNDLE = 50;
     const sizes = Array.isArray(currentStyle.sizes) ? currentStyle.sizes : [];
 
     let rows;
@@ -1121,29 +1462,28 @@ export default function LineLeaderPage() {
         const q = Math.max(0, Math.round(safeNum(s.quantity)));
         // Total asignado por el merchant para esa talla (original, no el restante).
         const assigned = Math.max(0, Math.round(safeNum(s.assignedQuantity ?? s.quantity)));
-        const qtys = autoSplit(q, DEFAULT_BUNDLE);
         return {
           talla: s.talla || "—",
-          label: labelForTalla(s.talla, s.label),   // resolved size label
+          label: labelForTalla(s.talla, s.label),
           color: s.color || "",
           customerPo: s.customerPo || s.customer_po || "",
-          assigned,                  // total del merchant (para el encabezado)
-          merchantQty: q,            // restante (tope de lo que se puede imprimir ahora)
-          bundle: DEFAULT_BUNDLE,
-          qtys,
-          open: false,               // talla must be selected (opened) first
-          sel: qtys.map(() => false), // then the user picks individual tickets
+          assigned,          // total del merchant (para el encabezado)
+          merchantQty: q,    // restante (tope de lo que se puede enviar ahora)
+          open: false,       // la talla se marca primero
+          sendQty: 0,        // cantidad a enviar al almacén de terminado
         };
       });
     } else {
-      // No merchant size breakdown for this work order: fall back to a single
-      // editable row seeded with what the line has actually produced.
+      // Sin desglose por talla: una fila editable con lo producido por la línea.
       const q = Math.max(0, Math.round(safeNum(finishedGarmentsTotal)));
-      rows = [{ talla: "—", label: "", color: "", customerPo: "", assigned: q, merchantQty: q, bundle: DEFAULT_BUNDLE, qtys: [q], open: true, sel: [true] }];
+      rows = [{ talla: "—", label: "", color: "", customerPo: "", assigned: q, merchantQty: q, open: true, sendQty: 0 }];
     }
 
     setTickets(null);
-    setTicketBuilder({ rows });
+    setTicketDraft(null);
+    setTicketsConfirmed(false);
+    setTicketConfirmMsg("");
+    setTicketBuilder({ rows, saving: false, error: "" });
   }
 
   // --- builder mutators (immutable updates) ---
@@ -1151,123 +1491,35 @@ export default function LineLeaderPage() {
     setTicketBuilder((b) => {
       if (!b) return b;
       const rows = b.rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
-      return { ...b, rows };
+      return { ...b, rows, error: "" };
     });
 
-  const setBundle = (i, value) => {
-    const bundle = Math.max(1, Math.floor(safeNum(value)));
-    updateBuilderRow(i, { bundle });
-  };
-
-  const reSplitRow = (i) =>
-    setTicketBuilder((b) => {
-      if (!b) return b;
-      const rows = b.rows.map((r, idx) => {
-        if (idx !== i) return r;
-        const qtys = autoSplit(r.merchantQty, r.bundle);
-        return { ...r, qtys, sel: qtys.map(() => false) }; // re-split -> re-pick
-      });
-      return { ...b, rows };
-    });
-
-  const setTicketQty = (i, j, value) =>
-    setTicketBuilder((b) => {
-      if (!b) return b;
-      const rows = b.rows.map((r, idx) => {
-        if (idx !== i) return r;
-        const qtys = r.qtys.map((q, k) =>
-          k === j ? Math.max(0, Math.floor(safeNum(value))) : q
-        );
-        return { ...r, qtys };
-      });
-      return { ...b, rows };
-    });
-
-  const addTicketRow = (i) =>
-    setTicketBuilder((b) => {
-      if (!b) return b;
-      const rows = b.rows.map((r, idx) => {
-        if (idx !== i) return r;
-        const used = r.qtys.reduce((a, q) => a + safeNum(q), 0);
-        const remaining = Math.max(0, r.merchantQty - used);
-        return { ...r, qtys: [...r.qtys, remaining], sel: [...r.sel, true] };
-      });
-      return { ...b, rows };
-    });
-
-  const removeTicketRow = (i, j) =>
-    setTicketBuilder((b) => {
-      if (!b) return b;
-      const rows = b.rows.map((r, idx) => {
-        if (idx !== i) return r;
-        const qtys = r.qtys.filter((_, k) => k !== j);
-        const sel = r.sel.filter((_, k) => k !== j);
-        return qtys.length
-          ? { ...r, qtys, sel }
-          : { ...r, qtys: [0], sel: [false] };
-      });
-      return { ...b, rows };
-    });
-
-  // --- talla open/close (step 1) ---
-  // Selecting a talla just opens it so its tickets become pickable; it does NOT
-  // auto-select every ticket. Closing it clears that talla's ticket picks.
+  // Marcar / desmarcar una talla. Al desmarcarla se limpia su cantidad.
   const toggleSizeOpen = (i) =>
     setTicketBuilder((b) => {
       if (!b) return b;
       const rows = b.rows.map((r, idx) => {
         if (idx !== i) return r;
         const open = !r.open;
-        return open ? { ...r, open } : { ...r, open, sel: r.sel.map(() => false) };
+        return open ? { ...r, open } : { ...r, open, sendQty: 0 };
       });
-      return { ...b, rows };
+      return { ...b, rows, error: "" };
     });
 
-  // --- individual ticket pick (step 2) ---
-  const toggleTicketSel = (i, j) =>
-    setTicketBuilder((b) => {
-      if (!b) return b;
-      const rows = b.rows.map((r, idx) => {
-        if (idx !== i) return r;
-        const sel = r.sel.map((v, k) => (k === j ? !v : v));
-        return { ...r, sel };
-      });
-      return { ...b, rows };
-    });
+  const setSendQty = (i, value) =>
+    updateBuilderRow(i, { sendQty: Math.max(0, Math.floor(safeNum(value))) });
 
-  // Convenience within an open talla: mark all / none of its tickets.
-  const setSizeAllTickets = (i, value) =>
-    setTicketBuilder((b) => {
-      if (!b) return b;
-      const rows = b.rows.map((r, idx) =>
-        idx === i ? { ...r, sel: r.sel.map(() => value) } : r
-      );
-      return { ...b, rows };
-    });
-
-  // Footer: clear every talla back to collapsed + unselected.
+  // Footer: todas las tallas vuelven a desmarcadas y en 0.
   const clearAll = () =>
     setTicketBuilder((b) => {
       if (!b) return b;
-      const rows = b.rows.map((r) => ({ ...r, open: false, sel: r.sel.map(() => false) }));
-      return { ...b, rows };
+      const rows = b.rows.map((r) => ({ ...r, open: false, sendQty: 0 }));
+      return { ...b, rows, error: "" };
     });
 
-  // Generate the printable tickets from the builder configuration.
-  async function generateTickets() {
-    const rows = ticketBuilder?.rows || [];
-    const flat = [];
-    for (const r of rows) {
-      if (!r.open) continue; // talla not selected -> skip
-      r.qtys.forEach((q, k) => {
-        const qty = Math.floor(safeNum(q));
-        if (qty > 0 && r.sel[k]) {
-          flat.push({ talla: r.talla, label: r.label || "", color: r.color || "", customerPo: r.customerPo || "", qty });
-        }
-      });
-    }
-    if (!flat.length) return;
-
+  // Construye los tickets imprimibles (con QR) a partir de una lista plana
+  // { talla, label, color, customerPo, qty }.
+  async function buildTickets(flat) {
     const base = {
       workOrderNo: header.workOrderNo || "—",
       style: header.style || "—",
@@ -1276,8 +1528,8 @@ export default function LineLeaderPage() {
       runId: currentStyle.run.id,
     };
 
-    // Sello de lote: distingue tickets de dos impresiones de la misma corrida, así
-    // el número de ticket es único aunque se regeneren. El almacén deduplica por él.
+    // Sello de lote: distingue tickets de dos envíos de la misma corrida, así
+    // el número de ticket es único. El almacén deduplica por él.
     const batch = Date.now().toString(36).toUpperCase().slice(-4);
 
     const built = [];
@@ -1286,10 +1538,6 @@ export default function LineLeaderPage() {
       const seq = i + 1;
       // Número de ticket: T-<corrida>-<lote>-<consecutivo>. Va impreso y dentro del QR.
       const ticketNo = `T-${base.runId}-${batch}-${seq}`;
-      // El QR se codifica en Base32 (solo A-Z y 2-7) con el prefijo "FGW1". Así el
-      // contenido no lleva signos como { } " : que un lector con distribución de
-      // teclado distinta convertiría en basura (p. ej. " -> [ , : -> Ñ). El
-      // almacén reconoce el prefijo, decodifica y recupera el JSON exacto.
       const qrPayload = ticketQrPayload({
         tn: ticketNo, wo: base.workOrderNo, talla, color, po: customerPo,
         qty, runId: base.runId, seq, date: base.date,
@@ -1302,66 +1550,103 @@ export default function LineLeaderPage() {
       }
       built.push({ ...base, ticketNo, talla, label, color, customerPo, qty, seq, total: flat.length, qrDataUrl });
     }
-
-    setTicketBuilder(null);
-    setTicketsConfirmed(false);
-    setTicketConfirmMsg("");
-    setTickets(built);
+    return built;
   }
 
-  // Persist the generated tickets so the assigned quantity per size gets
-  // decreased on the next load of this work order. Aggregates the current
-  // `tickets` by talla+color+PO, saves them, then updates the in-memory size
-  // breakdown so reopening the builder immediately shows the reduced amounts.
-  async function confirmTickets() {
-    if (!tickets || !tickets.length) return;
+  // PASO 1 — Generar ticket: arma los tickets (con QR) para revisarlos.
+  // Todavía NO se guarda nada; el guardado se hace en la pantalla de tickets.
+  async function generateTickets() {
+    const rows = ticketBuilder?.rows || [];
+    const flat = rows
+      .filter((r) => r.open && safeNum(r.sendQty) > 0)
+      .map((r) => ({
+        talla: r.talla,
+        label: r.label || "",
+        color: r.color || "",
+        customerPo: r.customerPo || "",
+        qty: Math.floor(safeNum(r.sendQty)),
+      }));
+    if (!flat.length) return;
     if (!currentStyle?.run?.id) return;
+
+    setTicketBuilder((b) => (b ? { ...b, saving: true, error: "" } : b));
+    try {
+      const built = await buildTickets(flat);
+      setTicketDraft({ flat, rows });
+      setTicketsConfirmed(false);
+      setTicketConfirmMsg("");
+      setTicketBuilder(null);
+      setTickets(built);
+    } catch (e) {
+      setTicketBuilder((b) => (b ? { ...b, saving: false, error: e.message || "No se pudo generar el ticket." } : b));
+    }
+  }
+
+  // Volver al builder con la misma selección para corregir antes de guardar.
+  function editTicketDraft() {
+    if (!ticketDraft) return;
+    setTickets(null);
+    setTicketConfirmMsg("");
+    setTicketBuilder({ rows: ticketDraft.rows, saving: false, error: "" });
+  }
+
+  // Cerrar la pantalla de tickets. Si no se guardó, se pide confirmación.
+  function closeTickets() {
+    if (ticketSaving) return;
+    if (!ticketsConfirmed && ticketDraft) {
+      const ok = window.confirm("Estos tickets no se han guardado. ¿Cerrar sin guardar?");
+      if (!ok) return;
+    }
+    setTickets(null);
+    setTicketDraft(null);
+  }
+
+  // PASO 2 — Guardar: persiste el envío al almacén de terminado (descuenta
+  // lo asignado). Se llama desde la pantalla de tickets generados.
+  async function saveTickets() {
+    const flat = ticketDraft?.flat || [];
+    if (!flat.length || ticketsConfirmed || ticketSaving) return;
+    if (!currentStyle?.run?.id) return;
+
     const token = getToken();
     if (!token) {
       setTicketConfirmMsg("No estás autenticado. Inicia sesión de nuevo.");
       return;
     }
 
-    // Aggregate by talla+color+PO for the payload.
-    const agg = new Map();
-    for (const t of tickets) {
-      const talla = String(t.talla ?? "").trim();
-      if (!talla) continue;
-      const color = String(t.color ?? "").trim();
-      const customerPo = String(t.customerPo ?? "").trim();
-      const qty = Math.max(0, Math.floor(safeNum(t.qty)));
-      if (qty <= 0) continue;
-      const key = `${talla}||${color}||${customerPo}`;
-      const cur = agg.get(key) || { talla, color, customerPo, qty: 0, count: 0 };
-      cur.qty += qty;
-      cur.count += 1;
-      agg.set(key, cur);
-    }
-    const payload = [...agg.values()];
-    if (!payload.length) return;
+    // Payload para el backend (agrupado por talla+color+PO; aquí ya es 1:1).
+    const payload = flat
+      .filter((f) => String(f.talla ?? "").trim() && f.talla !== "—")
+      .map((f) => ({
+        talla: String(f.talla).trim(),
+        color: String(f.color ?? "").trim(),
+        customerPo: String(f.customerPo ?? "").trim(),
+        qty: f.qty,
+        count: 1,
+      }));
 
-    setConfirmingTickets(true);
+    setTicketSaving(true);
     setTicketConfirmMsg("");
     try {
-      const runId = currentStyle.run.id;
-      const json = await fetchJson(
-        `http://localhost:5000/api/lineleader/confirm-tickets/${runId}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ tickets: payload }),
-        }
-      );
+      let json = { success: true, remaining: [] };
+      if (payload.length) {
+        json = await fetchJson(
+          `http://localhost:5000/api/lineleader/confirm-tickets/${currentStyle.run.id}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ tickets: payload }),
+          }
+        );
+      }
 
       if (!json.success) {
-        // Overflow (exceeds assigned) or other validation error.
+        // Excede lo asignado u otro error de validación.
         setTicketConfirmMsg(json.error || "No se pudo guardar. Intenta de nuevo.");
         return;
       }
 
-      // El backend devuelve el restante real por talla (asignado − impreso).
-      // Lo usamos como fuente de verdad; si faltara para alguna clave, caemos al
-      // descuento local.
+      // El backend devuelve el restante real por talla (asignado − enviado).
       const remainByKey = new Map();
       const printedByKey = new Map();
       for (const r of (json.remaining || [])) {
@@ -1370,8 +1655,7 @@ export default function LineLeaderPage() {
         printedByKey.set(key, Number(r.printed) || 0);
       }
 
-      // Decrease the in-memory size quantities so reopening the builder shows
-      // the reduced "Asignado" without needing a full reload.
+      // Descuenta en memoria para que al reabrir se vea el restante nuevo.
       setStyles((prev) => {
         if (!prev || !prev.length) return prev;
         const idx = selectedStyleIndex;
@@ -1387,35 +1671,30 @@ export default function LineLeaderPage() {
           const dec = decBy.get(key) || 0;
           if (!dec && !remainByKey.has(key)) return s;
           const assigned = Number(s.assignedQuantity ?? s.quantity) || 0;
-          // Preferimos el valor autoritativo del backend cuando existe.
           const remaining = remainByKey.has(key)
             ? remainByKey.get(key)
             : Math.max(0, (Number(s.quantity) || 0) - dec);
           const printed = printedByKey.has(key)
             ? printedByKey.get(key)
             : (Number(s.printedQuantity) || 0) + dec;
-          return {
-            ...s,
-            assignedQuantity: assigned,
-            printedQuantity: printed,
-            quantity: remaining,
-          };
+          return { ...s, assignedQuantity: assigned, printedQuantity: printed, quantity: remaining };
         });
         const next = [...prev];
         next[idx] = { ...style, sizes };
         return next;
       });
 
-      setTicketsConfirmed(true);
-      const savedQty = json.savedQty ?? payload.reduce((a, p) => a + p.qty, 0);
+      const savedQty = json.savedQty ?? flat.reduce((a, f) => a + f.qty, 0);
       const totalRemaining = (json.remaining || []).reduce((a, r) => a + (Number(r.remaining) || 0), 0);
+
+      setTicketsConfirmed(true);
       setTicketConfirmMsg(
-        `✅ Guardado. Se descontaron ${savedQty} pzs de lo asignado. Faltan ${totalRemaining} pzs por producir.`
+        `✅ Guardado. Se enviaron ${savedQty} pzs al almacén de terminado. Faltan ${totalRemaining} pzs por producir.`
       );
     } catch (e) {
       setTicketConfirmMsg(e.message || "Error de red al guardar.");
     } finally {
-      setConfirmingTickets(false);
+      setTicketSaving(false);
     }
   }
 
@@ -1632,6 +1911,27 @@ export default function LineLeaderPage() {
         onDismiss={handleDismissAlarm}
         onSnooze={handleSnoozeAlarm}
         lastSavedTime={lastSavedTime}
+      />
+
+      <EfficiencyReasonModal
+        visible={effReasonOpen}
+        lineNo={effLineNo}
+        jefeLinea={effJefeLinea}
+        date={effReasonDate}
+        efficiency={realTimeEfficiency}
+        selected={effReasonSelected}
+        onToggle={toggleEffReason}
+        note={effReasonNote}
+        onNoteChange={setEffReasonNote}
+        actionPlan={effReasonActionPlan}
+        onActionPlanChange={(v) => {
+          setEffReasonError("");
+          setEffReasonActionPlan(v);
+        }}
+        onSave={handleSaveEffReason}
+        onLater={handleEffReasonLater}
+        saving={effReasonSaving}
+        errorMsg={effReasonError}
       />
 
       <div className="mx-auto max-w-6xl p-4 sm:p-6">
@@ -2064,29 +2364,22 @@ export default function LineLeaderPage() {
         </div>
       </div>
 
-      {/* ============ TICKET BUILDER (split per size) ============ */}
+      {/* ============ TICKET BUILDER (cantidad por talla) ============ */}
       {ticketBuilder && (() => {
         const rows = ticketBuilder.rows;
+        const saving = !!ticketBuilder.saving;
         const rowStats = rows.map((r) => {
-          const assigned = r.qtys.reduce((a, q) => a + safeNum(q), 0);
-          const selectedCount = r.open
-            ? r.qtys.filter((q, k) => safeNum(q) > 0 && r.sel[k]).length
-            : 0;
-          return {
-            assigned,
-            remaining: r.merchantQty - assigned,
-            over: assigned > r.merchantQty,
-            selectedCount,
-          };
+          const qty = r.open ? safeNum(r.sendQty) : 0;
+          return { qty, over: qty > r.merchantQty, after: r.merchantQty - qty };
         });
-        const selectedTickets = rowStats.reduce((a, s) => a + s.selectedCount, 0);
-        const openCount = rows.filter((r) => r.open).length;
+        const readyRows = rows.filter((r, i) => r.open && rowStats[i].qty > 0).length;
+        const totalToSend = rowStats.reduce((a, s) => a + s.qty, 0);
         const anyOver = rowStats.some((s) => s.over);
-        const canGenerate = selectedTickets > 0 && !anyOver;
+        const canSave = readyRows > 0 && !anyOver && !saving;
 
         return (
           <div
-            onClick={() => setTicketBuilder(null)}
+            onClick={() => { if (!saving) setTicketBuilder(null); }}
             className="no-print"
             style={{
               position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)",
@@ -2103,12 +2396,12 @@ export default function LineLeaderPage() {
               }}
             >
               <div style={{ background: "#1a1a18", color: "#fff", padding: "16px 20px" }}>
-                <div style={{ fontSize: 12, letterSpacing: 2, color: "#c9c9c2" }}>GENERAR TICKETS POR TALLA</div>
+                <div style={{ fontSize: 12, letterSpacing: 2, color: "#c9c9c2" }}>ENVÍO A ALMACÉN DE TERMINADO</div>
                 <div style={{ fontSize: 18, fontWeight: 600, marginTop: 4 }}>
                   {header.workOrderNo || "—"} · {header.style || "—"}
                 </div>
                 <div style={{ fontSize: 12, color: "#c9c9c2", marginTop: 2 }}>
-                  1) Selecciona la talla · 2) marca los tickets que quieres imprimir. No puedes exceder la cantidad asignada por talla.
+                  1) Selecciona la talla · 2) escribe la cantidad que envías · 3) genera el ticket. Lo guardas en la siguiente pantalla. No puedes exceder el restante por talla.
                 </div>
               </div>
 
@@ -2119,171 +2412,109 @@ export default function LineLeaderPage() {
                     <div
                       key={`${r.talla}-${r.color}-${i}`}
                       style={{
-                        border: "1px solid #e6e6e0", borderRadius: 10,
+                        border: r.open ? "1px solid #1a1a18" : "1px solid #e6e6e0", borderRadius: 10,
                         padding: 12, marginBottom: 12,
                         background: st.over ? "#fff5f5" : "#fafaf7",
                       }}
                     >
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-                        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flexWrap: "wrap" }}>
-                          <input
-                            type="checkbox"
-                            checked={r.open}
-                            onChange={() => toggleSizeOpen(i)}
-                            style={{ width: 18, height: 18, cursor: "pointer" }}
-                          />
-                          <span style={{ fontSize: 18, fontWeight: 700 }}>
-                            Talla {r.talla}
-                            {r.label ? <span style={{ color: "#6b6b64", fontWeight: 600 }}> · {r.label}</span> : null}
+                      <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: r.merchantQty > 0 ? "pointer" : "default", flexWrap: "wrap" }}>
+                        <input
+                          type="checkbox"
+                          checked={r.open}
+                          disabled={r.merchantQty <= 0 || saving}
+                          onChange={() => toggleSizeOpen(i)}
+                          style={{ width: 18, height: 18, cursor: "pointer" }}
+                        />
+                        <span style={{ fontSize: 18, fontWeight: 700 }}>
+                          Talla {r.talla}
+                          {r.label ? <span style={{ color: "#6b6b64", fontWeight: 600 }}> · {r.label}</span> : null}
+                        </span>
+                        {r.color ? (
+                          <span style={{ fontSize: 12, fontWeight: 700, color: "#1a1a18", background: "#eceae2", borderRadius: 6, padding: "1px 8px" }}>
+                            {r.color}
                           </span>
-                          {r.color ? (
-                            <span style={{ fontSize: 12, fontWeight: 700, color: "#1a1a18", background: "#eceae2", borderRadius: 6, padding: "1px 8px" }}>
-                              {r.color}
-                            </span>
-                          ) : null}
-                          {r.customerPo ? (
-                            <span style={{ fontSize: 12, color: "#6b6b64" }}>PO: <b>{r.customerPo}</b></span>
-                          ) : null}
-                          <span style={{ fontSize: 13, color: "#6b6b64" }}>
-                            Asignado: <b>{r.assigned}</b> pzs · Restante: <b style={{ color: r.merchantQty > 0 ? "#b45309" : "#16a34a" }}>{r.merchantQty}</b> pzs
-                          </span>
-                          {r.open && st.selectedCount > 0 && (
-                            <span style={{ fontSize: 12, color: "#1a1a18", fontWeight: 700, background: "#ecece6", borderRadius: 6, padding: "1px 8px" }}>
-                              {st.selectedCount} ticket{st.selectedCount === 1 ? "" : "s"}
-                            </span>
-                          )}
-                        </label>
-                        {r.open && (
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={{ fontSize: 12, color: "#6b6b64" }}>Paquete</span>
-                          <NumberField
-                            min={1} value={r.bundle}
-                            onChangeNumber={(n) => setBundle(i, n)}
-                            style={{ width: 64, padding: "6px 8px", border: "1px solid #d8d8d2", borderRadius: 8, fontSize: 14 }}
-                          />
-                          <button
-                            onClick={() => reSplitRow(i)}
-                            style={{
-                              background: "#1a1a18", color: "#fff", border: "none",
-                              borderRadius: 8, padding: "7px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer",
-                            }}
-                          >
-                            Auto dividir
-                          </button>
-                        </div>
-                        )}
-                      </div>
+                        ) : null}
+                        {r.customerPo ? (
+                          <span style={{ fontSize: 12, color: "#6b6b64" }}>PO: <b>{r.customerPo}</b></span>
+                        ) : null}
+                        <span style={{ fontSize: 13, color: "#6b6b64" }}>
+                          Asignado: <b>{r.assigned}</b> pzs · Restante: <b style={{ color: r.merchantQty > 0 ? "#b45309" : "#16a34a" }}>{r.merchantQty}</b> pzs
+                        </span>
+                      </label>
 
-                      {!r.open ? (
-                        <div style={{ marginTop: 6, fontSize: 12, color: "#9a9a92" }}>
-                          Selecciona la talla para elegir sus tickets.
-                        </div>
-                      ) : (
-                      <>
-                      <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 10 }}>
-                        <span style={{ fontSize: 12, color: "#6b6b64" }}>Tickets:</span>
-                        <button
-                          onClick={() => setSizeAllTickets(i, true)}
-                          style={{ background: "transparent", border: "none", color: "#1a1a18", fontSize: 12, fontWeight: 600, textDecoration: "underline", cursor: "pointer", padding: 0 }}
-                        >
-                          Marcar todos
-                        </button>
-                        <button
-                          onClick={() => setSizeAllTickets(i, false)}
-                          style={{ background: "transparent", border: "none", color: "#6b6b64", fontSize: 12, fontWeight: 600, textDecoration: "underline", cursor: "pointer", padding: 0 }}
-                        >
-                          Ninguno
-                        </button>
-                      </div>
-
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
-                        {r.qtys.map((q, j) => {
-                          const selected = !!r.sel[j];
-                          return (
-                            <div
-                              key={j}
+                      {r.open && (
+                        <>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+                            <span style={{ fontSize: 13, color: "#1a1a18", fontWeight: 600 }}>Cantidad a enviar</span>
+                            <NumberField
+                              min={0}
+                              value={r.sendQty}
+                              autoFocus
+                              disabled={saving}
+                              onChangeNumber={(n) => setSendQty(i, n)}
                               style={{
-                                display: "flex", alignItems: "center", gap: 6,
-                                border: selected ? "1px solid #1a1a18" : "1px solid #d8d8d2",
-                                borderRadius: 8, padding: "4px 6px",
-                                background: "#fff", opacity: selected ? 1 : 0.5,
+                                width: 110, padding: "8px 10px", fontSize: 18, fontWeight: 700, textAlign: "right",
+                                border: st.over ? "1px solid #c0392b" : "1px solid #1a1a18", borderRadius: 8, background: "#fff",
                               }}
+                            />
+                            <span style={{ fontSize: 13, color: "#6b6b64" }}>pzs</span>
+                            <button
+                              onClick={() => setSendQty(i, r.merchantQty)}
+                              disabled={saving}
+                              style={{ background: "transparent", border: "none", color: "#1a1a18", fontSize: 12, fontWeight: 600, textDecoration: "underline", cursor: "pointer", padding: 0 }}
                             >
-                              <input
-                                type="checkbox"
-                                checked={selected}
-                                onChange={() => toggleTicketSel(i, j)}
-                                title="Incluir este ticket"
-                                style={{ width: 16, height: 16, cursor: "pointer" }}
-                              />
-                              <span style={{ fontSize: 11, color: "#9a9a92" }}>#{j + 1}</span>
-                              <NumberField
-                                min={0} value={q}
-                                onChangeNumber={(n) => setTicketQty(i, j, n)}
-                                style={{ width: 72, padding: "6px 8px", border: "none", fontSize: 15, fontWeight: 600, textAlign: "right", outline: "none", background: "transparent" }}
-                              />
-                              <button
-                                onClick={() => removeTicketRow(i, j)}
-                                title="Quitar ticket"
-                                style={{ background: "transparent", border: "none", color: "#c0392b", fontSize: 16, cursor: "pointer", lineHeight: 1 }}
-                              >
-                                ×
-                              </button>
-                            </div>
-                          );
-                        })}
-                        <button
-                          onClick={() => addTicketRow(i)}
-                          style={{
-                            border: "1px dashed #b8b8b0", background: "#fff", color: "#1a1a18",
-                            borderRadius: 8, padding: "6px 10px", fontSize: 13, fontWeight: 600, cursor: "pointer",
-                          }}
-                        >
-                          + Añadir ticket
-                        </button>
-                      </div>
-
-                      <div style={{ marginTop: 8, fontSize: 12, color: st.over ? "#c0392b" : "#4b7a3a", fontWeight: 600 }}>
-                        {st.over
-                          ? `Excede por ${st.assigned - r.merchantQty} pzs — reduce las cantidades`
-                          : `Seleccionados: ${st.selectedCount} · Total en tickets: ${st.assigned} / ${r.merchantQty} · Restante: ${st.remaining}`}
-                      </div>
-                      </>
+                              Todo el restante ({r.merchantQty})
+                            </button>
+                          </div>
+                          <div style={{ marginTop: 8, fontSize: 12, color: st.over ? "#c0392b" : "#4b7a3a", fontWeight: 600 }}>
+                            {st.over
+                              ? `Excede por ${st.qty - r.merchantQty} pzs — máximo ${r.merchantQty}`
+                              : `Quedarán ${st.after} pzs por enviar de esta talla`}
+                          </div>
+                        </>
                       )}
                     </div>
                   );
                 })}
               </div>
 
+              {ticketBuilder.error && (
+                <div style={{ margin: "0 16px 8px", fontSize: 12, fontWeight: 600, color: "#c0392b", background: "#fff5f5", border: "1px solid #f0c9c4", borderRadius: 8, padding: "8px 10px" }}>
+                  {ticketBuilder.error}
+                </div>
+              )}
+
               <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 16px 8px", flexWrap: "wrap" }}>
                 <button
                   onClick={clearAll}
+                  disabled={saving}
                   style={{ background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 8, padding: "6px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
                 >
                   Limpiar selección
                 </button>
                 <span style={{ fontSize: 12, color: "#6b6b64", marginLeft: "auto" }}>
-                  {openCount} talla{openCount === 1 ? "" : "s"} · {selectedTickets} ticket{selectedTickets === 1 ? "" : "s"} seleccionado{selectedTickets === 1 ? "" : "s"}
+                  {readyRows} talla{readyRows === 1 ? "" : "s"} · {totalToSend} pzs a enviar
                 </span>
               </div>
 
               <div style={{ display: "flex", gap: 10, padding: "8px 16px 16px", position: "sticky", bottom: 0, background: "#fff" }}>
                 <button
                   onClick={() => setTicketBuilder(null)}
+                  disabled={saving}
                   style={{ flex: 1, background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
                 >
                   Cancelar
                 </button>
                 <button
                   onClick={generateTickets}
-                  disabled={!canGenerate}
+                  disabled={!canSave}
                   style={{
-                    flex: 2, background: canGenerate ? "#1a1a18" : "#c9c9c2", color: "#fff",
+                    flex: 2, background: canSave ? "#1a1a18" : "#c9c9c2", color: "#fff",
                     border: "none", borderRadius: 10, padding: "12px", fontSize: 15, fontWeight: 700,
-                    cursor: canGenerate ? "pointer" : "not-allowed",
+                    cursor: canSave ? "pointer" : "not-allowed",
                   }}
                 >
-                  Generar {selectedTickets} ticket{selectedTickets === 1 ? "" : "s"}
+                  {saving ? "Generando…" : `🎫 Generar ticket${readyRows === 1 ? "" : "s"}`}
                 </button>
               </div>
             </div>
@@ -2294,7 +2525,7 @@ export default function LineLeaderPage() {
       {/* ============ GENERATED TICKETS (preview + print) ============ */}
       {tickets && tickets.length > 0 && (
         <div
-          onClick={() => setTickets(null)}
+          onClick={closeTickets}
           className="no-print"
           style={{
             position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)",
@@ -2306,25 +2537,17 @@ export default function LineLeaderPage() {
             onClick={(e) => e.stopPropagation()}
             style={{ width: 380, maxWidth: "100%", maxHeight: "90vh", display: "flex", flexDirection: "column" }}
           >
-            {/* Confirmar y guardar: persiste los tickets impresos y descuenta
-                la cantidad asignada por talla para la próxima vez. */}
-            <button
-              onClick={confirmTickets}
-              disabled={confirmingTickets || ticketsConfirmed}
-              style={{
-                width: "100%", marginBottom: 8,
-                background: ticketsConfirmed ? "#4b7a3a" : (confirmingTickets ? "#8a8a82" : "#1f6f43"),
-                color: "#fff", border: "none", borderRadius: 10, padding: "12px",
-                fontSize: 15, fontWeight: 700,
-                cursor: confirmingTickets || ticketsConfirmed ? "default" : "pointer",
-              }}
-            >
-              {ticketsConfirmed
-                ? "✅ Guardado"
-                : confirmingTickets
-                ? "Guardando…"
-                : "✅ Confirmar y guardar"}
-            </button>
+            {/* Aviso: pendiente de guardar / guardado / error */}
+            {!ticketsConfirmed && !ticketConfirmMsg && (
+              <div
+                style={{
+                  marginBottom: 10, fontSize: 12, fontWeight: 600, color: "#8a5a00",
+                  background: "#fff8e6", border: "1px solid #f1dca8", borderRadius: 8, padding: "8px 10px",
+                }}
+              >
+                Revisa los tickets y guárdalos para registrar el envío. Puedes compartirlos o descargarlos (JPG / ZPL) antes de guardar.
+              </div>
+            )}
             {ticketConfirmMsg && (
               <div
                 style={{
@@ -2339,26 +2562,58 @@ export default function LineLeaderPage() {
               </div>
             )}
 
-            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-              <button
-                onClick={printAllTickets}
-                style={{ flex: 2, background: "#1a1a18", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 15, fontWeight: 700, cursor: "pointer" }}
-              >
-                🖨️ Imprimir todo ({tickets.length})
-              </button>
-              <button
-                onClick={() => { setTickets(null); openTicketBuilder(); }}
-                style={{ flex: 1, background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
-              >
-                ← Editar
-              </button>
-              <button
-                onClick={() => setTickets(null)}
-                style={{ flex: 1, background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
-              >
-                Cerrar
-              </button>
-            </div>
+            {!ticketsConfirmed ? (
+              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                <button
+                  onClick={saveTickets}
+                  disabled={ticketSaving}
+                  style={{
+                    flex: 2, background: ticketSaving ? "#c9c9c2" : "#1f6f43", color: "#fff", border: "none",
+                    borderRadius: 10, padding: "12px", fontSize: 15, fontWeight: 700,
+                    cursor: ticketSaving ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {ticketSaving ? "Guardando…" : `💾 Guardar (${tickets.reduce((a, t) => a + (Number(t.qty) || 0), 0)} pzs)`}
+                </button>
+                <button
+                  onClick={editTicketDraft}
+                  disabled={ticketSaving}
+                  title="Volver a cambiar tallas o cantidades"
+                  style={{ flex: 1, background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                >
+                  ✏️ Editar
+                </button>
+                <button
+                  onClick={closeTickets}
+                  disabled={ticketSaving}
+                  style={{ flex: 1, background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                >
+                  Cancelar
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                <button
+                  onClick={printAllTickets}
+                  style={{ flex: 2, background: "#1a1a18", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 15, fontWeight: 700, cursor: "pointer" }}
+                >
+                  🖨️ Imprimir todo ({tickets.length})
+                </button>
+                <button
+                  onClick={() => { setTickets(null); openTicketBuilder(); }}
+                  title="Registrar otro envío al almacén"
+                  style={{ flex: 1, background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                >
+                  + Nuevo envío
+                </button>
+                <button
+                  onClick={closeTickets}
+                  style={{ flex: 1, background: "#fff", color: "#1a1a18", border: "1px solid #d8d8d2", borderRadius: 10, padding: "12px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}
+                >
+                  Cerrar
+                </button>
+              </div>
+            )}
 
             <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, paddingBottom: 8 }}>
               {tickets.map((t, i) => {

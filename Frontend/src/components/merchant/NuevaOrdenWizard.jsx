@@ -105,6 +105,136 @@ function RowField({ label, children, hint }) {
   );
 }
 
+// Piezas de esta prenda por conjunto. 1 chamarra + 1 pantalon = ratio 1 en las
+// dos; "1 chamarra + 2 pantalones" = 1 y 2.
+const ratioNum = (v) => {
+  const n = parseFloat(v);
+  return !isFinite(n) || n <= 0 ? 1 : n;
+};
+
+// Arma las POs de UNA prenda a partir de la rejilla compartida del paso 2.
+//   fabricsFor(row) -> las telas de ESTA prenda en esa fila de color
+//   ratio           -> multiplica las cantidades capturadas
+// Una PO por (color + estilo cliente + PO cliente + fecha de entrega + item code).
+// Con item code activo, cada item code (destino de Nike) es su PROPIA PO aunque
+// todo lo demás coincida.
+//   withItemCode    -> respeta el item code de cada línea (reparto de Nike por
+//                      destino). Dos líneas con la misma talla pero distinto
+//                      item code quedan como líneas SEPARADAS de la misma PO.
+function buildPoPlan({ colorRows, sizes, fabricsFor, ratio = 1, withItemCode = false }) {
+  const order = [];            // first-seen order of the buckets
+  const buckets = new Map();   // key -> { cells: [] }
+  const packingOf = (row, talla) => parseInt(row.packing?.[talla], 10) || 0;
+  const skuOf = (row, talla) => parseInt(row.sku?.[talla], 10) || 0;
+
+  for (const row of colorRows) {
+    const color = row.color.trim();
+    const est = (row.estilo || "").trim();
+    if (!color || est.length !== 6) continue;
+
+    const customerPo = (row.customerPo || "").trim() || null;
+    const commitmentDate = row.deliveryDate || null;
+    const itemCode = withItemCode ? ((row.itemCode || "").trim() || null) : null;
+    const meta = {
+      estilo: est,
+      customerPo,
+      commitmentDate,
+      itemCode,
+      fabrics: cleanFabrics(fabricsFor(row)),
+    };
+    const rowCells = [];
+    for (const talla of sizes) {
+      // Las cantidades se capturan UNA vez (por conjunto) y cada prenda las
+      // multiplica por su ratio.
+      const packingQty = packingOf(row, talla) * ratio;
+      const skuQty = skuOf(row, talla) * ratio;
+      const q = packingQty + skuQty;
+      if (q > 0) rowCells.push({ talla, color, ...meta, packingQty, skuQty, quantity: q });
+    }
+    if (rowCells.length === 0) continue;
+
+    const key = `${color}|${est}|${customerPo || ""}|${commitmentDate || ""}|${itemCode || ""}`;
+    let bucket = buckets.get(key);
+    if (!bucket) { bucket = { cells: [] }; buckets.set(key, bucket); order.push(key); }
+    for (const cell of rowCells) {
+      // Misma talla + mismo item code = se suma. Distinto item code = otra
+      // línea de la PO (el índice único incluye item_code).
+      const dup = bucket.cells.find(
+        (c) => c.talla === cell.talla && (c.itemCode || "") === (cell.itemCode || "")
+      );
+      if (dup) {
+        dup.quantity += cell.quantity;
+        // packing y sku son piezas: se suman igual que la cantidad.
+        dup.packingQty += cell.packingQty;
+        dup.skuQty += cell.skuQty;
+        const seenTela = new Set(dup.fabrics.map((f) => `${f.name}|${f.code || ""}`.toUpperCase()));
+        for (const f of cell.fabrics || []) {
+          const k = `${f.name}|${f.code || ""}`.toUpperCase();
+          if (!seenTela.has(k)) { seenTela.add(k); dup.fabrics = [...dup.fabrics, f]; }
+        }
+      } else {
+        bucket.cells.push({ ...cell, fabrics: [...(cell.fabrics || [])] });
+      }
+    }
+  }
+
+  const firstOf = (cells, k) => cells.find((c) => c[k])?.[k] || null;
+  // Distinct name+code pairs across the PO's lines.
+  const mergeFabrics = (cells) => {
+    const out = [];
+    const seen = new Set();
+    for (const c of cells) {
+      for (const f of c.fabrics || []) {
+        const key = `${f.name}|${f.code || ""}`.toUpperCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(f);
+      }
+    }
+    return out;
+  };
+  return order
+    .map((key) => buckets.get(key))
+    .filter((b) => b.cells.length > 0)
+    .map((b) => {
+      const fabricList = mergeFabrics(b.cells);
+      return {
+        cells: b.cells,
+        // header summary = first line that has a value
+        date: firstOf(b.cells, "commitmentDate"),
+        fabricList,
+        fabricName: fabricList[0]?.name || null,
+        fabricCode: fabricList[0]?.code || null,
+        yield: fabricList[0]?.yield ?? null,
+        customerPos: [...new Set(b.cells.map((c) => c.customerPo).filter(Boolean))].join(", ") || null,
+        itemCodes: [...new Set(b.cells.map((c) => c.itemCode).filter(Boolean))].join(", ") || null,
+        fabrics: fabricList
+          .map((f) => `${f.name}${f.code ? ` (${f.code})` : ""}${f.yield ? ` \u00b7 rend ${f.yield}` : ""}`)
+          .join(", ") || null,
+        pieces: b.cells.reduce((s, c) => s + c.quantity, 0),
+        colors: [...new Set(b.cells.map((c) => c.color))].join(", "),
+        estilos: [...new Set(b.cells.map((c) => c.estilo))].join(", "),
+      };
+    });
+}
+
+// Una PRENDA del pedido. Un pedido normal tiene una; un CONJUNTO (caso Reebok:
+// chamarra + pantalon) tiene dos o mas. Cada prenda es su propio estilo, su
+// propio SAM y su propia foto — y termina siendo su propia PO en produccion.
+// Las CANTIDADES no viven aqui: son las del paso 2, compartidas por todas las
+// prendas y multiplicadas por el ratio de cada una.
+let COMPONENT_SEQ = 0;
+const newComponent = (label = "") => ({
+  id: `c${++COMPONENT_SEQ}`,
+  label,                 // CHAMARRA / PANTALON — lo que FWH vera en la caja
+  tipo: "", modelo: "", correlativo: "",
+  description: "", sam: "",
+  photo: null,
+  ratio: "1",            // piezas de esta prenda por conjunto
+  warehouseStock: "", extraQuantity: "",
+  autoFilling: false,
+});
+
 export default function NuevaOrdenWizard() {
   const [step, setStep] = useState(1);
 
@@ -122,11 +252,20 @@ export default function NuevaOrdenWizard() {
   const [fabrics, setFabrics] = useState([]);
   const [skmSeq, setSkmSeq] = useState("");
 
-  // step 1 — style
-  const [tipo, setTipo] = useState("");
-  const [modelo, setModelo] = useState("");
-  const [correlativo, setCorrelativo] = useState("");
-  const [autoFilling, setAutoFilling] = useState(false);
+  // step 1 — prendas (1 = pedido normal, 2+ = CONJUNTO)
+  const [components, setComponents] = useState([newComponent()]);
+  const isSet = components.length > 1;
+  const primary = components[0];
+  // Alias de solo lectura para todo lo que ya esperaba UN estilo. La prenda 1
+  // sigue siendo "el estilo de la orden".
+  const { tipo, modelo, correlativo, autoFilling } = primary;
+
+  const setComp = (i, patch) =>
+    setComponents((cs) => cs.map((c, idx) => (idx === i ? { ...c, ...patch } : c)));
+  const addComponent = () =>
+    setComponents((cs) => (cs.length >= 4 ? cs : [...cs, newComponent()]));
+  const removeComponent = (i) =>
+    setComponents((cs) => (cs.length === 1 ? cs : cs.filter((_, idx) => idx !== i)));
 
   // step 2 — one line per color + estilo cliente + PO cliente, each with its
   // own delivery date, fabric, fabric code, yield and size quantities.
@@ -134,21 +273,29 @@ export default function NuevaOrdenWizard() {
   // Each line may use SEVERAL fabrics, each with its own code:
   //   fabrics: [{ name, code }, ...]
   const [colorRows, setColorRows] = useState([
-    { color: "", estilo: "", packing: {}, sku: {}, customerPo: "", deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }] },
+    { color: "", estilo: "", itemCode: "", packing: {}, sku: {}, customerPo: "", deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }] },
   ]); // packing / sku (piezas) keyed by talla; la cantidad de la talla = packing + sku
 
   // step 3 — customer
   const [customerId, setCustomerId] = useState("");
   const [clienteCode, setClienteCode] = useState("");
 
-  // step 4 — details + logistics
-  const [description, setDescription] = useState("");
-  const [sam, setSam] = useState("");
-  const [photo, setPhoto] = useState(null);
+  // ITEM CODE por línea. Nike reparte una misma PO entre varios destinos y cada
+  // destino trae su propio item code: la misma talla/color/estilo se captura en
+  // varias líneas, una por item code, y CADA item code es su propia PO. Se enciende sola cuando el cliente es Nike; para otros clientes
+  // es opcional.
+  const [useItemCodes, setUseItemCodes] = useState(false);
+
+  // step 4 — details + logistics. La descripcion, el SAM, la foto, el stock y
+  // los extras son POR PRENDA (viven en components[]): el SAM de una chamarra
+  // no es el de un pantalon, y el stock de una no descuenta la otra.
+  const description = primary.description;
+  const sam = primary.sam;
+  const photo = primary.photo;
   const [seasonCode, setSeasonCode] = useState("");
   const [seasonYear, setSeasonYear] = useState(String(new Date().getFullYear()).slice(-2));
-  const [warehouseStock, setWarehouseStock] = useState("");
-  const [extraQuantity, setExtraQuantity] = useState("");
+  const warehouseStock = primary.warehouseStock;
+  const extraQuantity = primary.extraQuantity;
   // Conversión incremental: cuando se completa una pre-orden que trae varias POs
   // de cliente y solo llegó la tela de una(s), el merchant marca esto para crear
   // SOLO esas POs y dejar la pre-orden como 'parcial' con el resto pendiente.
@@ -182,6 +329,13 @@ export default function NuevaOrdenWizard() {
     })();
   }, []);
 
+  // Cliente Nike -> activa el item code por línea (no lo apaga si se cambia de
+  // cliente: lo ya capturado no se pierde, el merchant lo apaga a mano).
+  useEffect(() => {
+    const c = customers.find((x) => String(x.id) === String(customerId));
+    if (c && /nike/i.test(`${c.name || ""} ${c.code || ""}`)) setUseItemCodes(true);
+  }, [customerId, customers]);
+
   // Carga la pre-orden y precarga los pasos 1, 3 y 4 con lo que ya se sabe.
   useEffect(() => {
     if (!preOrderId) return;
@@ -196,15 +350,19 @@ export default function NuevaOrdenWizard() {
           return;
         }
         setPreOrder(p);
-        if (p.tipo) setTipo(p.tipo);
-        if (p.modelo) setModelo(p.modelo);
-        if (p.correlativo) setCorrelativo(p.correlativo);
+        // La pre-orden precarga la PRIMERA prenda; si el pedido resulta ser un
+        // conjunto, el merchant agrega la segunda a mano en el paso 1.
+        setComponents((cs) => cs.map((c, i) => (i === 0 ? {
+          ...c,
+          tipo: p.tipo || c.tipo,
+          modelo: p.modelo || c.modelo,
+          correlativo: p.correlativo || c.correlativo,
+          description: p.style_description || c.description,
+          // Si la pre-orden ya traia SAM, se hereda para no recapturarlo.
+          sam: Number(p.sam_minutes) > 0 ? String(p.sam_minutes) : c.sam,
+        } : c)));
         if (p.customer_id) setCustomerId(String(p.customer_id));
         if (p.cliente_code) setClienteCode(p.cliente_code);
-        if (p.style_description) setDescription(p.style_description);
-        // Si la pre-orden ya traía SAM, se hereda para no recapturarlo (aquí es
-        // requerido); el merchant lo confirma o ajusta antes de crear la PO.
-        if (Number(p.sam_minutes) > 0) setSam(String(p.sam_minutes));
         // Estilo cliente y PO del cliente entran en la primera línea del paso 2,
         // donde las piezas se reparten por talla y color.
         if (p.estilo || p.customer_po) {
@@ -224,25 +382,28 @@ export default function NuevaOrdenWizard() {
     })();
   }, [preOrderId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // auto-fetch correlativo when tipo+modelo chosen
+  // auto-fetch correlativo when tipo+modelo chosen — para CADA prenda, porque
+  // en un conjunto la chamarra y el pantalon llevan correlativos distintos.
+  const styleKeys = components.map((c) => `${c.tipo}|${c.modelo}|${c.correlativo}`).join(",");
   useEffect(() => {
-    (async () => {
-      if (tipo && modelo && !correlativo) {
-        setAutoFilling(true);
+    components.forEach((c, i) => {
+      if (!c.tipo || !c.modelo || c.correlativo || c.autoFilling) return;
+      (async () => {
+        setComp(i, { autoFilling: true });
         try {
           const res = await fetch(
-            `${API_URL}/api/master-codes/next-correlativo?type=${tipo}&modelo=${modelo}`,
+            `${API_URL}/api/master-codes/next-correlativo?type=${c.tipo}&modelo=${c.modelo}`,
             { headers: authHeaders() }
           );
           if (res.ok) {
             const data = await res.json();
-            if (data.success) setCorrelativo(data.nextCorrelativo);
+            if (data.success) setComp(i, { correlativo: data.nextCorrelativo });
           }
         } catch { /* keep manual entry */ }
-        finally { setAutoFilling(false); }
-      }
-    })();
-  }, [tipo, modelo]); // eslint-disable-line react-hooks/exhaustive-deps
+        finally { setComp(i, { autoFilling: false }); }
+      })();
+    });
+  }, [styleKeys]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ------- derived -----------------------------------------------------
   const styleBase = `${tipo}${modelo}${correlativo}`;
@@ -261,6 +422,7 @@ export default function NuevaOrdenWizard() {
       const meta = {
         estilo: est,
         customerPo: (row.customerPo || "").trim() || null,
+        itemCode: useItemCodes ? ((row.itemCode || "").trim() || null) : null,
       };
       for (const talla of sizes) {
         const packingQty = packingOf(row, talla);
@@ -274,7 +436,7 @@ export default function NuevaOrdenWizard() {
       }
     }
     return out;
-  }, [colorRows, sizes]);
+  }, [colorRows, sizes, useItemCodes]);
 
   // Per-color estilo checks (step 2)
   const activeColorRows = colorRows.filter((r) => r.color.trim());
@@ -282,106 +444,72 @@ export default function NuevaOrdenWizard() {
   // A row's color+estilo may repeat; POs are split by color+estilo+PO+entrega (see poPlan).
   const allEstiloValid =
     activeColorRows.length > 0 && activeColorRows.every((r) => (r.estilo || "").trim().length === 6);
+  // Con item code activo, cada línea necesita el suyo: una línea sin item code
+  // no se sabe a qué destino va.
+  const allItemCodesValid =
+    !useItemCodes || activeColorRows.every((r) => (r.itemCode || "").trim().length > 0);
+  // Misma PO (color+estilo+PO cliente+entrega) con el mismo item code repetido:
+  // las cantidades se suman, casi siempre es un error de captura.
+  const repeatedItemCodes = useItemCodes
+    ? (() => {
+        const seen = new Set(), dups = new Set();
+        for (const r of activeColorRows) {
+          const ic = (r.itemCode || "").trim();
+          if (!ic) continue;
+          const k = [r.color.trim(), (r.estilo || "").trim(), (r.customerPo || "").trim(), r.deliveryDate || "", ic].join("|");
+          if (seen.has(k)) dups.add(ic); else seen.add(k);
+        }
+        return [...dups];
+      })()
+    : [];
+
+  // ---- telas POR PRENDA (accesor) --------------------------------------
+  // Se declara ANTES del useMemo de abajo: ese memo corre durante el render y
+  // usa este accesor, asi que declararlo despues seria un ReferenceError.
+  // La prenda 1 sigue usando row.fabrics (nada cambia para un pedido normal);
+  // las prendas 2+ guardan las suyas en row.fabricsBy[compId].
+  const blankFabrics = () => [{ name: "", code: "", yield: "" }];
+  const fabricsOf = (row, ci) =>
+    (ci === 0 ? row.fabrics : row.fabricsBy?.[components[ci]?.id]) || blankFabrics();
 
   // Build the PO buckets: ONE PO per (color + estilo + PO cliente + fecha de
-  // entrega). Rows that share all four merge into the same PO; the rest of the
-  // details (tallas, cantidades, telas, código de tela, rendimiento) travel with
-  // the bucket. A repeated talla inside a bucket has its quantity summed and its
-  // telas unioned — the (work_order_id, talla, color, estilo) unique index allows
-  // only one line per size in a PO. The header keeps the bucket's values as a
-  // summary. This mirrors the split the backend enforces.
-  const poPlan = useMemo(() => {
-    const order = [];            // first-seen order of the buckets
-    const buckets = new Map();   // key -> { cells: [] }
-    for (const row of colorRows) {
-      const color = row.color.trim();
-      const est = (row.estilo || "").trim();
-      if (!color || est.length !== 6) continue;
-
-      const customerPo = (row.customerPo || "").trim() || null;
-      const commitmentDate = row.deliveryDate || null;
-      const meta = {
-        estilo: est,
-        customerPo,
-        commitmentDate,
-        fabrics: cleanFabrics(row.fabrics),
-      };
-      const rowCells = [];
-      for (const talla of sizes) {
-        const packingQty = packingOf(row, talla);
-        const skuQty = skuOf(row, talla);
-        const q = packingQty + skuQty;
-        if (q > 0) rowCells.push({
-          talla, color, ...meta,
-          packingQty, skuQty,
-          quantity: q,
-        });
-      }
-      if (rowCells.length === 0) continue;
-
-      const key = `${color}|${est}|${customerPo || ""}|${commitmentDate || ""}`;
-      let bucket = buckets.get(key);
-      if (!bucket) { bucket = { cells: [] }; buckets.set(key, bucket); order.push(key); }
-      for (const cell of rowCells) {
-        const dup = bucket.cells.find((c) => c.talla === cell.talla);
-        if (dup) {
-          dup.quantity += cell.quantity;
-          // packing y sku son piezas: se suman igual que la cantidad.
-          dup.packingQty += cell.packingQty;
-          dup.skuQty += cell.skuQty;
-          const seenTela = new Set(dup.fabrics.map((f) => `${f.name}|${f.code || ""}`.toUpperCase()));
-          for (const f of cell.fabrics || []) {
-            const k = `${f.name}|${f.code || ""}`.toUpperCase();
-            if (!seenTela.has(k)) { seenTela.add(k); dup.fabrics = [...dup.fabrics, f]; }
-          }
-        } else {
-          bucket.cells.push({ ...cell, fabrics: [...(cell.fabrics || [])] });
-        }
-      }
-    }
-    const firstOf = (cells, k) => cells.find((c) => c[k])?.[k] || null;
-    // Distinct name+code pairs across the PO's lines.
-    const mergeFabrics = (cells) => {
-      const out = [];
-      const seen = new Set();
-      for (const c of cells) {
-        for (const f of c.fabrics || []) {
-          const key = `${f.name}|${f.code || ""}`.toUpperCase();
-          if (seen.has(key)) continue;
-          seen.add(key);
-          out.push(f);
-        }
-      }
-      return out;
-    };
-    return order
-      .map((key) => buckets.get(key))
-      .filter((b) => b.cells.length > 0)
-      .map((b) => {
-        const fabricList = mergeFabrics(b.cells);
-        return {
-          cells: b.cells,
-          // header summary = first line that has a value
-          date: firstOf(b.cells, "commitmentDate"),
-          fabricList,
-          fabricName: fabricList[0]?.name || null,
-          fabricCode: fabricList[0]?.code || null,
-          yield: fabricList[0]?.yield ?? null,
-          customerPos: [...new Set(b.cells.map((c) => c.customerPo).filter(Boolean))].join(", ") || null,
-          fabrics: fabricList
-            .map((f) => `${f.name}${f.code ? ` (${f.code})` : ""}${f.yield ? ` · rend ${f.yield}` : ""}`)
-            .join(", ") || null,
-          pieces: b.cells.reduce((s, c) => s + c.quantity, 0),
-          colors: [...new Set(b.cells.map((c) => c.color))].join(", "),
-          estilos: [...new Set(b.cells.map((c) => c.estilo))].join(", "),
-        };
-      });
-  }, [colorRows, sizes]);
-
-  const orderedQty = cells.reduce((s, c) => s + c.quantity, 0);
-  const totalToProduce = Math.max(
-    orderedQty - (parseFloat(warehouseStock) || 0) + (parseFloat(extraQuantity) || 0), 0
+  // entrega) Y POR PRENDA. Rows that share all four merge into the same PO; the
+  // rest of the details (tallas, cantidades, telas, código de tela,
+  // rendimiento) travel with the bucket. A repeated talla inside a bucket has
+  // its quantity summed and its telas unioned — the (work_order_id, talla,
+  // color, estilo) unique index allows only one line per size in a PO. The
+  // header keeps the bucket's values as a summary. This mirrors the split the
+  // backend enforces.
+  //
+  // En un CONJUNTO la rejilla de cantidades es UNA SOLA (se captura una vez) y
+  // cada prenda la multiplica por su ratio. Por eso el plan se calcula una vez
+  // POR PRENDA con las telas y el ratio de esa prenda.
+  const plans = useMemo(
+    () => components.map((c, ci) => buildPoPlan({
+      colorRows, sizes,
+      fabricsFor: (row) => fabricsOf(row, ci),
+      ratio: ratioNum(c.ratio),
+      withItemCode: useItemCodes,
+    })),
+    [colorRows, sizes, components, useItemCodes] // eslint-disable-line react-hooks/exhaustive-deps
   );
+  // El plan de la prenda 1: lo que ya usaban la revisión y los totales.
+  const poPlan = plans[0] || [];
+  // Cuántas POs se van a crear en total (todas las prendas).
+  const totalPos = plans.reduce((n, p) => n + p.length, 0);
+
+
+  // La rejilla del paso 2 se captura UNA vez. En un pedido normal eso son
+  // piezas; en un conjunto son CONJUNTOS, y cada prenda multiplica por su ratio.
+  const orderedQty = cells.reduce((s, c) => s + c.quantity, 0);
+  const setsQty = orderedQty;
+  // Piezas reales que va a coser la planta, sumando todas las prendas.
+  const piecesTotal = components.reduce((t, c) => t + setsQty * ratioNum(c.ratio), 0);
+  // Stock y extras son por prenda: el total a producir los descuenta prenda a
+  // prenda, no una sola vez sobre el conjunto.
+  const totalToProduce = components.reduce((t, c) => t + Math.max(
+    setsQty * ratioNum(c.ratio) - (parseFloat(c.warehouseStock) || 0) + (parseFloat(c.extraQuantity) || 0), 0
+  ), 0);
   const season = seasonCode ? `${seasonCode}${seasonYear}` : "";
 
   // Piezas comprometidas en la pre-orden vs. las capturadas hasta ahora. Es una
@@ -424,8 +552,28 @@ export default function NuevaOrdenWizard() {
   // tela, código de tela, rendimiento).
   const setRowField = (i, key, val) =>
     setColorRows((rows) => rows.map((r, idx) => (idx === i ? { ...r, [key]: val } : r)));
+  // Item code de Nike: alfanumérico + guion, en mayúsculas.
+  const setItemCode = (i, val) =>
+    setRowField(i, "itemCode", val.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 40));
+  // Copia la línea (color, estilo, PO, entrega, telas) justo debajo, con item
+  // code y cantidades en blanco: así se reparte la misma línea entre destinos.
+  const duplicateRow = (i) =>
+    setColorRows((rows) => {
+      const src = rows[i];
+      const copy = {
+        ...src,
+        itemCode: "",
+        packing: {},
+        sku: {},
+        fabrics: (src.fabrics || []).map((f) => ({ ...f })),
+        ...(src.fabricsBy
+          ? { fabricsBy: Object.fromEntries(Object.entries(src.fabricsBy).map(([k, v]) => [k, (v || []).map((f) => ({ ...f }))])) }
+          : {}),
+      };
+      return [...rows.slice(0, i + 1), copy, ...rows.slice(i + 1)];
+    });
   const newRow = () => ({
-    color: "", estilo: "", packing: {}, sku: {}, customerPo: "",
+    color: "", estilo: "", itemCode: "", packing: {}, sku: {}, customerPo: "",
     deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }],
   });
 
@@ -479,6 +627,34 @@ export default function NuevaOrdenWizard() {
       idx === i && r.fabrics.length > 1
         ? { ...r, fabrics: r.fabrics.filter((_, fi) => fi !== j) }
         : r));
+  // ---- escritura de telas por prenda (el accesor esta mas arriba) --------
+  const writeFabrics = (i, ci, next) =>
+    setColorRows((rows) => rows.map((r, idx) => {
+      if (idx !== i) return r;
+      if (ci === 0) return { ...r, fabrics: next };
+      return { ...r, fabricsBy: { ...(r.fabricsBy || {}), [components[ci].id]: next } };
+    }));
+  const setFabricFieldFor = (i, ci, j, key, val) => {
+    const list = fabricsOf(colorRows[i], ci).map((f, fi) => {
+      if (fi !== j) return f;
+      const next = { ...f, [key]: val };
+      // Picking a catalogued fabric fills its code, unless one was typed.
+      if (key === "name" && !(f.code || "").trim()) {
+        const hit = fabrics.find((c) => (c.name || "").toLowerCase() === val.trim().toLowerCase());
+        if (hit?.code) next.code = hit.code;
+      }
+      return next;
+    });
+    writeFabrics(i, ci, list);
+  };
+  const addFabricFor = (i, ci) =>
+    writeFabrics(i, ci, [...fabricsOf(colorRows[i], ci), { name: "", code: "", yield: "" }]);
+  const removeFabricFor = (i, ci, j) => {
+    const list = fabricsOf(colorRows[i], ci);
+    if (list.length <= 1) return;
+    writeFabrics(i, ci, list.filter((_, fi) => fi !== j));
+  };
+
   const addColor = () => setColorRows((r) => [...r, newRow()]);
   const removeColor = (i) =>
     setColorRows((r) => (r.length === 1 ? r : r.filter((_, idx) => idx !== i)));
@@ -489,38 +665,58 @@ export default function NuevaOrdenWizard() {
     if (c?.code) setClienteCode(c.code.toUpperCase());
   };
 
-  const handlePhoto = (e) => {
+  // La foto es de la PRENDA: la chamarra y el pantalon no son la misma imagen.
+  const handlePhoto = (e, ci = 0) => {
     const file = e.target.files?.[0];
     if (!file) return;
     // Keep the File for the presigned S3 upload at submit time; the base64 is
     // only used for the on-screen preview thumbnail (not sent in the JSON body).
     const reader = new FileReader();
-    reader.onload = () => setPhoto({ file, url: URL.createObjectURL(file), base64: reader.result });
+    reader.onload = () =>
+      setComp(ci, { photo: { file, url: URL.createObjectURL(file), base64: reader.result } });
     reader.readAsDataURL(file);
   };
 
   // ------- validation per step ----------------------------------------
+  // Cada prenda del conjunto se valida por separado: un conjunto a medio
+  // capturar produciria una PO huerfana sin su pareja.
+  const compName = (c, i) => (c.label || "").trim() || `Prenda ${i + 1}`;
+  const compStyleOk = (c) => c.tipo && c.modelo && (c.correlativo || "").length === 2;
+  const compDetailOk = (c) => (c.description || "").trim() && c.sam && Number(c.sam) > 0;
+  // Nombres distintos: son la etiqueta que FWH usa para saber que pieza falta.
+  const labelsOk = !isSet || (
+    components.every((c) => (c.label || "").trim().length > 0) &&
+    new Set(components.map((c) => (c.label || "").trim().toUpperCase())).size === components.length
+  );
+
   const stepValid = (s) => {
-    if (s === 1) return tipo && modelo && correlativo.length === 2;
-    if (s === 2) return sizes.length > 0 && cells.length > 0 && allEstiloValid;
+    if (s === 1) return components.every(compStyleOk) && labelsOk;
+    if (s === 2) return sizes.length > 0 && cells.length > 0 && allEstiloValid && allItemCodesValid;
     if (s === 3) return customerId && clienteCode.length === 3;
-    if (s === 4) return description.trim() && sam && Number(sam) > 0;
+    if (s === 4) return components.every(compDetailOk);
     return true;
   };
   const canCreate = [1, 2, 3, 4].every(stepValid) && !saving;
 
   // Human-readable list of what's still blocking creation (shown on review step).
   const missing = [
-    !tipo && "Tipo (paso 1)",
-    !modelo && "Modelo (paso 1)",
-    correlativo.length !== 2 && "Correlativo de 2 dígitos (paso 1)",
+    ...components.flatMap((c, i) => {
+      const who = isSet ? ` — ${compName(c, i)}` : "";
+      return [
+        !c.tipo && `Tipo${who} (paso 1)`,
+        !c.modelo && `Modelo${who} (paso 1)`,
+        (c.correlativo || "").length !== 2 && `Correlativo de 2 dígitos${who} (paso 1)`,
+        !(c.description || "").trim() && `Descripción${who} (paso 4)`,
+        !(c.sam && Number(c.sam) > 0) && `SAM mayor a 0${who} (paso 4)`,
+      ];
+    }),
+    !labelsOk && "Un nombre distinto para cada prenda del conjunto (paso 1)",
     sizes.length === 0 && "Al menos una talla (paso 2)",
     cells.length === 0 && "Cantidad en al menos una celda color × talla (paso 2)",
     !allEstiloValid && "Estilo cliente (6 caracteres) por cada color (paso 2)",
+    !allItemCodesValid && "Item code en cada línea (paso 2)",
     !customerId && "Cliente (paso 3)",
     clienteCode.length !== 3 && "Código de cliente de 3 letras (paso 3)",
-    !description.trim() && "Descripción (paso 4)",
-    !(sam && Number(sam) > 0) && "SAM mayor a 0 (paso 4)",
   ].filter(Boolean);
 
   const next = () => { if (stepValid(step)) setStep((s) => Math.min(5, s + 1)); };
@@ -534,44 +730,70 @@ export default function NuevaOrdenWizard() {
       // Upload the photo straight to S3 first (presigned PUT), so only a small
       // key travels in the JSON body — this avoids Lambda's ~6MB request limit
       // (base64 in the body was hitting a 413). One image, shared by all POs.
-      let photoKey = null;
-      if (photo?.file) {
+      // Una foto POR PRENDA: la chamarra y el pantalon no son la misma imagen.
+      const uploadPhoto = async (file) => {
+        if (!file) return null;
         const presRes = await fetch(`${API_URL}/api/master-codes/photo-upload-url`, {
           method: "POST",
           headers: authHeaders(),
           body: JSON.stringify({
-            filename: photo.file.name,
-            contentType: photo.file.type || "image/jpeg",
+            filename: file.name,
+            contentType: file.type || "image/jpeg",
           }),
         });
         const pres = await presRes.json();
         if (!presRes.ok || !pres.uploadUrl) throw new Error(pres.error || "No se pudo preparar la subida de la foto");
-        const putRes = await fetch(pres.uploadUrl, { method: "PUT", body: photo.file });
+        const putRes = await fetch(pres.uploadUrl, { method: "PUT", body: file });
         if (!putRes.ok) throw new Error("No se pudo subir la foto a S3");
-        photoKey = pres.photoKey;
-      }
+        return pres.photoKey;
+      };
+      const photoKeys = [];
+      for (const c of components) photoKeys.push(await uploadPhoto(c.photo?.file));
+      const photoKey = photoKeys[0];   // compat: la foto de la prenda 1
 
       // One atomic request. The backend creates one PO per bucket in poPlan
       // (distinct color+estilo rows share the first PO; each repeat is its own PO)
       // and auto-numbers them (SKM####).
+      // Cada PO de cada prenda, ya con sus cantidades multiplicadas por el
+      // ratio. El backend crea UNA PO por elemento de `orders` y, cuando hay 2+
+      // prendas, tambien la cabecera del conjunto que las amarra.
+      const ordersOf = (plan) => plan.map((p) => ({
+        // Each cell carries its own customerPo, commitmentDate, fabricName,
+        // fabricCode and yield -> work_order_lines. The order-level values
+        // below are the header summary (and the fallback for blank lines).
+        lines: p.cells,
+        commitmentDate: p.date,
+        fabrics: p.fabricList,
+        fabricName: p.fabricName,
+        fabricCode: p.fabricCode,
+        yield: p.yield,
+      }));
+
       const payload = {
+        // Compat: la prenda 1 sigue viajando tambien en la raiz, para cualquier
+        // consumidor viejo del endpoint.
         tipo, modelo, correlativo,
         clienteCode, customerId: Number(customerId),
-        description: description.trim(), sam: Number(sam),
+        description: (description || "").trim(), sam: Number(sam),
         photoKey,
-        orders: poPlan.map((p) => ({
-          // Each cell carries its own customerPo, commitmentDate, fabricName,
-          // fabricCode and yield -> work_order_lines. The order-level values
-          // below are the header summary (and the fallback for blank lines).
-          lines: p.cells,
-          commitmentDate: p.date,
-          fabrics: p.fabricList,
-          fabricName: p.fabricName,
-          fabricCode: p.fabricCode,
-          yield: p.yield,
+        orders: ordersOf(plans[0] || []),
+        components: components.map((c, ci) => ({
+          label: (c.label || "").trim() || null,   // CHAMARRA / PANTALON
+          ratio: ratioNum(c.ratio),
+          tipo: c.tipo, modelo: c.modelo, correlativo: c.correlativo,
+          description: (c.description || "").trim(),
+          sam: Number(c.sam),
+          photoKey: photoKeys[ci] || null,
+          // Stock y extras son POR PRENDA: el stock de chamarras no descuenta
+          // pantalones.
+          warehouseStock: parseFloat(c.warehouseStock) || 0,
+          extraQuantity: parseFloat(c.extraQuantity) || 0,
+          orders: ordersOf(plans[ci] || []),
         })),
+        // Solo se usa cuando hay 2+ prendas.
+        set: isSet ? { label: components.map((c, i) => compName(c, i)).join(" + ") } : null,
         season: season || null,
-        // Stock/extras count once — the backend applies them to the first PO only.
+        // Compat con el cuerpo viejo (un solo estilo).
         warehouseStock: parseFloat(warehouseStock) || 0,
         extraQuantity: parseFloat(extraQuantity) || 0,
       };
@@ -582,7 +804,9 @@ export default function NuevaOrdenWizard() {
       if (!res.ok) throw new Error(data.error || "No se pudieron crear las órdenes");
 
       const nos = (data.workOrders || [data.workOrder]).filter(Boolean).map((w) => w.work_order_no);
-      showToast(`✅ ${nos.length} orden(es) creada(s): ${nos.join(", ")}`);
+      showToast(data.set
+        ? `✅ Conjunto ${data.set.set_no} creado con ${nos.length} orden(es): ${nos.join(", ")}`
+        : `✅ ${nos.length} orden(es) creada(s): ${nos.join(", ")}`);
 
       // Cierra la pre-orden y le deja el rastro de las POs que produjo. Si esto
       // falla las órdenes YA existen: se avisa y la pre-orden queda pendiente
@@ -616,11 +840,11 @@ export default function NuevaOrdenWizard() {
       }
       // reset
       setStep(1);
-      setTipo(""); setModelo(""); setCorrelativo("");
+      setComponents([newComponent()]);
       setSizes([]); setColorRows([newRow()]);
       setCustomerId(""); setClienteCode("");
-      setDescription(""); setSam(""); setPhoto(null);
-      setSeasonCode(""); setWarehouseStock(""); setExtraQuantity("");
+      setUseItemCodes(false);
+      setSeasonCode("");
       if (fileRef.current) fileRef.current.value = "";
       const seqRes = await fetch(`${API_URL}/api/production-orders/next-number`, { headers: authHeaders() });
       if (seqRes.ok) setSkmSeq((await seqRes.json()).sequence || "");
@@ -702,33 +926,108 @@ export default function NuevaOrdenWizard() {
           </div>
         </div>
 
-        {/* Step 1 — Style */}
+        {/* Step 1 — Prendas (1 = pedido normal, 2+ = conjunto) */}
         {step === 1 && (
-          <SectionCard icon={Layers} title="1 · Estilo" subtitle="Tipo y modelo — el correlativo se genera solo">
-            <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide mb-2">Tipo</p>
-            <ChipGrid options={TIPOS} value={tipo} onChange={(v) => { setTipo(v); setCorrelativo(""); }} />
-            <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide mt-5 mb-2">Modelo</p>
-            <ChipGrid options={MODELOS} value={modelo} onChange={(v) => { setModelo(v); setCorrelativo(""); }} />
-            <div className="mt-5 flex items-end gap-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Correlativo</label>
-                <input
-                  value={correlativo}
-                  onChange={(e) => setCorrelativo(e.target.value.replace(/[^0-9]/g, "").slice(0, 2))}
-                  placeholder="01"
-                  className="w-24 rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm tracking-widest text-center
-                             focus:outline-none focus:ring-2 focus:ring-slate-900"
-                />
-                <p className="text-[11px] text-slate-400 mt-1">{autoFilling ? "Cargando…" : "2 dígitos · auto"}</p>
+          <div className="space-y-4">
+            {components.map((c, ci) => {
+              const base = `${c.tipo}${c.modelo}${c.correlativo}`;
+              return (
+                <SectionCard
+                  key={c.id}
+                  icon={Layers}
+                  title={isSet ? `1 · Prenda ${ci + 1}${c.label ? ` · ${c.label}` : ""}` : "1 · Estilo"}
+                  subtitle="Tipo y modelo — el correlativo se genera solo"
+                >
+                  {isSet && (
+                    <div className="flex items-end gap-3 mb-4">
+                      <div className="flex-1">
+                        <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">
+                          Nombre de la prenda
+                        </label>
+                        <input
+                          value={c.label}
+                          onChange={(e) => setComp(ci, { label: e.target.value.toUpperCase().slice(0, 20) })}
+                          placeholder="CHAMARRA"
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm
+                                     focus:outline-none focus:ring-2 focus:ring-slate-900"
+                        />
+                        <p className="text-[11px] text-slate-400 mt-1">
+                          Es lo que verá el almacén al armar la caja
+                        </p>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">
+                          Pzs por conjunto
+                        </label>
+                        <input
+                          value={c.ratio}
+                          onChange={(e) => setComp(ci, { ratio: e.target.value.replace(/[^0-9.]/g, "") })}
+                          inputMode="decimal"
+                          className="w-24 rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm text-center
+                                     focus:outline-none focus:ring-2 focus:ring-slate-900"
+                        />
+                      </div>
+                      {components.length > 1 && (
+                        <button type="button" onClick={() => removeComponent(ci)}
+                          className="rounded-lg border border-slate-200 p-2 text-slate-400 hover:text-rose-600 hover:border-rose-300">
+                          <Trash2 size={16} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide mb-2">Tipo</p>
+                  <ChipGrid options={TIPOS} value={c.tipo}
+                    onChange={(v) => setComp(ci, { tipo: v, correlativo: "" })} />
+                  <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide mt-5 mb-2">Modelo</p>
+                  <ChipGrid options={MODELOS} value={c.modelo}
+                    onChange={(v) => setComp(ci, { modelo: v, correlativo: "" })} />
+                  <div className="mt-5 flex items-end gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Correlativo</label>
+                      <input
+                        value={c.correlativo}
+                        onChange={(e) => setComp(ci, { correlativo: e.target.value.replace(/[^0-9]/g, "").slice(0, 2) })}
+                        placeholder="01"
+                        className="w-24 rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm tracking-widest text-center
+                                   focus:outline-none focus:ring-2 focus:ring-slate-900"
+                      />
+                      <p className="text-[11px] text-slate-400 mt-1">{c.autoFilling ? "Cargando…" : "2 dígitos · auto"}</p>
+                    </div>
+                    {base.length === 8 && (
+                      <div className="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
+                        <span className="text-[11px] text-slate-500 uppercase tracking-wide">Estilo</span>
+                        <p className="font-mono text-sm font-bold text-slate-800">{base}</p>
+                      </div>
+                    )}
+                  </div>
+                </SectionCard>
+              );
+            })}
+
+            {/* CONJUNTO: el cliente compra chamarra + pantalón como una unidad.
+                Se captura UNA vez; producción recibe una PO por prenda y el
+                almacén las vuelve a juntar al final. */}
+            {components.length < 4 && (
+              <button type="button" onClick={addComponent}
+                className="w-full rounded-xl border-2 border-dashed border-slate-300 bg-white px-4 py-3
+                           text-sm font-medium text-slate-600 hover:border-slate-900 hover:text-slate-900
+                           inline-flex items-center justify-center gap-2">
+                <Plus size={16} />
+                {isSet ? "Agregar otra prenda al conjunto" : "Es un conjunto (chamarra + pantalón)"}
+              </button>
+            )}
+            {isSet && (
+              <div className="rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3">
+                <p className="text-xs text-indigo-800 leading-relaxed">
+                  <b>Conjunto de {components.length} prendas.</b> Las tallas, colores y cantidades se
+                  capturan <b>una sola vez</b> en el paso 2 y cada prenda las multiplica por sus
+                  piezas por conjunto. Se creará <b>una PO por prenda</b> para producción, agrupadas
+                  bajo un número de conjunto para el cliente y el almacén.
+                </p>
               </div>
-              {styleBase.length === 8 && (
-                <div className="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
-                  <span className="text-[11px] text-slate-500 uppercase tracking-wide">Estilo</span>
-                  <p className="font-mono text-sm font-bold text-slate-800">{styleBase}</p>
-                </div>
-              )}
-            </div>
-          </SectionCard>
+            )}
+          </div>
         )}
 
         {/* Step 2 — Sizes + colors grid */}
@@ -750,6 +1049,18 @@ export default function NuevaOrdenWizard() {
               })}
             </div>
 
+            {/* Item code por línea (Nike reparte la PO por destino) */}
+            <label className="mt-4 flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 cursor-pointer">
+              <input type="checkbox" checked={useItemCodes} onChange={(e) => setUseItemCodes(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-slate-300" />
+              <span className="text-xs text-slate-600">
+                <b className="text-slate-800">Item code por línea</b>
+                <span className="text-slate-500"> · para clientes como Nike que reparten la misma PO entre varios destinos.
+                  Captura una línea por item code (usa <i>Duplicar</i>); cada item code se vuelve su propia orden de
+                  producción, aunque el color, estilo, PO y entrega sean iguales.</span>
+              </span>
+            </label>
+
             {sizes.length === 0 ? (
               <p className="text-sm text-slate-400 mt-4">Selecciona al menos una talla para capturar cantidades.</p>
             ) : (
@@ -767,14 +1078,23 @@ export default function NuevaOrdenWizard() {
                             {rowPieces.toLocaleString()} pzs
                           </span>
                         </span>
-                        <button type="button" onClick={() => removeColor(i)} disabled={colorRows.length === 1}
-                          className="p-1.5 rounded hover:bg-rose-100 text-rose-500 disabled:opacity-30">
-                          <Trash2 size={15} />
-                        </button>
+                        <div className="flex items-center gap-1">
+                          {useItemCodes && (
+                            <button type="button" onClick={() => duplicateRow(i)}
+                              title="Copiar esta línea para otro item code / destino"
+                              className="inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-200">
+                              <Plus size={12} /> Duplicar
+                            </button>
+                          )}
+                          <button type="button" onClick={() => removeColor(i)} disabled={colorRows.length === 1}
+                            className="p-1.5 rounded hover:bg-rose-100 text-rose-500 disabled:opacity-30">
+                            <Trash2 size={15} />
+                          </button>
+                        </div>
                       </div>
 
                       {/* Identity + logistics for this line */}
-                      <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                      <div className={`grid grid-cols-2 sm:grid-cols-2 gap-2 ${useItemCodes ? "lg:grid-cols-5" : "lg:grid-cols-4"}`}>
                         <RowField label="Color">
                           <input value={row.color} onChange={(e) => setColor(i, e.target.value)} placeholder="NEG"
                             className="w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm uppercase tracking-widest
@@ -797,10 +1117,28 @@ export default function NuevaOrdenWizard() {
                             className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm
                                        focus:outline-none focus:ring-2 focus:ring-slate-900" />
                         </RowField>
+                        {useItemCodes && (
+                          <RowField label="Item code" hint="Item code / destino del cliente para estas cantidades">
+                            <input value={row.itemCode || ""} onChange={(e) => setItemCode(i, e.target.value)}
+                              placeholder="Item code"
+                              className={`w-full rounded-lg border px-2 py-1.5 font-mono text-sm uppercase
+                                         focus:outline-none focus:ring-2 focus:ring-slate-900
+                                         ${row.color.trim() && !(row.itemCode || "").trim()
+                                           ? "border-rose-300 bg-rose-50"
+                                           : repeatedItemCodes.includes((row.itemCode || "").trim()) ? "border-amber-400 bg-amber-50" : "border-slate-300"}`} />
+                          </RowField>
+                        )}
                       </div>
 
-                      {/* Telas: one or more per line, each with its own code and rendimiento */}
+                      {/* Telas: one or more per line, each with its own code and rendimiento.
+                          En un CONJUNTO cada prenda lleva sus propias telas: la
+                          chamarra y el pantalón casi nunca son la misma. */}
                       <div className="mt-3 rounded-lg border border-slate-200 bg-white p-2">
+                        {isSet && (
+                          <p className="px-0.5 pb-1 text-[10px] font-bold uppercase tracking-wide text-indigo-600">
+                            Telas · {compName(components[0], 0)}
+                          </p>
+                        )}
                         <div className="grid grid-cols-[minmax(0,1fr)_8rem_6rem_2rem] gap-2 px-0.5 pb-1">
                           <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Tela</span>
                           <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Código</span>
@@ -850,7 +1188,56 @@ export default function NuevaOrdenWizard() {
                         </button>
                       </div>
 
-                      {/* Cantidad por talla = packing + SKU (ambas en piezas) */}
+                      {/* Telas de las demás prendas del conjunto. Mismo color,
+                          mismo estilo cliente, misma entrega — otra tela. */}
+                      {components.slice(1).map((comp, k) => {
+                        const ci = k + 1;
+                        const list = fabricsOf(row, ci);
+                        return (
+                          <div key={comp.id} className="mt-2 rounded-lg border border-indigo-200 bg-indigo-50/40 p-2">
+                            <p className="px-0.5 pb-1 text-[10px] font-bold uppercase tracking-wide text-indigo-600">
+                              Telas · {compName(comp, ci)}
+                            </p>
+                            <div className="grid grid-cols-[minmax(0,1fr)_8rem_6rem_2rem] gap-2 px-0.5 pb-1">
+                              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Tela</span>
+                              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Código</span>
+                              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Rend.</span>
+                              <span />
+                            </div>
+                            <div className="space-y-1.5">
+                              {list.map((f, j) => (
+                                <div key={j} className="grid grid-cols-[minmax(0,1fr)_8rem_6rem_2rem] gap-2 items-center">
+                                  <input value={f.name || ""} onChange={(e) => setFabricFieldFor(i, ci, j, "name", e.target.value)}
+                                    list="fabric-names" placeholder="Nombre de la tela"
+                                    className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                  <input value={f.code || ""} onChange={(e) => setFabricFieldFor(i, ci, j, "code", e.target.value.toUpperCase())}
+                                    placeholder="Código"
+                                    className="w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm uppercase
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                  <input value={f.yield || ""} onChange={(e) => setFabricFieldFor(i, ci, j, "yield", e.target.value.replace(/[^0-9.]/g, ""))}
+                                    inputMode="decimal" placeholder="0.00" title="Rendimiento de esta tela"
+                                    className="w-full rounded-lg border border-slate-300 px-2 py-1.5 font-mono text-sm text-right
+                                               focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                                  <button type="button" onClick={() => removeFabricFor(i, ci, j)} disabled={list.length === 1}
+                                    title="Quitar tela"
+                                    className="h-8 w-8 flex items-center justify-center rounded hover:bg-rose-100 text-rose-500 disabled:opacity-30">
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                            <button type="button" onClick={() => addFabricFor(i, ci)}
+                              className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-900">
+                              <Plus size={12} /> Agregar tela
+                            </button>
+                          </div>
+                        );
+                      })}
+
+                      {/* Cantidad por talla = packing + SKU (ambas en piezas).
+                          En un conjunto se captura UNA vez: es la cantidad del
+                          CONJUNTO, y cada prenda la multiplica por su ratio. */}
                       <div className="mt-3">
                         <div className="flex items-center gap-2 mb-1">
                           <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
@@ -908,10 +1295,16 @@ export default function NuevaOrdenWizard() {
                 <p className="text-xs text-slate-500 mt-3">
                   {cells.length} combinación(es) · {orderedQty.toLocaleString()} piezas · {poPlan.length} orden(es) de producción · {new Set(cells.map((c) => `${c.talla}|${c.color}|${c.estilo}`)).size} código(s) maestro(s)
                 </p>
+                {repeatedItemCodes.length > 0 && (
+                  <p className="text-xs text-amber-700 mt-1 flex items-start gap-1">
+                    <AlertCircle size={12} className="mt-0.5 shrink-0" />
+                    Item code repetido en la misma orden ({repeatedItemCodes.join(", ")}): sus cantidades se van a sumar.
+                  </p>
+                )}
                 {poPlan.length > 1 && (
                   <p className="text-xs text-slate-500 mt-1 flex items-start gap-1">
                     <AlertCircle size={12} className="mt-0.5 shrink-0" />
-                    Se crearán {poPlan.length} órdenes (números automáticos): una orden por cada combinación de color + estilo + PO cliente + fecha de entrega.
+                    Se crearán {poPlan.length} órdenes (números automáticos): una orden por cada combinación de color + estilo + PO cliente + fecha de entrega{useItemCodes ? " + item code" : ""}.
                   </p>
                 )}
               </div>
@@ -948,31 +1341,54 @@ export default function NuevaOrdenWizard() {
         {/* Step 4 — Details + logistics */}
         {step === 4 && (
           <div className="space-y-6">
-            <SectionCard icon={FileText} title="4 · Detalles del estilo" subtitle="Descripción y SAM (requeridos para el código maestro)">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="sm:col-span-2">
-                  <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Descripción</label>
-                  <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3}
-                    placeholder="Pantalón dama invierno, tela franela, color negro…"
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-slate-900" />
+            {/* Descripción, SAM, foto, stock y extras son POR PRENDA: el SAM de
+                una chamarra no es el de un pantalón, y el stock de una no puede
+                descontar piezas de la otra. */}
+            {components.map((c, ci) => (
+              <SectionCard
+                key={c.id}
+                icon={FileText}
+                title={isSet ? `4 · Detalles · ${compName(c, ci)}` : "4 · Detalles del estilo"}
+                subtitle="Descripción y SAM (requeridos para el código maestro)"
+              >
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="sm:col-span-2">
+                    <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Descripción</label>
+                    <textarea value={c.description} onChange={(e) => setComp(ci, { description: e.target.value })} rows={3}
+                      placeholder="Pantalón dama invierno, tela franela, color negro…"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">SAM (minutos)</label>
+                    <input type="number" min="0" step="0.01" value={c.sam} onChange={(e) => setComp(ci, { sam: e.target.value })} placeholder="12.50"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Foto (opcional)</label>
+                    <input ref={ci === 0 ? fileRef : null} type="file" accept="image/*"
+                      onChange={(e) => handlePhoto(e, ci)} className="hidden" id={`wiz-photo-${c.id}`} />
+                    <label htmlFor={`wiz-photo-${c.id}`}
+                      className="flex items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-300 px-3 py-3 cursor-pointer text-slate-500 hover:border-slate-500">
+                      {c.photo ? <img src={c.photo.url} alt="" className="h-16 object-contain rounded" /> : (<><Camera size={16} /><span className="text-sm">Subir foto</span></>)}
+                    </label>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-500 mb-1 uppercase">Stock almacén</label>
+                    <input value={c.warehouseStock} onChange={(e) => setComp(ci, { warehouseStock: e.target.value.replace(/[^0-9.]/g, "") })}
+                      inputMode="decimal" placeholder="0"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-500 mb-1 uppercase">Extras</label>
+                    <input value={c.extraQuantity} onChange={(e) => setComp(ci, { extraQuantity: e.target.value.replace(/[^0-9.]/g, "") })}
+                      inputMode="decimal" placeholder="0"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                  </div>
                 </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">SAM (minutos)</label>
-                  <input type="number" min="0" step="0.01" value={sam} onChange={(e) => setSam(e.target.value)} placeholder="12.50"
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Foto (opcional)</label>
-                  <input ref={fileRef} type="file" accept="image/*" onChange={handlePhoto} className="hidden" id="wiz-photo" />
-                  <label htmlFor="wiz-photo"
-                    className="flex items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-300 px-3 py-3 cursor-pointer text-slate-500 hover:border-slate-500">
-                    {photo ? <img src={photo.url} alt="" className="h-16 object-contain rounded" /> : (<><Camera size={16} /><span className="text-sm">Subir foto</span></>)}
-                  </label>
-                </div>
-              </div>
-            </SectionCard>
+              </SectionCard>
+            ))}
 
-            <SectionCard icon={CalendarClock} title="Logística" subtitle="Temporada, stock y extras (entrega y tela se capturan por línea en el paso 2)">
+            <SectionCard icon={CalendarClock} title="Logística" subtitle="Temporada (entrega y tela se capturan por línea en el paso 2; stock y extras, por prenda)">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">Temporada</label>
@@ -989,18 +1405,7 @@ export default function NuevaOrdenWizard() {
                   </div>
                   <p className="text-[11px] text-slate-400 mt-1">{season ? `= ${season}` : "código + año (ej. SU26)"}</p>
                 </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-500 mb-1 uppercase">Stock almacén</label>
-                    <input value={warehouseStock} onChange={(e) => setWarehouseStock(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" placeholder="0"
-                      className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-500 mb-1 uppercase">Extras</label>
-                    <input value={extraQuantity} onChange={(e) => setExtraQuantity(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" placeholder="0"
-                      className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
-                  </div>
-                </div>
+                {/* Stock y extras ahora viven en la tarjeta de cada prenda. */}
               </div>
             </SectionCard>
           </div>
@@ -1008,43 +1413,87 @@ export default function NuevaOrdenWizard() {
 
         {/* Step 5 — Review */}
         {step === 5 && (
-          <SectionCard icon={ClipboardList} title="5 · Revisar y crear" subtitle={`Se creará${poPlan.length === 1 ? "" : "n"} ${poPlan.length} orden(es) de producción — una por color + estilo + PO cliente + fecha de entrega`}>
+          <SectionCard icon={ClipboardList} title="5 · Revisar y crear"
+            subtitle={isSet
+              ? `Conjunto de ${components.length} prendas — se crearán ${totalPos} órdenes de producción, una por prenda × color × estilo × PO cliente × entrega`
+              : `Se creará${totalPos === 1 ? "" : "n"} ${totalPos} orden(es) de producción — una por color + estilo + PO cliente + fecha de entrega${useItemCodes ? " + item code" : ""}`}>
+
+            {/* CONJUNTO: lo que el cliente compra (una unidad) vs. lo que la
+                planta produce (una PO por prenda). Verlo junto aquí evita la
+                sorpresa de "pedí 500 y salieron 1,000 piezas". */}
+            {isSet && (
+              <div className="rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3 mb-4">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-[11px] font-bold uppercase tracking-widest text-indigo-500">Conjunto</span>
+                  <span className="text-[11px] text-indigo-500">N° automático (SET####)</span>
+                </div>
+                <p className="mt-1 font-mono text-lg font-bold text-indigo-900">
+                  {components.map((c, i) => compName(c, i)).join(" + ")}
+                </p>
+                <p className="mt-1 text-xs text-indigo-800">
+                  <b>{setsQty.toLocaleString()} conjuntos</b> ·{" "}
+                  {components.map((c, i) => (
+                    <span key={c.id}>
+                      {i > 0 && " + "}
+                      {compName(c, i)} {(setsQty * ratioNum(c.ratio)).toLocaleString()} pzs
+                    </span>
+                  ))}
+                  {" = "}
+                  <b>{piecesTotal.toLocaleString()} piezas</b> a producir
+                </p>
+              </div>
+            )}
+
             <div className="rounded-lg bg-slate-900 text-white px-4 py-3 mb-4">
               <span className="text-[11px] uppercase tracking-widest text-slate-400">
-                {poPlan.length === 1 ? "N° de orden" : `${poPlan.length} órdenes de producción`}
+                {totalPos === 1 ? "N° de orden" : `${totalPos} órdenes de producción`}
               </span>
-              <div className="mt-1 space-y-1.5">
-                {poPlan.length === 0 ? (
+              <div className="mt-1 space-y-3">
+                {totalPos === 0 ? (
                   <p className="font-mono text-lg font-bold">—</p>
                 ) : (
-                  poPlan.map((p, i) => (
-                    <div key={i} className="flex items-center justify-between gap-3">
-                      <p className="font-mono text-sm font-bold">
-                        PO {i + 1} <span className="text-slate-400 font-normal">· N° automático</span>
-                      </p>
-                      <span className="text-xs text-slate-300">
-                        <b className="font-mono text-white">{p.colors}</b> · {p.estilos} · {p.pieces.toLocaleString()} pzs
-                        {" · "}
-                        <span className="text-slate-400">
-                          entrega {p.date || "—"}
-                          {" · PO "}{p.customerPos || "—"}
-                          {" · tela "}{p.fabrics || "—"}
-                        </span>
-                      </span>
+                  components.map((c, ci) => (
+                    <div key={c.id}>
+                      {isSet && (
+                        <p className="text-[10px] font-bold uppercase tracking-widest text-indigo-300 mb-1">
+                          {compName(c, ci)} · {c.tipo}{c.modelo}{c.correlativo} · SAM {c.sam || "—"}
+                        </p>
+                      )}
+                      <div className="space-y-1.5">
+                        {(plans[ci] || []).map((p, i) => (
+                          <div key={i} className="flex items-center justify-between gap-3">
+                            <p className="font-mono text-sm font-bold">
+                              PO {i + 1} <span className="text-slate-400 font-normal">· N° automático</span>
+                            </p>
+                            <span className="text-xs text-slate-300">
+                              <b className="font-mono text-white">{p.colors}</b> · {p.estilos} · {p.pieces.toLocaleString()} pzs
+                              {" · "}
+                              <span className="text-slate-400">
+                                entrega {p.date || "—"}
+                                {" · PO "}{p.customerPos || "—"}
+                                {p.itemCodes && <>{" · item "}{p.itemCodes}</>}
+                                {" · tela "}{p.fabrics || "—"}
+                              </span>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   ))
                 )}
               </div>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
-              <Info label="Estilo" value={styleBase} />
+              <Info label={isSet ? "Estilos" : "Estilo"}
+                value={components.map((c) => `${c.tipo}${c.modelo}${c.correlativo}`).filter((v) => v.length === 8).join(" · ") || "—"} />
               <Info label="Cliente" value={customers.find((c) => String(c.id) === String(customerId))?.name || "—"} />
               <Info label="Estilos cliente" value={[...new Set(cells.map((c) => c.estilo))].join(", ") || "—"} />
               <Info label="Tallas" value={sizes.join(", ") || "—"} />
               <Info label="Colores" value={[...new Set(cells.map((c) => c.color))].join(", ") || "—"} />
               <Info label="Códigos maestros" value={String(new Set(cells.map((c) => `${c.talla}|${c.color}|${c.estilo}`)).size)} />
-              <Info label="Cantidad pedida" value={orderedQty.toLocaleString()} />
-              <Info label="SAM" value={sam ? `${sam} min` : "—"} />
+              <Info label={isSet ? "Conjuntos pedidos" : "Cantidad pedida"} value={setsQty.toLocaleString()} />
+              <Info label="SAM"
+                value={components.map((c, i) => (isSet ? `${compName(c, i)} ${c.sam || "—"}` : `${c.sam || "—"} min`)).join(" · ")} />
               <Info label="Temporada" value={season || "—"} />
               <Info label="Total a producir" value={totalToProduce.toLocaleString()} />
             </div>
@@ -1061,6 +1510,9 @@ export default function NuevaOrdenWizard() {
                       <span className={`font-mono text-sm font-bold ${(r.estilo || "").length === 6 ? "text-slate-800" : "text-rose-500"}`}>
                         {r.estilo || "—"}
                       </span>
+                      {useItemCodes && (r.itemCode || "").trim() && (
+                        <span className="font-mono text-xs text-indigo-600">· item {r.itemCode.trim()}</span>
+                      )}
                     </span>
                   ))}
                 </div>

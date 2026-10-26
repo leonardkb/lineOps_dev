@@ -6,6 +6,7 @@ import FinishedWarehouseNav from "../../components/FWH/FinishedWarehouseNav";
 import PrePacking from "../../components/FWH/PrePacking";
 import FinishedWarehouseDashboard from "../../components/FWH/Finishedwarehousedashboard";
 import FinishedWarehouseScan from "../../components/FWH/Finishedwarehousescan";
+import FinishedWarehouseInventory from "../../components/FWH/FinishedWarehouseInventory";
 // When they exist, drop these in and replace the placeholders below:
 // import FinishedWarehouseDashboard from "./FinishedWarehouseDashboard";
 // import FinishedInventory from "./FinishedInventory";
@@ -26,7 +27,7 @@ export default function FinishedWarehouse() {
       )}
 
       {tab === "inventario" && (
-        <div className="max-w-6xl mx-auto p-10 text-center text-gray-400">Inventario — próximamente</div>
+        <FinishedWarehouseInventory active ={tab} onNavigate={setTab} />
       )}
     </div>
   );

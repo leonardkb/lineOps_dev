@@ -19,31 +19,63 @@
 // re-deriving it here is how the two dashboards start disagreeing.
 //   /api/skyrina/style-performance       -> horizontal Meta vs Producido bars
 //   /api/skyrina/line-performance-detail -> product table
-//
-// ONE CREW PER STYLE (same style, different colour)
-// A colour split — style DAMCHA01 running BLA and NEG on the same line, same day —
-// is stored as two line_runs rows but is ONE crew: the same operators, the same
-// hours, the same target board. Every "Meta" and every efficiency denominator on
-// this page therefore counts that crew ONCE (MAX across the colour rows), while
-// "Producido" and SAM output still SUM across colours, because each colour really
-// does sew and pack its own pieces. Same rule Dashboard.jsx applies per card.
-//
-// The dedup lives in SQL, not here: all four routes above return numbers that are
-// already crew-deduped, keyed on (run_date, line_no, style). Do NOT re-derive Meta
-// or capacity in this file from summed run values — that is exactly how a
-// two-colour style ends up with a doubled target and a halved efficiency.
 //   /api/skyrina/available-styles        -> estilo dropdown
 //   /api/skyrina/available-lines         -> línea dropdown
+//   /api/skyrina/available-customers     -> cliente dropdown
+//   /api/skyrina/realtime-summary        -> "Hoy · Tiempo real" KPI card
+//
+// The "Hoy · Tiempo real" card shows three figures, matching SkyrinaDashboard:
+// Producido, META RT and Diario (settled SAM efficiency). realtime-summary
+// pro-rates today's Meta by how far into the shift we are (8:00 -> last slot end)
+// using PLANT-LOCAL time, so it reports the same META RT the browser-side
+// SkyrinaDashboard shows (computing it in the server's own timezone inflated the
+// elapsed fraction — 96% / 8,503 instead of 34.8% / 3,100). Like the other rail
+// cards it is ALWAYS scoped to *today*, independent of the selected period, and
+// it re-polls on an interval while the shift is running. The RT math lives on the
+// server so the two dashboards can't drift apart — same rule as the efficiency
+// note above.
+//
+// Piezas equivalentes (mismo criterio que PlanBoard.jsx): eq/pza = SAM ÷
+// equivalencia, piezas eq = piezas × eq/pza. Como daily-production ya devuelve
+// samOutput = SUM(empacado × SAM), aquí se reduce a samOutput ÷ EQUIVALENCE
+// (= 10, el factor global del merchant). Sólo la ruta daily-production trae
+// samOutput; en el fallback día-por-día (period-summary) las piezas eq quedan
+// en null y la vela simplemente no se dibuja.
+//
+// El gráfico muestra UNA unidad a la vez (segmented "Unidad": Piezas /
+// Equivalentes): barra = producido, línea = meta, ambas en la misma unidad. Las
+// cuatro cifras (meta, producido, meta eq, producido eq) y los dos
+// cumplimientos viven en el tooltip, que es donde caben sin encimarse.
+//
+// La META es el objetivo EN PIEZAS EQUIVALENTES. Ojo: line_runs.target_pcs se
+// guarda en piezas reales (= operarios × horas × 60 × eficiencia ÷ SAM), así que
+// para compararla con las piezas eq hay que multiplicarla por su propio SAM y
+// dividir entre la equivalencia — eso es `samTarget` (ver metaEqOf). Con el
+// checkbox "Piezas eq." encendido, la línea de Meta y el cumplimiento del
+// tooltip pasan a esa unidad; apagado, el gráfico vuelve a piezas reales, que es
+// lo que muestran los KPIs y la tabla.
+//
+// Monitor de producción: the default export is a two-tab page —
+//   Producción diaria    -> DailyProduction (this file)
+//   Eficiencia por línea -> ActualEfficiency.jsx, rendered with `embedded`
+// The active tab lives in the URL (?tab=eficiencia) so it survives a reload and
+// can be linked. Each tab mounts on first visit and then stays mounted (just
+// hidden), so switching back and forth keeps filters and doesn't refetch.
+//
+// Every read below (KPIs, series, style, line, dropdowns, realtime) also honours
+// an optional customer filter (?customer=), resolved through
+// line_runs.work_order_id -> work_orders.customer_name.
 
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import {
   ComposedChart, BarChart, Bar, Line, XAxis, YAxis,
-  CartesianGrid, Tooltip, LabelList,
+  CartesianGrid, Tooltip, LabelList, ReferenceLine, Cell,
 } from 'recharts';
 
 import NavCeo from '../components/NavCeo';
+import ActualEfficiency from './ActualEfficiency';
 
 /* ------------------------------------------------------------------ *
  * API client + concurrency limiter
@@ -118,6 +150,7 @@ const C = {
   warn: '#fce8b2', warnInk: '#7c5800',
   bad: '#f4c7c3', badInk: '#a50e0e',
   eff: '#9334e6', effInk: '#7627bb',
+  eq: '#26a69a', eqInk: '#00796b',
 };
 
 // Efficiency bands — same thresholds ActualEfficiency.jsx paints with, so a line
@@ -132,12 +165,66 @@ const EFF_BANDS = [
 
 const effColor = (v) => EFF_BANDS.find((b) => (Number(v) || 0) >= b.min).color;
 
+// Redondeo "bonito" hacia arriba (5, 10, 50, 100, 500…) para el tope del eje.
+const niceCeil = (v) => {
+  const n = Number(v) || 0;
+  if (n <= 0) return 0;
+  const step = Math.pow(10, Math.floor(Math.log10(n))) / 2;
+  return Math.ceil(n / step) * step;
+};
+
 const TOP_CHART_H = 292;
 const STYLE_CHART_H = 344;
 const PAGE_SIZE = 10;
 // Without /api/skyrina/daily-production the series falls back to one request per
 // day, so long ranges are refused rather than firing hundreds of calls.
 const MAX_FALLBACK_DAYS = 62;
+
+/* ------------------------------------------------------------------ *
+ * Piezas equivalentes — misma cuenta que PlanBoard.jsx
+ *
+ * En el tablero:  eq/pza = SAM ÷ equivalencia ; piezas eq = piezas × eq/pza.
+ * Aquí no hace falta el SAM por estilo: /api/skyrina/daily-production ya
+ * devuelve samOutput = SUM(empacado × SAM) del día (el mismo numerador de la
+ * eficiencia), así que
+ *
+ *     piezas equivalentes = samOutput ÷ equivalencia
+ *
+ * es exactamente lo que calcula el tablero, sólo que agregado por día.
+ *
+ * El factor es global y su dueño es el merchant (PlanBoard lo lee de
+ * /api/merchant-plan y cae en 10 si no viene). Aquí se fija en ese mismo 10;
+ * si algún día se quiere dinámico, basta leer `equivalence` de esa ruta y
+ * guardarlo en estado — el resto del cálculo no cambia.
+ * ------------------------------------------------------------------ */
+const EQUIVALENCE = 10;
+
+// Devuelve null (no 0) cuando el día no trae SAM, para que la vela no aparezca
+// en cero y se note que falta el dato en vez de mentir un vacío.
+const toEqPieces = (samMinutes) => {
+  const eq = Number(EQUIVALENCE) > 0 ? Number(EQUIVALENCE) : 10;
+  const sm = Number(samMinutes) || 0;
+  return sm > 0 ? sm / eq : null;
+};
+
+/* La Meta se guarda en PIEZAS REALES del estilo que corre:
+ *   target_pcs = operarios × horas × 60 × eficiencia ÷ SAM
+ * así que para compararla contra las piezas equivalentes hay que pasarla por el
+ * mismo factor: meta eq = SUM(target_pcs × SAM) ÷ equivalencia. Ese SUM es
+ * `samTarget` y lo tiene que dar el servidor por crew (día, línea, estilo),
+ * porque el SAM cambia con la mezcla de estilos del día.
+ *
+ * Si la ruta todavía no lo manda, se aproxima con el SAM promedio de lo
+ * empacado ese día (samOutput ÷ piezas). Es exacto cuando corrió un solo
+ * estilo y se marca con "≈" en el tooltip cuando no.
+ */
+const metaEqOf = ({ samTarget, target, samOutput, produced }) => {
+  if (Number(samTarget) > 0) return { metaEq: toEqPieces(samTarget), metaEqApprox: false };
+  if (Number(target) > 0 && Number(produced) > 0 && Number(samOutput) > 0) {
+    return { metaEq: toEqPieces(target * (samOutput / produced)), metaEqApprox: true };
+  }
+  return { metaEq: null, metaEqApprox: false };
+};
 
 /* ------------------------------------------------------------------ *
  * Formatting
@@ -215,8 +302,6 @@ const ppChange = (current, previous) =>
 const fmtShort = (d) => d.toLocaleDateString('es-MX', { day: 'numeric', month: 'short' }).replace(/\./g, '');
 const fmtLong = (d) =>
   d.toLocaleDateString('es-MX', { day: 'numeric', month: 'short', year: 'numeric' }).replace(/\./g, '');
-// Axis ticks drop the year — it already lives in the panel subtitle
-const fmtAxisDay = (val) => fmtShort(fromYMD(val));
 const fmtDayLabel = (val) => {
   const d = fromYMD(val);
   const weekday = d.toLocaleDateString('es-MX', { weekday: 'short' }).replace(/\./g, '');
@@ -290,6 +375,179 @@ function buildWeekOptions() {
     cursor = addDays(cursor, -7);
   }
   return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Trend-chart scope — the top chart shows a *series of buckets* whose
+ * granularity follows the selected period, independent of the KPI `period`:
+ *   día    -> one bar per DAY   across the selected date's month, plus
+ *             context from the previous month: the LEAD_IN_DAYS before the
+ *             1st, or every previous-month day with runs when "Solo con
+ *             corridas" is on (the whole previous month is fetched once)
+ *   semana -> one bar per WEEK  across the weeks touching that month
+ *   mes    -> one bar per MONTH (Enero .. mes actual del año elegido)
+ *   año    -> one bar per YEAR  (año actual y el siguiente: 2026, 2027)
+ *   rango  -> one bar per DAY   across the custom range (sin cambios)
+ * Los KPIs, la tabla y los estilos siguen usando el período puntual.
+ * ------------------------------------------------------------------ */
+const TREND_NOUN = { day: 'días', week: 'semanas', month: 'meses', year: 'años' };
+
+// Días del mes anterior que se muestran como contexto en la vista "Día".
+const LEAD_IN_DAYS = 7;
+
+function resolveChartScope(state, today) {
+  const { rangeType, selectedDate, selectedWeek, selectedMonth, selectedYear, customStart, customEnd } = state;
+
+  switch (rangeType) {
+    case 'week': {
+      const wStart = weekStart(selectedWeek);
+      const mid = addDays(wStart, 3); // Thursday decides the owning month
+      const mStart = new Date(mid.getFullYear(), mid.getMonth(), 1);
+      const mEnd = new Date(mid.getFullYear(), mid.getMonth() + 1, 0);
+      return {
+        bucket: 'week',
+        start: startOfWeek(mStart),
+        end: addDays(startOfWeek(mEnd), 6),
+        label: `Por semana · ${sentence(mStart.toLocaleDateString('es-MX', { month: 'long', year: 'numeric' }))}`,
+      };
+    }
+    case 'month': {
+      const y = Number(selectedMonth.split('-')[0]) || today.getFullYear();
+      const lastMonth = y === today.getFullYear() ? today.getMonth() : 11;
+      return {
+        bucket: 'month',
+        start: new Date(y, 0, 1),
+        end: new Date(y, lastMonth + 1, 0),
+        label: `Por mes · ${y}`,
+      };
+    }
+    case 'year': {
+      const y = Number(selectedYear) || today.getFullYear();
+      const from = Math.min(y, today.getFullYear());
+      const to = Math.max(y, today.getFullYear() + 1);
+      return {
+        bucket: 'year',
+        start: new Date(from, 0, 1),
+        end: new Date(to, 11, 31),
+        label: `Por año · ${from}–${to}`,
+      };
+    }
+    case 'custom': {
+      let s = fromYMD(customStart);
+      let e = fromYMD(customEnd);
+      if (e < s) [s, e] = [e, s];
+      return { bucket: 'day', start: s, end: e, label: `Por día · ${fmtShort(s)} – ${fmtShort(e)}` };
+    }
+    case 'day':
+    default: {
+      const d = fromYMD(selectedDate);
+      const mStart = new Date(d.getFullYear(), d.getMonth(), 1);
+      const mEnd = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+      return {
+        bucket: 'day',
+        // Fetch the whole previous month; focusStart marks where the selected
+        // month begins. chartData decides how much of that context is shown.
+        start: new Date(d.getFullYear(), d.getMonth() - 1, 1),
+        end: mEnd,
+        focusStart: mStart,
+        label: `Por día · ${sentence(mStart.toLocaleDateString('es-MX', { month: 'long', year: 'numeric' }))}`,
+      };
+    }
+  }
+}
+
+// Fold the raw per-day rows (each carrying samOutput + availableMinutes) into
+// day/week/month/year buckets. Efficiency is re-derived the SAME way the server
+// does it — SUM(samOutput) / SUM(availableMinutes) — never by averaging the
+// per-day percentages, which would give a slow day an equal vote. Piezas
+// equivalentes viajan igual: SUM(samOutput) ÷ equivalencia.
+function bucketDays(rows, bucket, focusStart) {
+  if (bucket === 'day') {
+    return rows.map((d, i) => {
+      const dt = fromYMD(d.date);
+      return {
+        key: d.date,
+        // Días previos al mes elegido: se dibujan atenuados y no entran en los
+        // totales del pie del gráfico.
+        lead: !!focusStart && dt < focusStart,
+        // Just the day number keeps a full month of ticks legible and in order;
+        // the 1st of each month (and the first bar) carries the short month.
+        axisLabel: dt.getDate() === 1 || i === 0 ? fmtShort(dt) : String(dt.getDate()),
+        tipLabel: fmtDayLabel(d.date),
+        sortAt: dt.getTime(),
+        runs: d.runs,
+        produced: d.produced,
+        target: d.target,
+        efficiency: d.efficiency,
+        samOutput: d.samOutput || 0,
+        samTarget: d.samTarget || 0,
+        // piezas equivalentes del día = samOutput ÷ equivalencia
+        eqPcs: toEqPieces(d.samOutput),
+        ...metaEqOf(d),
+      };
+    });
+  }
+
+  const groups = new Map();
+  for (const d of rows) {
+    const date = fromYMD(d.date);
+    let key;
+    let axisLabel;
+    let tipLabel;
+    if (bucket === 'week') {
+      key = weekString(date);
+      const ws = weekStart(key);
+      const n = key.split('-W')[1];
+      axisLabel = `S${n}`;
+      tipLabel = `Semana ${n} · ${fmtShort(ws)} – ${fmtShort(addDays(ws, 6))}`;
+    } else if (bucket === 'month') {
+      key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      axisLabel = sentence(date.toLocaleDateString('es-MX', { month: 'short' }).replace(/\./g, ''));
+      tipLabel = sentence(date.toLocaleDateString('es-MX', { month: 'long', year: 'numeric' }));
+    } else {
+      key = String(date.getFullYear());
+      axisLabel = key;
+      tipLabel = key;
+    }
+
+    let g = groups.get(key);
+    if (!g) {
+      g = { key, axisLabel, tipLabel, sortAt: date.getTime(),
+            runs: 0, produced: 0, target: 0, samOutput: 0, samTarget: 0,
+            availableMinutes: 0, hasTarget: false };
+      groups.set(key, g);
+    }
+    g.runs += d.runs || 0;
+    g.produced += d.produced || 0;
+    if (d.target != null) { g.target += d.target; g.hasTarget = true; }
+    g.samOutput += d.samOutput || 0;
+    g.samTarget += d.samTarget || 0;
+    g.availableMinutes += d.availableMinutes || 0;
+  }
+
+  return [...groups.values()]
+    .sort((a, b) => a.sortAt - b.sortAt)
+    .map((g) => ({
+      key: g.key,
+      axisLabel: g.axisLabel,
+      tipLabel: g.tipLabel,
+      sortAt: g.sortAt,
+      runs: g.runs,
+      produced: g.produced,
+      target: g.hasTarget ? g.target : null,
+      efficiency: g.availableMinutes > 0 ? (g.samOutput / g.availableMinutes) * 100 : null,
+      samOutput: g.samOutput,
+      samTarget: g.samTarget,
+      // Las piezas equivalentes se suman por samOutput, nunca promediando las
+      // de cada día: un día corto no puede pesar igual que uno completo.
+      eqPcs: toEqPieces(g.samOutput),
+      ...metaEqOf({
+        samTarget: g.samTarget,
+        target: g.hasTarget ? g.target : 0,
+        samOutput: g.samOutput,
+        produced: g.produced,
+      }),
+    }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -422,53 +680,235 @@ function KpiCard({
 }
 
 /* ------------------------------------------------------------------ *
+ * "Hoy · Tiempo real" card — the rail's real-time twin of SkyrinaDashboard's
+ * META / META RT / DIARIO tiles. Values arrive pre-computed from
+ * /api/skyrina/realtime-summary; nothing is derived here (see header note).
+ * Shows exactly three figures, as requested:
+ *   - Producido : pieces packed so far today (big number)
+ *   - Meta RT   : Meta pro-rated to the elapsed part of the shift, plus its
+ *                 share of the full day Meta
+ *   - Diario    : settled daily SAM efficiency (same value as SkyrinaDashboard's
+ *                 DIARIO tile). The live "Ef. RT" figure is intentionally omitted.
+ * ------------------------------------------------------------------ */
+function RealtimeKpiCard({ data, loading, updatedAt }) {
+  const s = data?.summary;
+  const ended = !!data?.productionEnded;
+
+  const meta = s?.totalTarget ?? null;
+  const metaRt = s?.realtimeTarget ?? null;
+  const prod = s?.totalProduced ?? null;
+
+  // Only three figures, matching SkyrinaDashboard's request: Producido (big),
+  // Meta RT, and Diario (settled daily efficiency). No live RT efficiency here.
+  const dailyEff = s?.dailyEfficiency ?? null;
+  const hasEff = dailyEff != null;
+
+  const metaShare = meta ? (metaRt / meta) * 100 : null;
+  const hasData = data && prod != null;
+
+  return (
+    <div className="dp-kpi dp-kpi-tall dp-kpi-rt">
+      <div className="dp-rt-head">
+        <span className="dp-kpi-label" title="Producción de hoy en tiempo real">Hoy · Tiempo real</span>
+        {!loading && hasData && (
+          ended ? (
+            <span className="dp-rt-badge fin">Final</span>
+          ) : (
+            <span className="dp-rt-badge live"><i className="dp-live-dot" />En vivo</span>
+          )
+        )}
+      </div>
+
+      {loading && !hasData ? (
+        <>
+          <div className="dp-kpi-ghost dp-kpi-ghost-lg" />
+          <div className="dp-kpi-ghost dp-kpi-ghost-md" />
+        </>
+      ) : (
+        <>
+          <div className="dp-kpi-value">{prod != null ? fmtInt(prod) : '–'}</div>
+          <div className="dp-kpi-delta" title="Piezas empacadas hoy">Producido</div>
+
+          <div className="dp-rt-grid">
+            <div className="dp-rt-cell">
+              <div className="dp-rt-k">Meta RT</div>
+              <div className="dp-rt-v">{metaRt == null ? '–' : fmtInt(metaRt)}</div>
+              <div className="dp-rt-sub">
+                {metaShare == null ? 'Sin meta' : `${Math.round(metaShare)}% de ${fmtInt(meta)}`}
+              </div>
+            </div>
+            <div className="dp-rt-cell">
+              <div className="dp-rt-k">Diario</div>
+              <div className="dp-rt-v" style={{ color: hasEff ? effColor(dailyEff) : C.faint }}>
+                {fmtPct1(dailyEff)}
+              </div>
+              <div className="dp-rt-sub">Eficiencia SAM</div>
+            </div>
+          </div>
+
+          <div className="dp-kpi-eff-track" aria-hidden="true" style={{ marginTop: 9 }}>
+            <span
+              style={{
+                width: `${Math.min(Math.max(Number(dailyEff) || 0, 0), 100)}%`,
+                background: hasEff ? effColor(dailyEff) : 'transparent',
+              }}
+            />
+          </div>
+
+          {updatedAt && !ended && <div className="dp-kpi-caption">Actualizado {updatedAt}</div>}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
  * Chart pieces
  * ------------------------------------------------------------------ */
-function StaggeredTick({ x, y, payload, index }) {
+function BucketTick({ x, y, payload, index, data }) {
   const i = index ?? payload?.index ?? 0;
+  const row = data?.[i] || {};
+  // Single baseline, one label per bucket, left-to-right in date order.
   return (
-    <text x={x} y={y + (i % 2 === 0 ? 12 : 26)} fill={C.axis} fontSize={11} textAnchor="middle">
-      {fmtAxisDay(payload.value)}
+    <text x={x} y={y + 14} fill={C.axis} fontSize={11} textAnchor="middle">
+      {row.axisLabel ?? payload?.value}
     </text>
   );
 }
 
-function BarValueLabel({ x, y, width, height, value }) {
+// Produced quantity + SAM efficiency for each bar of the trend chart.
+// - Produced: inside the bar (white) when it fits, otherwise just above it.
+// - Efficiency: always above the produced number, in its band colour, so it
+//   reads the same as the efficiency line / KPI cards. Server value, verbatim.
+// This is rendered by the overlay bar that sits AFTER the Meta / Eficiencia
+// lines, so the labels paint on top of them. Each number gets a knock-out
+// background (white pill for the %, bar-coloured halo for the quantity) so a
+// line passing behind a number stops at its edge instead of crossing it.
+// `data`, `showEff`, `selectedKey`, `barColor`, `barColorSel` come from the
+// chart; recharts adds `index`.
+function BarValueLabel({
+  x, y, width, height, value, index, data, showEff,
+  selectedKey, barColor = C.blue, barColorSel = C.blueInk,
+}) {
   if (!value || !Number.isFinite(width) || !Number.isFinite(height)) return null;
   if (width < 26) return null; // too narrow to read
+  const cx = x + width / 2;
   const inside = height >= 26;
+
+  const eff = showEff ? data?.[index]?.efficiency : null;
+  const hasEff = eff != null && Number.isFinite(Number(eff));
+  // Up to two decimals when the value has them (44.77%), at least one
+  // otherwise (85.3%, 80.0%) — trailing zero of the 2nd decimal is dropped.
+  let effText = null;
+  if (hasEff) {
+    let t = Number(eff).toFixed(2);
+    if (t.endsWith('0')) t = t.slice(0, -1);
+    effText = `${t}%`;
+  }
+
+  const prodY = inside ? y + 15 : y - 5;
+  const effY = inside ? y - 6 : y - 20;
+
+  const row = data?.[index];
+  const fillUnder = row && row.key === selectedKey ? barColorSel : barColor;
+  // Halo colour = whatever is behind the number: the bar itself, or the panel.
+  const prodHalo = inside ? fillUnder : C.panel;
+
+  // Pill sized to the text (≈6.1 px per char at 10 px semibold).
+  const pillW = effText ? effText.length * 6.1 + 8 : 0;
+  const pillH = 14;
+
   return (
-    <text
-      x={x + width / 2}
-      y={inside ? y + 15 : y - 5}
-      fill={inside ? '#ffffff' : C.muted}
-      fontSize={11}
-      textAnchor="middle"
-    >
-      {fmtInt(value)}
-    </text>
+    <g pointerEvents="none">
+      <text
+        x={cx}
+        y={prodY}
+        fill={inside ? '#ffffff' : C.muted}
+        fontSize={11}
+        textAnchor="middle"
+        stroke={prodHalo}
+        strokeWidth={4}
+        strokeLinejoin="round"
+        paintOrder="stroke"
+      >
+        {fmtInt(value)}
+      </text>
+      {hasEff && (
+        <>
+          <rect
+            x={cx - pillW / 2}
+            y={effY - 10.5}
+            width={pillW}
+            height={pillH}
+            rx={3}
+            fill={C.panel}
+          />
+          <text
+            x={cx}
+            y={effY}
+            fill={effColor(eff)}
+            fontSize={10}
+            fontWeight={600}
+            textAnchor="middle"
+          >
+            {effText}
+          </text>
+        </>
+      )}
+    </g>
   );
 }
 
-function DailyTooltip({ active, payload, label }) {
+/* Tooltip: las CUATRO cifras del bucket, agrupadas por unidad, con la unidad
+ * activa del gráfico marcada en negritas. Así el gráfico puede mostrar una sola
+ * unidad (legible) sin esconder la otra. */
+function DailyTooltip({ active, payload, unit }) {
   if (!active || !payload?.length) return null;
   const row = payload[0]?.payload || {};
-  const meta = row.target;
-  const prod = row.produced;
-  const eff = row.efficiency;
-  const cump = meta ? (prod / meta) * 100 : null;
+  const { target: meta, produced: prod, eqPcs: eqp, metaEq, efficiency: eff } = row;
   const hasRuns = meta != null || row.runs > 0;
+
+  const cumpPz = meta ? (prod / meta) * 100 : null;
+  // El factor se cancela en esta división: cumplimiento eq = SAM producido ÷
+  // SAM planeado. Cambiar la equivalencia no mueve el porcentaje.
+  const cumpEq = metaEq ? (eqp / metaEq) * 100 : null;
+  const strong = (u) => (unit === u ? { fontWeight: 500 } : undefined);
 
   return (
     <div className="dp-tip">
-      <div className="dp-tip-head">{fmtDayLabel(label)}</div>
+      <div className="dp-tip-head">{row.tipLabel}</div>
       {!hasRuns ? (
         <div className="dp-tip-note">Sin corridas programadas</div>
       ) : (
         <>
-          <div className="dp-tip-row"><span style={{ color: C.meta }}>Meta</span><span>{meta == null ? '–' : fmtInt(meta)}</span></div>
-          <div className="dp-tip-row"><span style={{ color: C.blueInk }}>Producido</span><span>{fmtInt(prod)}</span></div>
-          <div className="dp-tip-row"><span>Cumplimiento</span><span>{cump == null ? '–' : fmtPct(cump)}</span></div>
+          <div className="dp-tip-group">Piezas</div>
+          <div className="dp-tip-row" style={strong('pzas')}>
+            <span style={{ color: C.meta }}>Meta</span>
+            <span>{meta == null ? '–' : fmtInt(meta)}</span>
+          </div>
+          <div className="dp-tip-row" style={strong('pzas')}>
+            <span style={{ color: C.blueInk }}>Producido</span>
+            <span>{fmtInt(prod)}</span>
+          </div>
+          <div className="dp-tip-row" style={strong('pzas')}>
+            <span>Cumplimiento</span>
+            <span>{cumpPz == null ? '–' : fmtPct(cumpPz)}</span>
+          </div>
+
+          <div className="dp-tip-group">Equivalentes (SAM ÷ {EQUIVALENCE})</div>
+          <div className="dp-tip-row" style={strong('eq')}>
+            <span style={{ color: C.meta }}>Meta eq.</span>
+            <span>{metaEq == null ? '–' : `${row.metaEqApprox ? '≈ ' : ''}${fmtInt(metaEq)}`}</span>
+          </div>
+          <div className="dp-tip-row" style={strong('eq')}>
+            <span style={{ color: C.eqInk }}>Producido eq.</span>
+            <span>{eqp == null ? '–' : fmtInt(eqp)}</span>
+          </div>
+          <div className="dp-tip-row" style={strong('eq')}>
+            <span>Cumplimiento eq.</span>
+            <span>{cumpEq == null ? '–' : fmtPct(cumpEq)}</span>
+          </div>
+
           <div className="dp-tip-row strong">
             <span style={{ color: C.effInk }}>Eficiencia</span>
             <span style={{ color: eff == null ? C.faint : effColor(eff) }}>{fmtPct1(eff)}</span>
@@ -557,12 +997,11 @@ function Segmented({ label, value, options, onChange }) {
   );
 }
 
-const complianceClass = (pct) => (pct >= 100 ? 'good' : pct >= 90 ? 'warn' : 'bad');
 
 /* ================================================================== *
  * Page
  * ================================================================== */
-export default function Overview() {
+function DailyProduction({ embedded = false }) {
   const navigate = useNavigate();
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -574,7 +1013,10 @@ export default function Overview() {
   }, []);
 
   /* ---- filters ---- */
-  const [rangeType, setRangeType] = useState('month');
+  // Lands on TODAY (was 'month'): the board opens on the live day so the
+  // "Hoy · Tiempo real" card is immediately relevant. Semana / mes / año / rango
+  // are all still one click away in the period dropdown.
+  const [rangeType, setRangeType] = useState('day');
   const [selectedDate, setSelectedDate] = useState(ymd(today));
   const [selectedWeek, setSelectedWeek] = useState(weekString(today));
   const [selectedMonth, setSelectedMonth] = useState(ymd(today).slice(0, 7));
@@ -583,9 +1025,11 @@ export default function Overview() {
   const [customEnd, setCustomEnd] = useState(ymd(today));
   const [selectedStyle, setSelectedStyle] = useState('all');
   const [selectedLine, setSelectedLine] = useState('all');
+  const [selectedCustomer, setSelectedCustomer] = useState('all');
 
   const [availableStyles, setAvailableStyles] = useState([]);
   const [availableLines, setAvailableLines] = useState([]);
+  const [availableCustomers, setAvailableCustomers] = useState([]);
 
   const weekOptions = useMemo(buildWeekOptions, []);
   const yearOptions = useMemo(() => {
@@ -602,6 +1046,51 @@ export default function Overview() {
     [rangeType, selectedDate, selectedWeek, selectedMonth, selectedYear, customStart, customEnd]
   );
 
+  // Independent scope for the trend chart (bucket + window). See resolveChartScope.
+  const chartScope = useMemo(
+    () =>
+      resolveChartScope({
+        rangeType, selectedDate, selectedWeek, selectedMonth,
+        selectedYear, customStart, customEnd,
+      }, today),
+    [rangeType, selectedDate, selectedWeek, selectedMonth, selectedYear, customStart, customEnd, today]
+  );
+
+  // The key of the bucket that matches the current selection, so the trend chart
+  // can highlight the active bar (día/semana/mes/año keys line up with the state).
+  const selectedKey = useMemo(() => {
+    switch (chartScope.bucket) {
+      case 'week': return selectedWeek;
+      case 'month': return selectedMonth;
+      case 'year': return String(selectedYear);
+      default: return selectedDate;
+    }
+  }, [chartScope.bucket, selectedDate, selectedWeek, selectedMonth, selectedYear]);
+
+  // Click-to-drill: selecting a bucket in the chart sets the matching filter, which
+  // drives `period` -> KPIs, tabla y estilos se recargan para ese día/semana/mes/año.
+  const drillTo = useCallback((bucket, key) => {
+    if (!key) return;
+    if (bucket === 'week') { setRangeType('week'); setSelectedWeek(key); }
+    else if (bucket === 'month') { setRangeType('month'); setSelectedMonth(key); }
+    else if (bucket === 'year') { setRangeType('year'); setSelectedYear(String(key)); }
+    else { setRangeType('day'); setSelectedDate(key); }
+  }, []);
+
+  const handleBucketClick = useCallback((state) => {
+    const key = state?.activeLabel ?? state?.activePayload?.[0]?.payload?.key;
+    drillTo(chartScope.bucket, key != null ? String(key) : null);
+  }, [chartScope.bucket, drillTo]);
+
+  // Table drill: clicking a product filters by that estilo; clicking a línea value
+  // filters by that line. Both flow through `period` so every panel refetches.
+  const drillStyle = useCallback((st) => {
+    if (st && st !== 'No Style') setSelectedStyle(st);
+  }, []);
+  const drillLine = useCallback((ln) => {
+    if (ln != null && ln !== '') setSelectedLine(String(ln));
+  }, []);
+
   /* ---- data ---- */
   const [kpis, setKpis] = useState({
     lastWeek: null, lastWeekChange: null, lastWeekEff: null, lastWeekEffChange: null,
@@ -615,9 +1104,16 @@ export default function Overview() {
   const [styles, setStyles] = useState([]);
   const [rows, setRows] = useState([]);
 
+  // "Hoy · Tiempo real" card — always today, refreshed on an interval.
+  const [realtime, setRealtime] = useState(null);
+  const [rtUpdatedAt, setRtUpdatedAt] = useState('');
+
   const [chartOrder, setChartOrder] = useState('date');
   const [hideEmptyDays, setHideEmptyDays] = useState(false);
   const [showEfficiency, setShowEfficiency] = useState(true);
+  // Unidad del gráfico: 'pzas' (piezas reales) o 'eq' (piezas equivalentes).
+  // Una sola unidad a la vez — las cuatro cifras viven en el tooltip.
+  const [unit, setUnit] = useState('pzas');
   const [styleSort, setStyleSort] = useState('target');
   const [sortKey, setSortKey] = useState('compliance');
   const [sortDir, setSortDir] = useState('desc');
@@ -652,8 +1148,9 @@ export default function Overview() {
     let q = '';
     if (selectedStyle !== 'all') q += `&style=${encodeURIComponent(selectedStyle)}`;
     if (selectedLine !== 'all') q += `&lineNo=${encodeURIComponent(selectedLine)}`;
+    if (selectedCustomer !== 'all') q += `&customer=${encodeURIComponent(selectedCustomer)}`;
     return q;
-  }, [selectedStyle, selectedLine]);
+  }, [selectedStyle, selectedLine, selectedCustomer]);
 
   const summary = useCallback(async (start, end, headers, qs) => {
     try {
@@ -690,6 +1187,13 @@ export default function Overview() {
         target: Number(d.target) > 0 ? Number(d.target) : null,
         // Server-calculated, never re-derived here — see the note at the top.
         efficiency: runs > 0 ? Number(d.efficiency) || 0 : null,
+        // Kept so week/month/year buckets can re-derive efficiency the server's
+        // way: SUM(samOutput) / SUM(availableMinutes).
+        samOutput: Number(d.samOutput) || 0,
+        availableMinutes: Number(d.availableMinutes) || 0,
+        // SUM(meta × SAM) del día — la meta en minutos SAM, de donde salen las
+        // piezas equivalentes planeadas. Opcional: ver metaEqOf.
+        samTarget: Number(d.samTarget) || 0,
       };
     };
 
@@ -748,18 +1252,81 @@ export default function Overview() {
       apiGet(`http://localhost:5000/api/skyrina/available-lines?${qs}`, { headers })
         .then((r) => (r.data?.success ? r.data.lines : []))
         .catch(() => []),
-    ]).then(([s, l]) => {
+      apiGet(`http://localhost:5000/api/skyrina/available-customers?${qs}`, { headers })
+        .then((r) => (r.data?.success ? r.data.customers : []))
+        .catch(() => []),
+    ]).then(([s, l, c]) => {
       if (cancelled) return;
       setAvailableStyles(s);
       setAvailableLines(l);
+      setAvailableCustomers(c);
       setSelectedStyle((prev) => (prev !== 'all' && !s.includes(prev) ? 'all' : prev));
       setSelectedLine((prev) => (prev !== 'all' && !l.includes(prev) ? 'all' : prev));
+      // Keep a chosen customer even if they have no runs in the newly-selected
+      // period, so switching Día->Mes doesn't silently wipe the filter; only
+      // drop it when the route returns a list that genuinely excludes it.
+      setSelectedCustomer((prev) => (prev !== 'all' && c.length && !c.includes(prev) ? 'all' : prev));
     });
 
     return () => {
       cancelled = true;
     };
   }, [user, period]);
+
+  /* ---------------- week cards ---------------- *
+   * "Semana pasada" y "Esta semana" son fijas: siempre la planta completa y
+   * siempre relativas a HOY. No dependen del período (día/semana/mes/año), ni
+   * de los filtros, ni del clic en el gráfico o la tabla — por eso viven en su
+   * propio efecto y no se recargan cuando cambia lo demás. */
+  const [weekLoading, setWeekLoading] = useState(true);
+  useEffect(() => {
+    if (!user) return undefined;
+    let cancelled = false;
+
+    (async () => {
+      setWeekLoading(true);
+      const headers = { Authorization: `Bearer ${localStorage.getItem('token')}` };
+      const thisWeekStart = startOfWeek(today);
+      const lastWeekStart = addDays(thisWeekStart, -7);
+      const lastWeekEnd = addDays(thisWeekStart, -1);
+      const prevWeekStart = addDays(lastWeekStart, -7);
+      const prevWeekEnd = addDays(lastWeekStart, -1);
+      const daysIntoWeek = Math.round((today - thisWeekStart) / 86400000);
+      const weekBeforeSameSpan = addDays(lastWeekStart, daysIntoWeek);
+
+      try {
+        const [lastWeek, prevWeek, thisWeek, lastWeekPartial] = await Promise.all([
+          summary(lastWeekStart, lastWeekEnd, headers, ''),
+          summary(prevWeekStart, prevWeekEnd, headers, ''),
+          summary(thisWeekStart, today, headers, ''),
+          summary(lastWeekStart, weekBeforeSameSpan, headers, ''),
+        ]);
+        if (cancelled) return;
+        setKpis((k) => ({
+          ...k,
+          lastWeek: lastWeek.produced,
+          lastWeekChange: pctChange(lastWeek.produced, prevWeek.produced),
+          lastWeekEff: lastWeek.efficiency,
+          lastWeekEffChange: ppChange(lastWeek.efficiency, prevWeek.efficiency),
+
+          thisWeek: thisWeek.produced,
+          thisWeekChange: thisWeek.produced ? pctChange(thisWeek.produced, lastWeekPartial.produced) : null,
+          thisWeekEff: thisWeek.efficiency,
+          // compared against the same number of days into last week, not the
+          // full week — otherwise Monday always looks catastrophic.
+          thisWeekEffChange: ppChange(thisWeek.efficiency, lastWeekPartial.efficiency),
+        }));
+      } catch (err) {
+        console.error('Week cards load failed:', err);
+      } finally {
+        if (!cancelled) setWeekLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user, today, summary]);
 
   /* ---------------- load panels ---------------- */
   useEffect(() => {
@@ -772,14 +1339,6 @@ export default function Overview() {
       const qs = filterQS();
       const range = `startDate=${ymd(period.start)}&endDate=${ymd(period.end)}`;
 
-      const thisWeekStart = startOfWeek(today);
-      const lastWeekStart = addDays(thisWeekStart, -7);
-      const lastWeekEnd = addDays(thisWeekStart, -1);
-      const prevWeekStart = addDays(lastWeekStart, -7);
-      const prevWeekEnd = addDays(lastWeekStart, -1);
-      const daysIntoWeek = Math.round((today - thisWeekStart) / 86400000);
-      const weekBeforeSameSpan = addDays(lastWeekStart, daysIntoWeek);
-
       const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
       const prevMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
       const prevMonthSameDay = new Date(
@@ -790,42 +1349,26 @@ export default function Overview() {
 
       try {
         const [
-          lastWeek, prevWeek, thisWeek, lastWeekPartial,
           thisMonth, prevMonth, current, previous,
           series, styleRes, lineRes,
         ] = await Promise.all([
-          summary(lastWeekStart, lastWeekEnd, headers, qs),
-          summary(prevWeekStart, prevWeekEnd, headers, qs),
-          summary(thisWeekStart, today, headers, qs),
-          summary(lastWeekStart, weekBeforeSameSpan, headers, qs),
           summary(monthStart, today, headers, qs),
           summary(prevMonthStart, prevMonthSameDay, headers, qs),
           summary(period.start, period.end, headers, qs),
           summary(period.prevStart, period.prevEnd, headers, qs),
-          dailySeries(period.start, period.end, headers, qs),
-          apiGet(`/api/skyrina/style-performance?${range}${qs}`, { headers })
+          dailySeries(chartScope.start, chartScope.end, headers, qs),
+          apiGet(`http://localhost:5000/api/skyrina/style-performance?${range}${qs}`, { headers })
             .then((r) => (r.data?.success ? r.data.styles : []))
             .catch(() => []),
-          apiGet(`/api/skyrina/line-performance-detail?${range}${qs}`, { headers })
+          apiGet(`http://localhost:5000/api/skyrina/line-performance-detail?${range}${qs}`, { headers })
             .then((r) => (r.data?.success ? r.data.lines : []))
             .catch(() => []),
         ]);
 
         if (cancelled) return;
 
-        setKpis({
-          lastWeek: lastWeek.produced,
-          lastWeekChange: pctChange(lastWeek.produced, prevWeek.produced),
-          lastWeekEff: lastWeek.efficiency,
-          lastWeekEffChange: ppChange(lastWeek.efficiency, prevWeek.efficiency),
-
-          thisWeek: thisWeek.produced,
-          thisWeekChange: thisWeek.produced ? pctChange(thisWeek.produced, lastWeekPartial.produced) : null,
-          thisWeekEff: thisWeek.efficiency,
-          // compared against the same number of days into last week, not the
-          // full week — otherwise Monday always looks catastrophic.
-          thisWeekEffChange: ppChange(thisWeek.efficiency, lastWeekPartial.efficiency),
-
+        setKpis((k) => ({
+          ...k,
           thisMonth: thisMonth.produced,
           thisMonthChange: pctChange(thisMonth.produced, prevMonth.produced),
           thisMonthEff: thisMonth.efficiency,
@@ -838,7 +1381,7 @@ export default function Overview() {
           // value ActualEfficiency.jsx shows for the same range and filters.
           periodEff: current.efficiency,
           periodEffChange: ppChange(current.efficiency, previous.efficiency),
-        });
+        }));
 
         setDaily(series.rows);
         setSeriesNote(series.note);
@@ -855,23 +1398,126 @@ export default function Overview() {
     return () => {
       cancelled = true;
     };
-  }, [user, period, filterQS, today, summary, dailySeries]);
+  }, [user, period, chartScope, filterQS, today, summary, dailySeries]);
+
+  /* ---------------- realtime "Hoy" card ---------------- *
+   * Always scoped to TODAY (not the selected period, exactly like the week rail
+   * cards) and re-polled every 60 s. The server flags productionEnded, so once
+   * the shift closes the numbers simply settle instead of us stopping the timer
+   * on the client and risking a stale "En vivo" badge. Runs through the shared
+   * limiter, so it queues politely behind the heavier panel loads. */
+  useEffect(() => {
+    if (!user) return undefined;
+    let cancelled = false;
+    const todayStr = ymd(today);
+
+    const load = async () => {
+      const headers = { Authorization: `Bearer ${localStorage.getItem('token')}` };
+      const qs = filterQS();
+      try {
+        const res = await apiGet(`http://localhost:5000/api/skyrina/realtime-summary?date=${todayStr}${qs}`, { headers });
+        if (!cancelled && res.data?.success) {
+          setRealtime(res.data);
+          setRtUpdatedAt(
+            new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })
+          );
+        }
+      } catch {
+        /* keep the last good snapshot on a transient failure */
+      }
+    };
+
+    load();
+    const id = setInterval(load, 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [user, today, filterQS]);
 
   /* ---------------- derived ---------------- */
-  const activeDays = useMemo(() => daily.filter((d) => d.target != null || d.produced > 0).length, [daily]);
+  // Fold raw days into the scope's buckets (día/semana/mes/año), then apply the
+  // display toggles. allBuckets keeps the whole window for the footnote count.
+  const allBuckets = useMemo(
+    () => bucketDays(daily, chartScope.bucket, chartScope.focusStart),
+    [daily, chartScope.bucket, chartScope.focusStart]
+  );
+  // Los días de contexto (mes anterior) se ven en el gráfico pero no cuentan en
+  // el pie: el total sigue siendo el del mes elegido.
+  const focusBuckets = useMemo(() => allBuckets.filter((b) => !b.lead), [allBuckets]);
+  const activeBuckets = useMemo(
+    () => focusBuckets.filter((b) => b.target != null || b.produced > 0).length,
+    [focusBuckets]
+  );
 
   const chartData = useMemo(() => {
-    let d = [...daily];
-    if (hideEmptyDays) d = d.filter((x) => x.produced > 0 || x.target != null);
+    let d = [...allBuckets];
+    if (hideEmptyDays) {
+      // Solo con corridas: todos los días con corridas, del mes anterior al actual.
+      d = d.filter((x) => x.produced > 0 || x.target != null);
+    } else if (chartScope.focusStart) {
+      // Vista normal: sólo la última semana del mes anterior como contexto.
+      const from = addDays(chartScope.focusStart, -LEAD_IN_DAYS).getTime();
+      d = d.filter((x) => !x.lead || x.sortAt >= from);
+    }
     if (chartOrder === 'asc') d.sort((a, b) => a.produced - b.produced);
     else if (chartOrder === 'desc') d.sort((a, b) => b.produced - a.produced);
+    if (chartScope.bucket === 'day') {
+      // Por fecha: el mes va en la primera barra y en cada día 1. Ordenado por
+      // Mayor/Menor los meses se mezclan, así que los días previos lo llevan siempre.
+      d = d.map((x, i) => {
+        const dt = fromYMD(x.key);
+        const withMonth = chartOrder === 'date' ? i === 0 || dt.getDate() === 1 : x.lead;
+        return { ...x, axisLabel: withMonth ? fmtShort(dt) : String(dt.getDate()) };
+      });
+    }
     return d;
-  }, [daily, chartOrder, hideEmptyDays]);
+  }, [allBuckets, chartOrder, hideEmptyDays, chartScope.focusStart, chartScope.bucket]);
 
-  const tickInterval = useMemo(
-    () => Math.max(0, Math.ceil(chartData.length / 26) - 1),
-    [chartData.length]
-  );
+  // Días de contexto visibles (mes anterior) y subtítulo del gráfico.
+  const leadCount = useMemo(() => chartData.filter((b) => b.lead).length, [chartData]);
+  const chartSubtitle = useMemo(() => {
+    if (!chartScope.focusStart) return chartScope.label;
+    const prev = addDays(chartScope.focusStart, -1).toLocaleDateString('es-MX', { month: 'long' });
+    return hideEmptyDays
+      ? `${chartScope.label} · con los días con corridas de ${prev}`
+      : `${chartScope.label} · con los ${LEAD_IN_DAYS} días previos`;
+  }, [chartScope.focusStart, chartScope.label, hideEmptyDays]);
+
+  // Línea divisoria en el día 1 (sólo en orden por fecha y si ese día se ve).
+  const monthStartKey = useMemo(() => {
+    if (!chartScope.focusStart || chartOrder !== 'date') return null;
+    const k = ymd(chartScope.focusStart);
+    return chartData.some((b) => b.key === k) ? k : null;
+  }, [chartScope.focusStart, chartOrder, chartData]);
+
+  // La unidad decide qué series se dibujan; todo lo demás es idéntico.
+  const eqMode = unit === 'eq';
+  const barKey = eqMode ? 'eqPcs' : 'produced';
+  const metaKey = eqMode ? 'metaEq' : 'target';
+  const barColor = eqMode ? C.eq : C.blue;
+  const barColorSel = eqMode ? C.eqInk : C.blueInk;
+
+  // Totales de la ventana para la nota al pie, en las dos unidades. Se suman
+  // sobre allBuckets (la ventana completa) para que "Solo con corridas" no
+  // cambie el total — los días sin corridas aportan 0 de todos modos.
+  const totals2 = useMemo(() => {
+    let pz = 0, eq = 0;
+    for (const b of focusBuckets) { pz += b.produced || 0; eq += b.eqPcs || 0; }
+    return { pz, eq };
+  }, [focusBuckets]);
+
+  // Tope del eje izquierdo: el mayor de producido / meta / piezas eq.
+  const leftMax = useMemo(() => {
+    let m = 0;
+    for (const b of chartData) m = Math.max(m, b[barKey] || 0, b[metaKey] || 0);
+    return niceCeil(m * 1.05);
+  }, [chartData, barKey, metaKey]);
+
+  const tickInterval = useMemo(() => {
+    if (chartScope.bucket !== 'day') return 0; // few, wide labels — show all
+    return chartData.length > 45 ? Math.ceil(chartData.length / 45) - 1 : 0;
+  }, [chartData.length, chartScope.bucket]);
 
   const styleData = useMemo(() => {
     const mapped = styles.map((s) => ({
@@ -937,9 +1583,12 @@ export default function Overview() {
   const resetFilters = () => {
     setSelectedStyle('all');
     setSelectedLine('all');
+    setSelectedCustomer('all');
   };
-  const filtersActive = selectedStyle !== 'all' || selectedLine !== 'all';
+  const filtersActive =
+    selectedStyle !== 'all' || selectedLine !== 'all' || selectedCustomer !== 'all';
   const scopeText = [
+    selectedCustomer === 'all' ? 'Todos los clientes' : selectedCustomer,
     selectedStyle === 'all' ? 'Todos los estilos' : selectedStyle,
     selectedLine === 'all' ? 'Todas las líneas' : `Línea ${selectedLine}`,
   ].join(' · ');
@@ -970,7 +1619,7 @@ export default function Overview() {
 
   return (
     <div className="dp-page">
-      <NavCeo />
+      {!embedded && <NavCeo />}
 
       <div className="dp-root">
         {/* ---------- title + filters ---------- */}
@@ -1019,6 +1668,11 @@ export default function Overview() {
               </>
             )}
 
+            <select value={selectedCustomer} onChange={(e) => setSelectedCustomer(e.target.value)} aria-label="Cliente" className="wide">
+              <option value="all">Todos los clientes</option>
+              {availableCustomers.map((c) => (<option key={c} value={c}>{c}</option>))}
+            </select>
+
             <select value={selectedStyle} onChange={(e) => setSelectedStyle(e.target.value)} aria-label="Estilo" className="wide">
               <option value="all">Todos los estilos</option>
               {availableStyles.map((s) => (<option key={s} value={s}>{s}</option>))}
@@ -1044,7 +1698,7 @@ export default function Overview() {
               change={kpis.lastWeekChange}
               efficiency={kpis.lastWeekEff}
               efficiencyChange={kpis.lastWeekEffChange}
-              loading={loading}
+              loading={weekLoading}
             />
             <KpiCard
               label="Esta semana"
@@ -1052,15 +1706,12 @@ export default function Overview() {
               change={kpis.thisWeekChange}
               efficiency={kpis.thisWeekEff}
               efficiencyChange={kpis.thisWeekEffChange}
-              loading={loading}
+              loading={weekLoading}
             />
-            <KpiCard
-              label="Este mes"
-              value={kpis.thisMonth}
-              change={kpis.thisMonthChange}
-              efficiency={kpis.thisMonthEff}
-              efficiencyChange={kpis.thisMonthEffChange}
-              loading={loading}
+            <RealtimeKpiCard
+              data={realtime}
+              loading={loading && !realtime}
+              updatedAt={rtUpdatedAt}
             />
             <KpiCard
               label={period.label}
@@ -1082,7 +1733,16 @@ export default function Overview() {
 
           {/* ---------- daily combo chart ---------- */}
           <section className="dp-panel dp-chart-top">
-            <PanelHead title="Producción diaria" subtitle={period.rangeText}>
+            <PanelHead title="Producción" subtitle={chartSubtitle}>
+              <Segmented
+                label="Unidad"
+                value={unit}
+                onChange={setUnit}
+                options={[
+                  { value: 'pzas', label: 'Piezas' },
+                  { value: 'eq', label: 'Equivalentes' },
+                ]}
+              />
               <Segmented
                 label="Orden del gráfico"
                 value={chartOrder}
@@ -1095,7 +1755,7 @@ export default function Overview() {
               />
               <label className="dp-check">
                 <input type="checkbox" checked={hideEmptyDays} onChange={(e) => setHideEmptyDays(e.target.checked)} />
-                Solo días con corridas
+                Solo con corridas
               </label>
               <label className="dp-check">
                 <input type="checkbox" checked={showEfficiency} onChange={(e) => setShowEfficiency(e.target.checked)} />
@@ -1105,11 +1765,22 @@ export default function Overview() {
 
             <Legend
               items={[
-                { label: 'Meta', color: C.meta, type: 'line' },
-                { label: 'Producido', color: C.blue, type: 'square' },
-                ...(showEfficiency ? [{ label: 'Eficiencia', color: C.eff, type: 'line' }] : []),
+                { label: eqMode ? 'Meta eq.' : 'Meta', color: C.meta, type: 'line' },
+                { label: eqMode ? 'Producido eq.' : 'Producido', color: barColor, type: 'square' },
+                ...(showEfficiency
+                  ? [
+                      { label: 'Eficiencia', color: C.eff, type: 'line' },
+                      { label: 'Meta 70%', color: C.effInk, type: 'line' },
+                    ]
+                  : []),
               ]}
             />
+            <p className="dp-hint">
+              {eqMode
+                ? `Piezas equivalentes = SAM producido ÷ ${EQUIVALENCE}. Meta y producido se comparan en la misma unidad; el tooltip trae también las piezas reales.`
+                : 'Piezas reales cosidas y empacadas. El tooltip trae también los equivalentes.'}
+              {' '}Haz clic en una barra para filtrar los KPIs y la tabla por ese período.
+            </p>
 
             <ChartFrame
               height={TOP_CHART_H}
@@ -1121,21 +1792,32 @@ export default function Overview() {
                   width={w}
                   height={h}
                   data={chartData}
-                  margin={{ top: 16, right: showEfficiency ? 6 : 14, left: 0, bottom: 24 }}
+                  // extra top room so the efficiency label over the tallest bar isn't clipped
+                  margin={{ top: showEfficiency ? 30 : 16, right: showEfficiency ? 6 : 14, left: 0, bottom: 24 }}
+                  onClick={handleBucketClick}
+                  style={{ cursor: 'pointer' }}
+                  barCategoryGap={chartData.length > 31 ? '12%' : '20%'}
                 >
                   <CartesianGrid stroke={C.grid} vertical={false} />
                   <XAxis
-                    dataKey="date"
-                    tick={<StaggeredTick />}
+                    dataKey="key"
+                    tick={<BucketTick data={chartData} />}
                     tickLine={false}
                     axisLine={{ stroke: C.grid }}
                     interval={tickInterval}
                     height={42}
                   />
+                  {/* Twin of the x-axis above, hidden. Only the label overlay bar
+                      uses it: bars on different x-axes don't share a category
+                      slot, so the overlay lands exactly on top of the real bar. */}
+                  <XAxis xAxisId="labels" dataKey="key" hide />
                   {/* pieces (left) and % (right) can't share a scale — 1.2k pieces
                       would flatten an 80 % line onto the axis */}
                   <YAxis
                     yAxisId="left"
+                    // Tope calculado a mano (ver leftMax) para que el eje no
+                    // brinque al cambiar de unidad y la meta quepa siempre.
+                    domain={[0, leftMax || 'auto']}
                     tickFormatter={fmtMil}
                     tick={{ fill: C.axis, fontSize: 11 }}
                     tickLine={false}
@@ -1155,21 +1837,65 @@ export default function Overview() {
                       width={46}
                     />
                   )}
-                  <Tooltip content={<DailyTooltip />} cursor={{ fill: 'rgba(60,64,67,0.06)' }} />
-                  <Bar yAxisId="left" dataKey="produced" name="Producido" fill={C.blue} maxBarSize={44} isAnimationActive={false}>
-                    <LabelList dataKey="produced" content={<BarValueLabel />} />
+                  <Tooltip content={<DailyTooltip unit={unit} />} cursor={{ fill: 'rgba(60,64,67,0.06)' }} />
+                  <Bar
+                    yAxisId="left"
+                    dataKey={barKey}
+                    name={eqMode ? 'Producido eq.' : 'Producido'}
+                    fill={barColor}
+                    maxBarSize={44}
+                    isAnimationActive={false}
+                    cursor="pointer"
+                  >
+                    {chartData.map((b) => (
+                      <Cell
+                        key={b.key}
+                        fill={b.key === selectedKey ? barColorSel : barColor}
+                      />
+                    ))}
                   </Bar>
+                  {/* Meta en la unidad elegida: piezas reales (target_pcs) o
+                      equivalentes (target × SAM ÷ equivalencia). */}
                   <Line
                     yAxisId="left"
                     type="linear"
-                    dataKey="target"
-                    name="Meta"
+                    dataKey={metaKey}
+                    name={eqMode ? 'Meta eq.' : 'Meta'}
                     stroke={C.meta}
                     strokeWidth={2}
                     dot={false}
                     connectNulls={false}
                     isAnimationActive={false}
                   />
+                  {monthStartKey && (
+                    <ReferenceLine
+                      yAxisId="left"
+                      x={monthStartKey}
+                      stroke={C.muted}
+                      strokeDasharray="3 3"
+                      strokeWidth={1}
+                      ifOverflow="visible"
+                      position="start"
+                      label={{
+                        value: sentence(chartScope.focusStart.toLocaleDateString('es-MX', { month: 'long' })),
+                        position: 'insideTopLeft',
+                        fill: C.muted,
+                        fontSize: 10,
+                        dx: -2,
+                      }}
+                    />
+                  )}
+                  {showEfficiency && (
+                    <ReferenceLine
+                      yAxisId="right"
+                      y={70}
+                      stroke={C.effInk}
+                      strokeDasharray="6 4"
+                      strokeWidth={1.5}
+                      ifOverflow="extendDomain"
+                      label={{ value: 'Meta 70%', position: 'right', fill: C.effInk, fontSize: 10, dy: -4 }}
+                    />
+                  )}
                   {showEfficiency && (
                     <Line
                       yAxisId="right"
@@ -1183,13 +1909,47 @@ export default function Overview() {
                       isAnimationActive={false}
                     />
                   )}
+                  {/* Label overlay — declared LAST so the numbers paint above the
+                      Meta and Eficiencia lines. Same data/axes as the real bar,
+                      but invisible: it only carries the labels. */}
+                  <Bar
+                    xAxisId="labels"
+                    yAxisId="left"
+                    dataKey={barKey}
+                    fill="none"
+                    maxBarSize={44}
+                    isAnimationActive={false}
+                    legendType="none"
+                    tooltipType="none"
+                  >
+                    <LabelList
+                      dataKey={barKey}
+                      content={
+                        <BarValueLabel
+                          data={chartData}
+                          showEff={showEfficiency}
+                          selectedKey={selectedKey}
+                          barColor={barColor}
+                          barColorSel={barColorSel}
+                        />
+                      }
+                    />
+                  </Bar>
                 </ComposedChart>
               )}
             </ChartFrame>
 
-            {!loading && daily.length > 0 && (
+            {!loading && allBuckets.length > 0 && (
               <p className="dp-foot-note">
-                {activeDays} de {daily.length} días con corridas programadas
+                {activeBuckets} de {focusBuckets.length} {TREND_NOUN[chartScope.bucket]} con producción
+                {' · '}Producido{' '}
+                <b style={{ color: C.blueInk, fontWeight: 500 }}>{fmtInt(totals2.pz)}</b> pzas
+                {totals2.eq > 0 && (
+                  <>
+                    {' / '}
+                    <b style={{ color: C.eqInk, fontWeight: 500 }}>{fmtInt(totals2.eq)}</b> eq
+                  </>
+                )}
                 {kpis.periodEff != null && (
                   <>
                     {' · '}Eficiencia global{' '}
@@ -1197,6 +1957,11 @@ export default function Overview() {
                       {fmtPct1(kpis.periodEff)}
                     </b>
                   </>
+                )}
+                {leadCount > 0 && (
+                  <span style={{ color: C.muted }}>
+                    {' · '}Antes de la línea punteada: {leadCount} días del mes anterior como contexto (no suman al total)
+                  </span>
                 )}
               </p>
             )}
@@ -1271,13 +2036,7 @@ export default function Overview() {
 
           {/* ---------- product table ---------- */}
           <section className="dp-panel dp-table-panel">
-            <PanelHead title="Cumplimiento por producto y línea" subtitle={`${sortedRows.length} combinaciones`}>
-              <div className="dp-key">
-                <span><i className="good" /> ≥100%</span>
-                <span><i className="warn" /> 90–99%</span>
-                <span><i className="bad" /> &lt;90%</span>
-              </div>
-            </PanelHead>
+            <PanelHead title="Cumplimiento por producto y línea" subtitle={`${sortedRows.length} combinaciones`} />
 
             <div className="dp-table-scroll">
               <table className="dp-table">
@@ -1303,16 +2062,32 @@ export default function Overview() {
                       return (
                         <tr key={`${r.style}-${r.lineNo}-${rank}`}>
                           <td className="dp-rank">{rank}.</td>
-                          <td className="dp-name" title={r.style}>{r.style}</td>
-                          <td>{r.lineNo}</td>
+                          <td className="dp-name" title={r.style}>
+                            <button
+                              type="button"
+                              className="dp-drill"
+                              onClick={() => drillStyle(r.style)}
+                              title={`Filtrar por ${r.style}`}
+                            >
+                              {r.style}
+                            </button>
+                          </td>
+                          <td>
+                            <button
+                              type="button"
+                              className="dp-drill"
+                              onClick={() => drillLine(r.lineNo)}
+                              title={`Filtrar por línea ${r.lineNo}`}
+                            >
+                              {r.lineNo}
+                            </button>
+                          </td>
                           <td className="dp-num">{fmtInt(r.target)}</td>
                           <td className="dp-num">{fmtInt(r.produced)}</td>
                           <td className="dp-num dp-eff-num" style={{ color: effColor(r.efficiency) }}>
                             {fmtPct1(r.efficiency)}
                           </td>
-                          <td className="dp-cump-cell">
-                            <div className={`dp-cump ${complianceClass(r.compliance)}`}>{fmtPct(r.compliance)}</div>
-                          </td>
+                          <td className="dp-num">{fmtPct(r.compliance)}</td>
                         </tr>
                       );
                     })}
@@ -1331,9 +2106,7 @@ export default function Overview() {
                       >
                         {fmtPct1(kpis.periodEff)}
                       </td>
-                      <td className="dp-cump-cell">
-                        <div className={`dp-cump ${complianceClass(totals.compliance)}`}>{fmtPct(totals.compliance)}</div>
-                      </td>
+                      <td className="dp-num">{fmtPct(totals.compliance)}</td>
                     </tr>
                   </tfoot>
                 )}
@@ -1357,6 +2130,103 @@ export default function Overview() {
     </div>
   );
 }
+
+
+/* ================================================================== *
+ * Monitor de producción — tab shell
+ * ================================================================== */
+const MONITOR_TABS = [
+  { key: 'produccion', label: 'Producción diaria' },
+  { key: 'eficiencia', label: 'Line Performance' },
+];
+
+export default function Overview() {
+  const [params, setParams] = useSearchParams();
+  const requested = params.get('tab');
+  const tab = MONITOR_TABS.some((t) => t.key === requested) ? requested : 'produccion';
+
+  // Mount a tab the first time it is opened, then keep it alive.
+  const [visited, setVisited] = useState(() => new Set([tab]));
+  useEffect(() => {
+    setVisited((v) => (v.has(tab) ? v : new Set(v).add(tab)));
+  }, [tab]);
+
+  const select = useCallback((key) => {
+    const next = new URLSearchParams(params);
+    if (key === 'produccion') next.delete('tab');
+    else next.set('tab', key);
+    setParams(next, { replace: true });
+  }, [params, setParams]);
+
+  // Arrow keys move between tabs (WAI-ARIA tabs pattern).
+  const onKeyDown = (e) => {
+    const i = MONITOR_TABS.findIndex((t) => t.key === tab);
+    let j = null;
+    if (e.key === 'ArrowRight') j = (i + 1) % MONITOR_TABS.length;
+    else if (e.key === 'ArrowLeft') j = (i - 1 + MONITOR_TABS.length) % MONITOR_TABS.length;
+    else if (e.key === 'Home') j = 0;
+    else if (e.key === 'End') j = MONITOR_TABS.length - 1;
+    if (j == null) return;
+    e.preventDefault();
+    select(MONITOR_TABS[j].key);
+    document.getElementById(`pm-tab-${MONITOR_TABS[j].key}`)?.focus();
+  };
+
+  return (
+    <div className="pm-page">
+      <NavCeo />
+
+      <div className="pm-tabs" role="tablist" aria-label="Monitor de producción" onKeyDown={onKeyDown}>
+        {MONITOR_TABS.map((t) => (
+          <button
+            key={t.key}
+            id={`pm-tab-${t.key}`}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.key}
+            aria-controls={`pm-panel-${t.key}`}
+            tabIndex={tab === t.key ? 0 : -1}
+            className={tab === t.key ? 'on' : ''}
+            onClick={() => select(t.key)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {visited.has('produccion') && (
+        <div role="tabpanel" id="pm-panel-produccion" aria-labelledby="pm-tab-produccion" hidden={tab !== 'produccion'}>
+          <DailyProduction embedded />
+        </div>
+      )}
+      {visited.has('eficiencia') && (
+        <div role="tabpanel" id="pm-panel-eficiencia" aria-labelledby="pm-tab-eficiencia" hidden={tab !== 'eficiencia'}>
+          <ActualEfficiency embedded />
+        </div>
+      )}
+
+      <style>{pmCss}</style>
+    </div>
+  );
+}
+
+const pmCss = `
+.pm-page{min-height:100vh;background:${C.canvas}}
+.pm-page [role="tabpanel"] > div{min-height:0}
+.pm-tabs{display:flex;gap:2px;padding:8px 20px 0;background:${C.panel};
+  border-bottom:1px solid ${C.edge};
+  font-family:Roboto,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}
+.pm-tabs button{background:none;border:none;border-bottom:3px solid transparent;
+  padding:9px 16px 8px;font:inherit;font-size:13.5px;color:${C.muted};cursor:pointer;
+  border-radius:6px 6px 0 0;margin-bottom:-1px}
+.pm-tabs button:hover{background:${C.hover};color:${C.ink}}
+.pm-tabs button.on{color:#1967d2;border-bottom-color:#1a73e8;font-weight:500}
+.pm-tabs button:focus-visible{outline:2px solid ${C.focus};outline-offset:-2px}
+@media (max-width:620px){
+  .pm-tabs{padding:6px 8px 0;overflow-x:auto}
+  .pm-tabs button{white-space:nowrap;padding:9px 12px 8px}
+}
+`;
 
 /* ------------------------------------------------------------------ */
 const css = `
@@ -1458,6 +2328,28 @@ const css = `
 
 .dp-eff-num{font-weight:500;font-variant-numeric:tabular-nums}
 
+/* ---- "Hoy · Tiempo real" card ---- */
+.dp-kpi-rt{border-left:3px solid ${C.green};display:flex;flex-direction:column}
+.dp-rt-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.dp-rt-head .dp-kpi-label{margin-bottom:0}
+.dp-rt-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:600;
+  letter-spacing:.3px;text-transform:uppercase;padding:2px 7px;border-radius:999px;white-space:nowrap}
+.dp-rt-badge.live{background:#e6f4ea;color:${C.goodInk}}
+.dp-rt-badge.fin{background:${C.grid};color:${C.muted}}
+.dp-live-dot{width:6px;height:6px;border-radius:50%;background:${C.green};display:inline-block;
+  animation:dp-pulse 1.4s ease-in-out infinite}
+@keyframes dp-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.7)}}
+
+.dp-rt-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.dp-rt-cell{background:${C.head};border:1px solid ${C.grid};border-radius:6px;padding:7px 9px;min-width:0}
+.dp-rt-k{font-size:10.5px;color:${C.muted};margin-bottom:2px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.dp-rt-v{font-size:17px;font-weight:500;color:${C.ink};line-height:1.1;
+  font-variant-numeric:tabular-nums;letter-spacing:-.2px}
+.dp-rt-sub{margin-top:3px;font-size:10.5px;color:${C.faint};white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+@media (prefers-reduced-motion:reduce){.dp-live-dot{animation:none}}
+
 .dp-legend{display:flex;gap:18px;align-items:center;padding:8px 0 2px 14px;
   font-size:12.5px;color:${C.ink}}
 .dp-legend-item{display:flex;align-items:center;gap:6px}
@@ -1467,10 +2359,14 @@ const css = `
 .dp-chart-empty{height:100%;display:grid;place-items:center;text-align:center;
   padding:0 24px;color:${C.muted};font-size:13px;line-height:1.5}
 .dp-foot-note{margin:0;padding:2px 14px 8px;font-size:11px;color:${C.faint};text-align:right}
+.dp-hint{margin:0;padding:4px 14px 2px;font-size:11px;color:${C.faint}}
 
 .dp-tip{background:${C.panel};border:1px solid ${C.edge};border-radius:6px;padding:9px 11px;
   font-size:12px;color:${C.ink};box-shadow:0 2px 8px rgba(60,64,67,.2);min-width:150px}
 .dp-tip-head{color:${C.muted};margin-bottom:5px;font-size:11.5px}
+.dp-tip-group{font-size:10px;text-transform:uppercase;letter-spacing:.04em;
+  color:#80868b;margin:6px 0 2px;border-top:1px solid #e8eaed;padding-top:5px}
+.dp-tip-group:first-of-type{border-top:0;margin-top:2px;padding-top:0}
 .dp-tip-row{display:flex;gap:14px;justify-content:space-between;line-height:1.7}
 .dp-tip-row.strong{border-top:1px solid ${C.grid};margin-top:4px;padding-top:4px;font-weight:500}
 .dp-tip-note{color:${C.faint};font-style:italic}
@@ -1491,6 +2387,9 @@ const css = `
 .dp-table tbody tr:hover{background:${C.hover}}
 .dp-rank{color:${C.faint};text-align:right;padding-right:6px !important;padding-left:12px !important}
 .dp-name{max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.dp-drill{display:inline-block;max-width:100%;vertical-align:bottom;background:none;border:none;font:inherit;color:${C.blueInk};cursor:pointer;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dp-drill:hover{text-decoration:underline}
+.dp-drill:focus-visible{outline:2px solid ${C.focus};outline-offset:1px;border-radius:2px}
 .dp-num{text-align:right;font-variant-numeric:tabular-nums}
 .dp-cump-cell{padding:0 !important;text-align:right}
 .dp-cump{padding:9px 12px;text-align:right;font-variant-numeric:tabular-nums}

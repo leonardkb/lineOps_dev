@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import { colorForWO } from "../../lib/workOrderColors";
+import { buildTicketUrl } from "./ticketCode";
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
@@ -565,6 +566,7 @@ export default function CuttingEntry() {
     const panelTickets = [];
     const mk = onlyMarker
       ? [{
+          id: onlyMarker.id,
           name: onlyMarker.name,
           fabricCode: onlyMarker.fabricCode,
           fabricName: onlyMarker.fabricName,
@@ -589,10 +591,10 @@ export default function CuttingEntry() {
           const quantity = pedidoMap.get(String(l.talla)) ?? 0;
           if (panels > 0) {
             for (let i = 1; i <= panels; i++) {
-              panelTickets.push({ talla: l.talla, quantity, panelNo: i, panelCount: panels, pieces: per, marker: m.name, tela: mTela });
+              panelTickets.push({ talla: l.talla, quantity, panelNo: i, panelCount: panels, pieces: per, marker: m.name, markerId: m.id, tela: mTela });
             }
           } else {
-            panelTickets.push({ talla: l.talla, quantity, panelNo: null, panelCount: null, pieces: per, marker: m.name, tela: mTela });
+            panelTickets.push({ talla: l.talla, quantity, panelNo: null, panelCount: null, pieces: per, marker: m.name, markerId: m.id, tela: mTela });
           }
         });
       });
@@ -625,9 +627,15 @@ export default function CuttingEntry() {
 
     const oneTicket = (t) => {
       const panelTag = t.panelCount ? `P${t.panelNo}/${t.panelCount}` : "";
-      const panelNum = t.panelCount ? `${t.panelNo} / ${t.panelCount}` : "—";
-      const qrData = encodeURIComponent(`${cutNo(co)}|${co.work_order_no || ""}|${co.color || ""}|${t.talla || ""}|${t.marker || ""}|P${t.panelNo || 1}`);
-      const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=160x160&margin=0&data=${qrData}`;
+      // QR = enlace a la tarjeta del ticket (TicketCard). Con la cámara del
+      // celular abre una tarjeta pequeña; el escáner de la app también lo lee.
+      const qrData = encodeURIComponent(buildTicketUrl({
+        cutId: co.id, workOrderNo: co.work_order_no, color: co.color, talla: t.talla,
+        marker: t.marker, markerId: t.markerId, panelNo: t.panelNo, panelCount: t.panelCount,
+        pieces: t.pieces,
+      }));
+      // ecc=L: QR menos denso, se lee mejor impreso en térmica a 15 mm.
+      const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=0&ecc=L&data=${qrData}`;
       const telaTxt = t.tela || [co.fabric_code, co.fabric].filter(Boolean).join(" ") || "—";
       return `
       <div class="ticket">
@@ -648,14 +656,17 @@ export default function CuttingEntry() {
           ${tallaLabel(t.talla) ? `<span class="sz">${esc(tallaLabel(t.talla))}</span>` : ""}
         </div>
 
-        <div class="pieces"><span class="pk">Piezas · panel</span><span class="pv">${rnd(t.pieces)}</span></div>
+        <div class="pieces">
+          <div class="pn"><span class="pk">Panel</span><span class="pnv">${t.panelCount ? `${t.panelNo}<small>/${t.panelCount}</small>` : "—"}</span></div>
+          <div class="pp"><span class="pk">Pzs/panel</span><span class="pv">${rnd(t.pieces)}</span></div>
+        </div>
 
         <div class="grid">
           <div class="c"><span class="l">Color</span><span class="v">${esc(co.color)}</span></div>
           <div class="c"><span class="l">Season</span><span class="v">${esc(co.season || "—")}</span></div>
           <div class="c stack">
             <div><span class="l">Pedido talla</span><span class="v">${rnd(t.quantity)}</span></div>
-            <div><span class="l">Panel</span><span class="v">${esc(panelNum)}</span></div>
+            <div><span class="l">Paneles talla</span><span class="v">${t.panelCount ? rnd(t.panelCount) : "—"}</span></div>
           </div>
           <div class="c"><span class="l">Marcada</span><span class="v">${esc(t.marker || "—")}</span></div>
           <div class="c wide"><span class="l">Tela</span><span class="v">${esc(telaTxt)}</span></div>
@@ -685,7 +696,7 @@ export default function CuttingEntry() {
         .who { flex:1; min-width:0; }
         .cust { font-size:8pt; font-weight:800; line-height:1.05; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .meta { font-family:ui-monospace,Consolas,monospace; font-size:6pt; color:var(--muted); line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .qr { width:13mm; height:13mm; flex:none; }
+        .qr { width:15mm; height:15mm; flex:none; image-rendering:pixelated; }
 
         .estilo { display:flex; align-items:baseline; gap:1.5mm; border-top:0.3mm solid var(--line); padding-top:0.8mm; }
         .estilo .k { font-size:6pt; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); flex:none; }
@@ -695,9 +706,14 @@ export default function CuttingEntry() {
         .talla .tv { font-size:13pt; font-weight:700; line-height:1; }
         .talla .sz { font-size:22pt; font-weight:800; line-height:1; border:0.4mm solid var(--line); border-radius:1.2mm; padding:0.2mm 2mm; }
 
-        .pieces { display:flex; align-items:baseline; justify-content:space-between; gap:1mm; border:0.5mm solid var(--line); border-radius:1mm; padding:0.8mm 2mm; }
-        .pieces .pk { font-size:6.5pt; text-transform:uppercase; letter-spacing:.05em; }
-        .pieces .pv { font-size:19pt; font-weight:800; line-height:1; }
+        .pieces { display:flex; align-items:stretch; border:0.5mm solid var(--line); border-radius:1mm; }
+        .pieces > div { flex:1; display:flex; flex-direction:column; justify-content:center; padding:0.5mm 1.5mm; line-height:1; }
+        .pieces .pn { background:#000; color:#fff; }
+        .pieces .pp { align-items:flex-end; }
+        .pieces .pk { font-size:5.5pt; text-transform:uppercase; letter-spacing:.05em; }
+        .pieces .pnv { font-size:16pt; font-weight:800; }
+        .pieces .pnv small { font-size:9pt; font-weight:700; }
+        .pieces .pv { font-size:16pt; font-weight:800; }
 
         .po1 { display:flex; align-items:baseline; gap:1.5mm; border-top:0.3mm solid var(--line); padding-top:0.8mm; }
         .po1 .l { font-size:6pt; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); flex:none; }

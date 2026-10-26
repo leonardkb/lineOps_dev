@@ -8,25 +8,56 @@
 //   • SAM               Merchant vs Producción por estilo / línea.
 //                       Regla: SAM producción (line_runs.sam_minutes) debe ser
 //                       MENOR que SAM merchant (work_orders.sam_minutes).
-//   • Estado de órdenes Avance, estado y FECHAS: entrega del merchant
-//                       (commitment_date) vs fin de plan del planner
-//                       (máx. assigned_date en line_assignments).
+//   • Estado de órdenes La MISMA vista que el planner (OrderStatus.jsx):
+//                       avance, entrega del merchant vs fin de plan, foto del
+//                       merchant, líneas y detalle por línea / día.
 //   • Tablero           El Plan Board del planner en modo consulta.
+//   • Cierres           Solicitudes de permiso para completar órdenes por
+//                       debajo del umbral + alertas de órdenes cerradas por
+//                       planeación (OrderCloseApprovals.jsx / order-close.js).
 
 import { useState, useEffect, useMemo } from "react";
 import {
   LayoutGrid, Gauge, Search, Loader2, CheckCircle2, AlertTriangle,
   MinusCircle, ArrowUpDown, Layers, Info, CalendarClock, Package,
-  ClipboardList, Truck,
+  ClipboardList, Truck, ShieldCheck, Bell,
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import PlanBoard from "./PlanBoard";
+import StyleEfficiencyApprovals from "./StyleEfficiencyApprovals";
 import NavCeo from "../NavCeo";
+// Same "Estado de Órdenes" screen the planner sees (photo, lines, per-day detail)
+import OrderStatus from "./OrderStatus";
+// Cierre manual de órdenes: permisos y alertas para el CEO
+import OrderCloseApprovals from "./OrderCloseApprovals";
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
   Authorization: `Bearer ${localStorage.getItem("token")}`,
 });
+
+// GET con reintentos: AWS rechaza peticiones cuando se llena el límite de
+// Lambda (responde {"message":"Internal server error"}) o la BD despierta.
+// Reintenta 5xx/429/red/no-JSON a los 0.4, 0.8 y 1.6 s. Nunca lanza.
+async function getJSON(path, retries = 3) {
+  let last = { ok: false, data: null };
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetch(`${API_URL}${path}`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
+        cache: "no-store",
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) return { ok: true, data };
+      last = { ok: false, data };
+      if (res.status < 500 && res.status !== 429) return last; // 4xx: no insistir
+    } catch {
+      last = { ok: false, data: null };
+    }
+    if (i < retries) await new Promise((r) => setTimeout(r, 400 * 2 ** i));
+  }
+  return last;
+}
 
 const norm = (s) => String(s || "").trim().toUpperCase();
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
@@ -79,8 +110,8 @@ const orderStChip = (raw) => ORDER_ST[String(raw || "").toLowerCase()]
   || { label: raw ? String(raw) : "—", chip: "bg-gray-100 text-gray-500 ring-gray-500/20" };
 
 export default function PlannerAnalytics() {
-  const [tab, setTab] = useState("sam");     // "sam" | "orders" | "board"
-  const [boardVisited, setBoardVisited] = useState(false);
+  const [tab, setTab] = useState("board");   // "board" | "orders" | "efficiency" | "sam" — abre en el tablero
+  const [boardVisited, setBoardVisited] = useState(true); // the board is the opening tab
 
   const [workOrders, setWorkOrders] = useState([]);
   const [lineRuns, setLineRuns] = useState([]);
@@ -99,33 +130,46 @@ export default function PlannerAnalytics() {
   const [search, setSearch] = useState("");
   const [worstFirst, setWorstFirst] = useState(true);
 
+  // Antes: si /api/work-orders fallaba (p.ej. límite de Lambda), se guardaba
+  // una lista VACÍA sin avisar y «Estado de órdenes» salía en blanco. Ahora
+  // cada recurso se reintenta; si work-orders o line-runs siguen fallando se
+  // muestra el error con botón «Reintentar» y nunca una tabla vacía engañosa.
+  const [reloadKey, setReloadKey] = useState(0);
   useEffect(() => {
     let cancelled = false;
     (async () => {
       setLoading(true); setErrored(false);
-      try {
-        const [woRes, lrRes, mpRes, asRes] = await Promise.all([
-          fetch(`${API_URL}/api/work-orders`, { headers: authHeaders() }),
-          fetch(`${API_URL}/api/line-runs`, { headers: authHeaders() }),
-          fetch(`${API_URL}/api/merchant-plan`, { headers: authHeaders() }).catch(() => null),
-          fetch(`${API_URL}/api/line-assignments`, { headers: authHeaders() }).catch(() => null),
-        ]);
-        const wo = await woRes.json();
-        const lr = await lrRes.json();
-        const mp = mpRes && mpRes.ok ? await mpRes.json().catch(() => null) : null;
-        const as = asRes && asRes.ok ? await asRes.json().catch(() => null) : null;
-        if (cancelled) return;
-        setWorkOrders(wo?.success ? wo.workOrders || [] : []);
-        setLineRuns(lr?.success ? lr.runs || [] : []);
-        setMerchantPlan(mp?.success ? mp.plan || [] : []);
-        setAssignments(as?.success ? as.assignments || [] : []);
-      } catch {
-        if (!cancelled) setErrored(true);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+      const [wo, lr, mp, as] = await Promise.all([
+        getJSON("/api/work-orders"),
+        getJSON("/api/line-runs"),
+        getJSON("/api/merchant-plan"),
+        getJSON("/api/line-assignments"),
+      ]);
+      if (cancelled) return;
+      const woOk = wo.ok && wo.data?.success;
+      const lrOk = lr.ok && lr.data?.success;
+      if (woOk) setWorkOrders(wo.data.workOrders || []);
+      if (lrOk) setLineRuns(lr.data.runs || []);
+      if (mp.ok && mp.data?.success) setMerchantPlan(mp.data.plan || []);
+      if (as.ok && as.data?.success) setAssignments(as.data.assignments || []);
+      // Sin órdenes no hay nada que mostrar: es un error, no "0 órdenes".
+      if (!woOk || !lrOk) setErrored(true);
+      setLoading(false);
     })();
     return () => { cancelled = true; };
+  }, [reloadKey]);
+
+  // Contador de la pestaña "Cierres": solicitudes pendientes + alertas sin ver.
+  // Se refresca cada minuto para que el CEO vea llegar los cierres.
+  const [closeBadge, setCloseBadge] = useState(0);
+  const refreshCloseBadge = async () => {
+    const r = await getJSON("/api/work-order-close-requests/summary", 1);
+    if (r.ok && r.data?.success) setCloseBadge((r.data.pendingRequests || 0) + (r.data.unreadAlerts || 0));
+  };
+  useEffect(() => {
+    refreshCloseBadge();
+    const t = setInterval(refreshCloseBadge, 60000);
+    return () => clearInterval(t);
   }, []);
 
   useEffect(() => { if (tab === "board") setBoardVisited(true); }, [tab]);
@@ -503,19 +547,31 @@ export default function PlannerAnalytics() {
           <div>
             <h1 className="text-lg sm:text-xl font-bold tracking-tight">Analíticas de Planeación</h1>
             <p className="text-xs text-gray-500">
-              {tab === "sam" && "SAM del merchant contra la SAM de producción."}
-              {tab === "orders" && "Estado, avance y fechas de entrega: merchant vs plan del planner."}
               {tab === "board" && "El tablero que armó planeación, en modo consulta."}
+              {tab === "orders" && "Estado, avance y fechas de entrega: merchant vs plan del planner."}
+              {tab === "efficiency" && "Solicitudes de cambio de eficiencia por estilo del Plan Board, para aprobación del CEO."}
+              {tab === "closes" && "Órdenes que planeación quiere completar: permisos por debajo del mínimo producido y alertas de cierre."}
+              {tab === "sam" && "SAM del merchant contra la SAM de producción."}
             </p>
           </div>
-          <KpiStrip cards={activeKpis.cards} loading={loading} />
+          {/* Orders tab brings its own summary bar (same as the planner's) */}
+          {tab !== "orders" && tab !== "closes" && <KpiStrip cards={activeKpis.cards} loading={loading} />}
         </div>
 
         <div className="max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8">
           <div role="tablist" className="flex gap-1 overflow-x-auto">
-            <Tab active={tab === "sam"} onClick={() => setTab("sam")} Icon={Gauge}>SAM: Merchant vs Producción</Tab>
-            <Tab active={tab === "orders"} onClick={() => setTab("orders")} Icon={ClipboardList}>Estado de órdenes</Tab>
             <Tab active={tab === "board"} onClick={() => setTab("board")} Icon={LayoutGrid}>Tablero del planner</Tab>
+            <Tab active={tab === "orders"} onClick={() => setTab("orders")} Icon={ClipboardList}>Estado de órdenes</Tab>
+            <Tab active={tab === "efficiency"} onClick={() => setTab("efficiency")} Icon={ShieldCheck}>Permisos de eficiencia</Tab>
+            <Tab active={tab === "closes"} onClick={() => setTab("closes")} Icon={Bell}>
+              Cierres de órdenes
+              {closeBadge > 0 && (
+                <span className="ml-1.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-rose-600 px-1.5 text-[11px] font-semibold leading-5 text-white">
+                  {closeBadge}
+                </span>
+              )}
+            </Tab>
+            <Tab active={tab === "sam"} onClick={() => setTab("sam")} Icon={Gauge}>SAM: Merchant vs Producción</Tab>
           </div>
         </div>
       </header>
@@ -525,8 +581,28 @@ export default function PlannerAnalytics() {
         {tab === "board" ? (
           <div className="h-full overflow-auto">
             {boardVisited && (
-              <PlanBoard readOnly heading="Tablero del planner" subheading="Vista de consulta." />
+              <PlanBoard
+                readOnly
+                canLockWeeks
+                heading="Tablero del planner"
+                subheading="Vista de consulta. En la vista Semanal, use el candado junto a cada semana para bloquearla o desbloquearla: una semana bloqueada no la puede mover el planner."
+              />
             )}
+          </div>
+        ) : tab === "orders" ? (
+          <div className="h-full max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-3">
+            {/* Identical to Planificación Avanzada → Estado de Órdenes */}
+            {/* approverMode: el CEO completa directo, sin regla ni solicitud */}
+            <OrderStatus fill approverMode />
+          </div>
+        ) : tab === "efficiency" ? (
+          <div className="h-full overflow-auto">
+            {/* Planner's Plan Board standards: efficiency changes need the CEO */}
+            <StyleEfficiencyApprovals />
+          </div>
+        ) : tab === "closes" ? (
+          <div className="h-full overflow-auto">
+            <OrderCloseApprovals onChange={refreshCloseBadge} />
           </div>
         ) : (
           <div className="h-full flex flex-col max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-3">
@@ -596,7 +672,15 @@ export default function PlannerAnalytics() {
                 {loading ? (
                   <Centered><Loader2 className="w-5 h-5 animate-spin" /> Cargando…</Centered>
                 ) : errored ? (
-                  <Centered>No se pudieron cargar los datos. Revisa tu conexión y vuelve a intentar.</Centered>
+                  <Centered>
+                    <span>No se pudieron cargar las órdenes (el servidor está ocupado o despertando).</span>
+                    <button
+                      onClick={() => setReloadKey((k) => k + 1)}
+                      className="ml-2 rounded-lg bg-gray-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-gray-700"
+                    >
+                      Reintentar
+                    </button>
+                  </Centered>
                 ) : tab === "sam" ? (
                   samVisible.length === 0
                     ? <Centered>{samOnly === "bad" ? "Ningún estilo incumple: todo corre por debajo de la SAM del merchant." : "No hay estilos con este filtro."}</Centered>

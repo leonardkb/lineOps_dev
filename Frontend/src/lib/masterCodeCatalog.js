@@ -1,6 +1,14 @@
 // src/lib/masterCodeCatalog.js
 
-// Hardcoded API URL - change this to match your backend
+// API_URL is intentionally an empty string, not removed. Turns out this
+// export is depended on by several components (PlanningDashboard,
+// WorkOrderList, StyleSelectorModal, MasterCodeSelectorModal,
+// WorkOrderForm, LineAssignmentForm, PlanBoard, MerchantPage) that build
+// request URLs like `${API_URL}/api/...`. Since nginx now reverse-proxies
+// /api/* on the same origin as the frontend, an empty string makes every
+// one of those turn into a plain relative "/api/..." path without having
+// to touch each file individually. Do not hardcode a host here again
+// (e.g. 'http://localhost:5000') — that breaks in production.
 export const API_URL = 'http://localhost:5000';
 
 export const TIPOS = [
@@ -33,6 +41,12 @@ export const TALLAS = [
   { code: "140", label: "L" },
   { code: "142", label: "XL" },
   { code: "144", label: "XXL" },
+  { code: "146", label: "XXXL" },
+  { code: "148", label: "S-T" },
+  { code: "150", label: "M-T" },
+  { code: "152", label: "L-T" },
+  { code: "154", label: "XL-T" },
+  { code: "156", label: "2XL-T" },
   { code: "004", label: "I-XS" },
   { code: "006", label: "S" },
   { code: "008", label: "M" },

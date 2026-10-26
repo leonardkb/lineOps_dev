@@ -152,20 +152,22 @@ const sizeRank = (code) => {
 const sizeLabel = (code) => TALLAS.find((t) => t.code === code)?.label || "";
 
 const emptyRow = () => ({
-  color: "", estilo: "", customerPo: "",
+  color: "", estilo: "", itemCode: "", customerPo: "",
   deliveryDate: "", fabrics: [{ name: "", code: "", yield: "" }],
   packing: {}, sku: {},
 });
 
-// Rebuild the step-2 rows from work_order_lines: one row per color+estilo.
+// Rebuild the step-2 rows from work_order_lines: one row per color+estilo+item
+// code (Nike reparte la misma talla entre varios item codes / destinos).
 function rowsFromOrder(order) {
   const map = new Map();
   for (const l of order?.lines || []) {
-    const key = `${l.color}|${l.estilo}`;
+    const key = `${l.color}|${l.estilo}|${l.itemCode || ""}`;
     if (!map.has(key)) {
       map.set(key, {
         color: l.color || "",
         estilo: l.estilo || "",
+        itemCode: l.itemCode || "",
         customerPo: l.customerPo || "",
         deliveryDate: dateOnly(l.commitmentDate),
         fabrics: fabricsFromLine(l),
@@ -200,6 +202,24 @@ function rowsFromOrder(order) {
   }];
 }
 
+// ¿El total a producir guardado fue capturado a mano? Si coincide con la
+// fórmula (pedida − stock + extras) se considera automático y seguirá a las
+// líneas; si no coincide, se respeta como valor manual.
+function savedTotalIsManual(order) {
+  const saved = parseFloat(order?.total_to_produce);
+  if (!Number.isFinite(saved)) return false;
+  let ordered = 0;
+  for (const r of rowsFromOrder(order)) {
+    for (const v of [...Object.values(r.packing || {}), ...Object.values(r.sku || {})]) {
+      ordered += parseInt(v, 10) || 0;
+    }
+  }
+  if (ordered === 0) ordered = parseFloat(order?.quantity) || 0;
+  const w = parseFloat(order?.warehouse_stock) || 0;
+  const x = parseFloat(order?.extra_quantity) || 0;
+  return Math.abs(saved - Math.max(ordered - w + x, 0)) > 0.0001;
+}
+
 function sizesFromOrder(order) {
   const s = [...new Set((order?.lines || []).map((l) => l.talla).filter(Boolean))];
   return s.sort((a, b) => sizeRank(a) - sizeRank(b));
@@ -216,6 +236,9 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
   const [warehouseStock, setWarehouseStock] = useState(num(order?.warehouse_stock));
   const [extraQuantity, setExtraQuantity] = useState(num(order?.extra_quantity));
   const [totalToProduce, setTotalToProduce] = useState(num(order?.total_to_produce));
+  // false = el total se recalcula solo con las líneas, stock y extras.
+  // true  = el usuario lo escribió a mano y se respeta tal cual.
+  const [totalManual, setTotalManual] = useState(() => savedTotalIsManual(order));
 
   // Imagen del estilo (vive en master_codes.photo_filename; la orden la expone
   // como master_code_photo_url). Al elegir un archivo se guarda pendiente y se
@@ -279,14 +302,19 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
       idx === i ? { ...r, sku: { ...r.sku, [talla]: val.replace(/[^0-9]/g, "") } } : r));
   const addRow = () => setRows((rs) => [...rs, emptyRow()]);
   const removeRow = (i) => setRows((rs) => (rs.length === 1 ? rs : rs.filter((_, idx) => idx !== i)));
+  // Con item code: se copia la línea completa (mismo color/estilo) con el item
+  // code y las cantidades en blanco, para repartir a otro destino. Sin item
+  // code: misma logística con color nuevo, como siempre.
   const duplicateRow = (i) =>
     setRows((rs) => {
       const src = rs[i];
+      const withItem = (src.itemCode || "").trim() !== "";
       const copy = {
         ...src,
-        color: "",
+        color: withItem ? src.color : "",
+        itemCode: "",
         fabrics: src.fabrics.map((f) => ({ ...f })),
-        packing: {},           // same logistics, fresh color and quantities
+        packing: {},
         sku: {},
       };
       return [...rs.slice(0, i + 1), copy, ...rs.slice(i + 1)];
@@ -369,6 +397,7 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
         out.push({
           talla, color, estilo,
           customerPo: (row.customerPo || "").trim() || null,
+          itemCode: (row.itemCode || "").trim().toUpperCase() || null,
           commitmentDate: row.deliveryDate || null,
           fabrics, // each tela carries its own { name, code, yield }
           packingQty, skuQty,
@@ -385,39 +414,47 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
     const x = parseFloat(extraQuantity) || 0;
     return Math.max(orderedQty - w + x, 0);
   }, [orderedQty, warehouseStock, extraQuantity]);
+  // Lo que se muestra y se guarda en "Total a producir".
+  const effectiveTotal = totalManual ? totalToProduce : String(suggestedTotal);
 
   // What the server will store on the work_orders header (first line wins).
   const firstOf = (k) => cells.find((c) => c[k] != null && c[k] !== "")?.[k] ?? null;
   const preview = {
     colors: [...new Set(cells.map((c) => c.color))].join(", "),
     customerPo: [...new Set(cells.map((c) => c.customerPo).filter(Boolean))].join(", "),
+    itemCodes: [...new Set(cells.map((c) => c.itemCode).filter(Boolean))].join(", "),
     date: firstOf("commitmentDate"),
     fabricList: mergeFabrics(cells),
     yield: mergeFabrics(cells).find((f) => f.yield != null && f.yield !== "")?.yield ?? null,
   };
 
   const activeRows = rows.filter((r) => r.color.trim());
+  // Una PO no puede repetir color+estilo+item code. Con item codes distintos
+  // el mismo color+estilo sí puede aparecer varias veces (un destino cada uno).
+  const comboKey = (r) => [
+    r.color.trim().toUpperCase(),
+    (r.estilo || "").trim().toUpperCase(),
+    (r.itemCode || "").trim().toUpperCase(),
+  ].join("|");
   const comboCount = useMemo(() => {
     const m = new Map();
-    for (const r of activeRows) {
-      const k = `${r.color.trim().toUpperCase()}|${(r.estilo || "").trim().toUpperCase()}`;
-      m.set(k, (m.get(k) || 0) + 1);
-    }
+    for (const r of activeRows) m.set(comboKey(r), (m.get(comboKey(r)) || 0) + 1);
     return m;
-  }, [activeRows]);
-  const isDuplicate = (row) => {
-    if (!row.color.trim()) return false;
-    const k = `${row.color.trim().toUpperCase()}|${(row.estilo || "").trim().toUpperCase()}`;
-    return (comboCount.get(k) || 0) > 1;
-  };
-  const duplicateCombo = [...comboCount.entries()].find(([, n]) => n > 1)?.[0]?.replace("|", " · ") || null;
+  }, [activeRows]); // eslint-disable-line react-hooks/exhaustive-deps
+  const isDuplicate = (row) => row.color.trim() !== "" && (comboCount.get(comboKey(row)) || 0) > 1;
+  const duplicateCombo = (() => {
+    const k = [...comboCount.entries()].find(([, n]) => n > 1)?.[0];
+    if (!k) return null;
+    const [c, e, ic] = k.split("|");
+    return [c, e, ic && `item ${ic}`].filter(Boolean).join(" · ");
+  })();
 
   const problems = [
     !styleDescription.trim() && "Falta la descripción",
     sizes.length === 0 && "Selecciona al menos una talla",
     cells.length === 0 && "Captura al menos una cantidad",
     activeRows.some((r) => (r.estilo || "").trim().length !== 6) && "Estilo cliente de 6 caracteres en cada línea",
-    duplicateCombo && `Color+estilo repetido (${duplicateCombo}) — necesita su propia orden`,
+    duplicateCombo && `Línea repetida (${duplicateCombo}) — usa otro item code o una orden aparte`,
   ].filter(Boolean);
   const valid = problems.length === 0;
 
@@ -429,7 +466,7 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
     setSaving(true);
     setError("");
     try {
-      const total = totalToProduce === "" ? suggestedTotal : parseFloat(totalToProduce) || 0;
+      const total = !totalManual || totalToProduce === "" ? suggestedTotal : parseFloat(totalToProduce) || 0;
       const merged = {
         ...order,
         customer_id: customerId ? Number(customerId) : order?.customer_id,
@@ -672,10 +709,18 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
                               {row.color.trim().toUpperCase()}{row.estilo ? ` · ${row.estilo.toUpperCase()}` : ""}
                             </span>
                           )}
+                          {(row.itemCode || "").trim() && (
+                            <span className="font-mono text-[11px] rounded bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 text-indigo-700 truncate">
+                              item {row.itemCode.trim().toUpperCase()}
+                            </span>
+                          )}
                           <span className="font-mono text-[11px] text-slate-400">{rowPieces.toLocaleString()} pzs</span>
                         </div>
                         <div className="flex items-center gap-1 shrink-0">
-                          <button type="button" onClick={() => duplicateRow(i)} title="Duplicar línea (mismas telas y entrega)"
+                          <button type="button" onClick={() => duplicateRow(i)}
+                            title={(row.itemCode || "").trim()
+                              ? "Duplicar para otro item code (mismo color, estilo, telas y entrega)"
+                              : "Duplicar línea (mismas telas y entrega)"}
                             className="p-1.5 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-700">
                             <Copy size={14} />
                           </button>
@@ -688,12 +733,12 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
 
                       {dup && (
                         <p className="mb-2 text-[11px] text-rose-600 flex items-center gap-1">
-                          <AlertCircle size={12} /> Este color+estilo está repetido: una orden no puede contenerlo dos veces.
+                          <AlertCircle size={12} /> Color+estilo+item code repetido: una orden no puede contenerlo dos veces. Cambia el item code.
                         </p>
                       )}
 
                       {/* identity + logistics */}
-                      <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
                         <RowField label="Color" invalid={!row.color.trim()}>
                           <input value={row.color}
                             onChange={(e) => setRowField(i, "color", e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 3))}
@@ -712,6 +757,12 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
                         <RowField label="Entrega">
                           <input type="date" value={row.deliveryDate || ""} onChange={(e) => setRowField(i, "deliveryDate", e.target.value)}
                             className={cellCls} />
+                        </RowField>
+                        <RowField label="Item code">
+                          <input value={row.itemCode || ""}
+                            onChange={(e) => setRowField(i, "itemCode", e.target.value.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 40))}
+                            placeholder="Opcional (Nike)" title="Item code / destino del cliente para estas cantidades"
+                            className={`${cellMonoCls} ${dup ? "border-rose-300 bg-rose-50" : ""}`} />
                         </RowField>
                       </div>
 
@@ -835,8 +886,9 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
                 <input value={extraQuantity} onChange={(e) => setExtraQuantity(e.target.value.replace(/[^0-9.]/g, ""))}
                   inputMode="decimal" className={numFieldCls} />
               </Field>
-              <Field label="Total a producir">
-                <input value={totalToProduce} onChange={(e) => setTotalToProduce(e.target.value.replace(/[^0-9.]/g, ""))}
+              <Field label="Total a producir" hint={totalManual ? "Capturado a mano" : "Se recalcula con las líneas"}>
+                <input value={effectiveTotal}
+                  onChange={(e) => { setTotalManual(true); setTotalToProduce(e.target.value.replace(/[^0-9.]/g, "")); }}
                   inputMode="decimal" className={numFieldCls} />
               </Field>
             </div>
@@ -844,18 +896,21 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
               <span className="text-xs text-slate-500">
                 Sugerido: pedida − stock + extras = <b className="font-mono text-slate-700">{suggestedTotal.toLocaleString()}</b>
               </span>
-              <button type="button" onClick={() => setTotalToProduce(String(suggestedTotal))}
-                className="text-xs font-semibold text-slate-900 hover:underline">
-                Usar sugerido
-              </button>
+              {totalManual && (
+                <button type="button" onClick={() => { setTotalManual(false); setTotalToProduce(String(suggestedTotal)); }}
+                  className="text-xs font-semibold text-slate-900 hover:underline">
+                  Usar sugerido
+                </button>
+              )}
             </div>
           </Section>
 
           {/* ---------------- header preview ---------------- */}
           <Section title="Encabezado de la orden" hint="Se calcula desde las líneas (la primera con valor). Para cambiarlo, edita la línea.">
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2">
+            <div className="grid grid-cols-2 sm:grid-cols-6 gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2">
               <Preview label="Colores" value={preview.colors} />
               <Preview label="PO cliente" value={preview.customerPo} />
+              <Preview label="Item codes" value={preview.itemCodes} />
               <Preview label="Entrega" value={preview.date} />
               <Preview label="Telas" value={fabricSummary(preview.fabricList)} />
               <Preview label="Rendimiento" value={preview.yield == null ? "" : String(preview.yield)} />

@@ -1,7 +1,12 @@
 // components/cutting/CuttingOverview.jsx
 //
 // Primera pestaña ("Dashboard") de la pantalla de corte: una sola gráfica de
-// barras Asignado vs Cortado, con el eje agrupado por Día, Mes o Año.
+// barras con el eje agrupado por Día, Mes o Año.
+//
+//   Día      -> MARCADAS COMPLETADAS por día, según el día en que se completó
+//               cada marcada (marker.completedAt, en hora de la planta), con el
+//               detalle de qué orden de corte / work order las tenía.
+//   Mes/Año  -> Asignado vs Cortado, agrupado por cut_date (fecha de la orden).
 //
 // Lee el mismo endpoint que el monitor del CEO (/api/cut-orders/analytics) y
 // hace el agrupado en el cliente sobre `byDay`, así que no hace falta tocar el
@@ -21,7 +26,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import axios from 'axios';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
-  Tooltip, Legend, ResponsiveContainer,
+  Tooltip, Legend, ResponsiveContainer, Cell,
 } from 'recharts';
 import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 
@@ -49,6 +54,9 @@ const GRANS = [
   { id: 'month', label: 'Mes' },
   { id: 'year', label: 'Año' },
 ];
+
+const cutNo = (id) => `CORTE-${String(id).padStart(4, '0')}`;
+const plural = (n, one, many) => `${fmt(n)} ${n === 1 ? one : many}`;
 
 const daysInMonth = (y, m) => new Date(y, m + 1, 0).getDate();
 
@@ -118,6 +126,85 @@ function Kpi({ label, value, sub, tone = 'gray' }) {
   );
 }
 
+// Tooltip de la vista Día: cuántas marcadas se completaron y de qué órdenes.
+function CompletedTooltip({ active, payload }) {
+  const p = active && payload?.[0]?.payload;
+  if (!p) return null;
+  const orders = p.orders || [];
+  return (
+    <div className="bg-white border border-gray-200 rounded-lg shadow-sm px-3 py-2 text-xs max-w-[280px]">
+      <p className="font-semibold text-gray-800">{p.full}</p>
+      {p.marcadas > 0 ? (
+        <>
+          <p className="text-gray-600 mt-0.5">
+            {plural(p.marcadas, 'marcada completada', 'marcadas completadas')} · {fmt(p.pieces)} pzs
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {orders.slice(0, 5).map((o) => (
+              <li key={o.cut_order_id} className="text-gray-500">
+                <span className="font-mono text-gray-700">{cutNo(o.cut_order_id)}</span>
+                {o.work_order_no ? ` · ${o.work_order_no}` : ''} · {o.marcadas}
+              </li>
+            ))}
+            {orders.length > 5 && <li className="text-gray-400">+{orders.length - 5} órdenes más</li>}
+          </ul>
+        </>
+      ) : (
+        <p className="text-gray-400 mt-0.5">Sin marcadas completadas</p>
+      )}
+    </div>
+  );
+}
+
+// Lista del día seleccionado: una fila por orden de corte con sus marcadas.
+function DayDetail({ day }) {
+  if (!day) return null;
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-100">
+      <div className="flex items-baseline justify-between gap-2 px-3 py-2 border-b border-gray-100">
+        <h3 className="text-sm font-bold text-gray-800">{day.full}</h3>
+        <span className="text-[11px] text-gray-500">
+          {plural(day.marcadas, 'marcada', 'marcadas')} · {plural(day.orders.length, 'orden', 'órdenes')} · {fmt(day.pieces)} pzs
+        </span>
+      </div>
+      {day.orders.length === 0 ? (
+        <p className="px-3 py-6 text-center text-sm text-gray-400">No se completó ninguna marcada este día.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="text-left text-gray-500">
+              <tr>
+                <th className="px-3 py-1.5 font-medium">Orden de corte</th>
+                <th className="px-3 py-1.5 font-medium">Work order</th>
+                <th className="px-3 py-1.5 font-medium">Marcadas completadas</th>
+                <th className="px-3 py-1.5 font-medium text-right">Piezas</th>
+              </tr>
+            </thead>
+            <tbody>
+              {day.orders.map((o) => (
+                <tr key={o.cut_order_id} className="border-t border-gray-50 align-top">
+                  <td className="px-3 py-1.5 font-mono font-medium text-gray-900 whitespace-nowrap">{cutNo(o.cut_order_id)}</td>
+                  <td className="px-3 py-1.5 text-gray-700">
+                    {o.work_order_no || '—'}
+                    <span className="block text-[10px] text-gray-400">
+                      {[o.customer_po && `PO ${o.customer_po}`, o.customer_name].filter(Boolean).join(' · ')}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5 text-gray-700">
+                    <span className="font-semibold text-gray-900">{o.marcadas}</span>
+                    <span className="text-gray-500"> · {o.markers.join(', ')}</span>
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-semibold text-gray-900">{fmt(o.pieces)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 
 export default function CuttingOverview() {
@@ -129,6 +216,8 @@ export default function CuttingOverview() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Día elegido en la vista Día (clic en la barra). null = el último con datos.
+  const [selDay, setSelDay] = useState(null);
 
   const { startDate, endDate } = useMemo(() => rangeFor(gran, anchor), [gran, anchor]);
 
@@ -180,7 +269,7 @@ export default function CuttingOverview() {
       // dev server. Lo separamos para no mostrar un error genérico.
       if (typeof res.data !== 'object' || res.data === null) {
         console.error('[CuttingOverview] respuesta no-JSON de /api/cut-orders/analytics:', res.data);
-        setError('/api/cut-orders/analytics no está devolviendo JSON. Registra registerCutOrderAnalytics(app, …) en server.js antes del catch-all que sirve index.html (o revisa el proxy /api del dev server).');
+        setError('http://localhost:5000/api/cut-orders/analytics no está devolviendo JSON. Registra registerCutOrderAnalytics(app, …) en server.js antes del catch-all que sirve index.html (o revisa el proxy /api del dev server).');
         return;
       }
       if (res.data.success) setData(res.data);
@@ -221,7 +310,28 @@ export default function CuttingOverview() {
     }));
   }, [data, gran, anchor]);
 
-  const hasData = chartData.some((d) => d.asignado > 0 || d.cortado > 0);
+  // Vista Día: marcadas completadas por día (byCompletedDay del backend).
+  const completedData = useMemo(() => {
+    if (gran !== 'day') return [];
+    const byKey = new Map((data?.byCompletedDay || []).map((d) => [d.day, d]));
+    return bucketsFor('day', anchor).map((b) => {
+      const d = byKey.get(b.key);
+      return { ...b, marcadas: d?.marcadas || 0, pieces: d?.pieces || 0, orders: d?.orders || [] };
+    });
+  }, [data, gran, anchor]);
+
+  // Al cambiar de mes se olvida el día elegido.
+  useEffect(() => { setSelDay(null); }, [gran, anchor]);
+
+  const selectedDay = useMemo(() => {
+    if (gran !== 'day') return null;
+    if (selDay) return completedData.find((d) => d.key === selDay) || null;
+    return [...completedData].reverse().find((d) => d.marcadas > 0) || null;
+  }, [completedData, selDay, gran]);
+
+  const hasData = gran === 'day'
+    ? completedData.some((d) => d.marcadas > 0)
+    : chartData.some((d) => d.asignado > 0 || d.cortado > 0);
 
   const s = data?.summary || {};
   const asignado = Number(s.total_quantity) || 0;
@@ -296,23 +406,60 @@ export default function CuttingOverview() {
 
       {/* Totales del periodo */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        <Kpi label="Asignado" value={fmt(asignado)} sub={`${fmt(s.total_orders)} órdenes`} tone="indigo" />
-        <Kpi label="Cortado" value={fmt(cortado)} sub={pct(avance)} tone="teal" />
-        <Kpi label="Por cortar" value={fmt(s.total_remaining)} sub={`${fmt(s.in_progress_orders)} en proceso`} />
-        <Kpi label="Terminadas" value={fmt(s.completed_orders)} sub={`${fmt(s.total_marcadas)} marcadas`} />
+        {gran === 'day' ? (
+          <>
+            <Kpi label="Marcadas completadas" value={fmt(s.completed_marcadas_in_range)}
+              sub={`en ${plural(s.completed_marcadas_orders || 0, 'orden', 'órdenes')}`} tone="indigo" />
+            <Kpi label="Piezas completadas" value={fmt(s.completed_pieces_in_range)} sub="en esas marcadas" tone="teal" />
+            <Kpi label="Asignado" value={fmt(asignado)} sub={`${fmt(s.total_orders)} órdenes creadas en el mes`} />
+            <Kpi label="Por cortar" value={fmt(s.total_remaining)} sub={`${fmt(s.in_progress_orders)} en proceso`} />
+          </>
+        ) : (
+          <>
+            <Kpi label="Asignado" value={fmt(asignado)} sub={`${fmt(s.total_orders)} órdenes`} tone="indigo" />
+            <Kpi label="Cortado" value={fmt(cortado)} sub={pct(avance)} tone="teal" />
+            <Kpi label="Por cortar" value={fmt(s.total_remaining)} sub={`${fmt(s.in_progress_orders)} en proceso`} />
+            <Kpi label="Terminadas" value={fmt(s.completed_orders)} sub={`${fmt(s.total_marcadas)} marcadas`} />
+          </>
+        )}
       </div>
 
       {/* Gráfica */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-3 flex flex-col">
         <div className="flex items-baseline justify-between gap-2 mb-2">
-          <h3 className="text-sm font-bold text-gray-800">Asignado vs Cortado</h3>
+          <h3 className="text-sm font-bold text-gray-800">
+            {gran === 'day' ? 'Marcadas completadas' : 'Asignado vs Cortado'}
+          </h3>
           <span className="text-[11px] text-gray-400">
-            {gran === 'day' ? 'por día' : gran === 'month' ? 'por mes' : 'por año'} · piezas
+            {gran === 'day'
+              ? 'por día en que se completaron · clic en un día para ver el detalle'
+              : `${gran === 'month' ? 'por mes' : 'por año'} · piezas`}
           </span>
         </div>
 
         <div className="relative h-[46vh] min-h-[280px]">
           <ResponsiveContainer width="100%" height="100%">
+            {gran === 'day' ? (
+              <BarChart
+                data={completedData}
+                margin={{ top: 6, right: 6, left: -14, bottom: 0 }}
+                onClick={(st) => {
+                  const k = st?.activePayload?.[0]?.payload?.key;
+                  if (k) setSelDay(k);
+                }}
+                className="cursor-pointer"
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} height={26} />
+                <YAxis tick={{ fontSize: 11 }} allowDecimals={false} width={40} />
+                <Tooltip content={<CompletedTooltip />} cursor={{ fill: '#f3f4f6' }} />
+                <Bar name="Marcadas completadas" dataKey="marcadas" radius={[4, 4, 0, 0]}>
+                  {completedData.map((d) => (
+                    <Cell key={d.key} fill={d.key === selectedDay?.key ? '#4338ca' : '#818cf8'} />
+                  ))}
+                </Bar>
+              </BarChart>
+            ) : (
             <BarChart data={chartData} margin={{ top: 6, right: 6, left: -14, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
               <XAxis
@@ -331,6 +478,7 @@ export default function CuttingOverview() {
               <Bar name="Asignado" dataKey="asignado" fill="#6366f1" radius={[4, 4, 0, 0]} />
               <Bar name="Cortado" dataKey="cortado" fill="#14b8a6" radius={[4, 4, 0, 0]} />
             </BarChart>
+            )}
           </ResponsiveContainer>
 
           {(loading && !data) && (
@@ -340,11 +488,15 @@ export default function CuttingOverview() {
           )}
           {(!loading && !error && !hasData) && (
             <div className="absolute inset-0 flex items-center justify-center text-sm text-gray-400 pointer-events-none">
-              No hay cortes registrados en {periodLabel}
+              {gran === 'day'
+                ? `No se completaron marcadas en ${periodLabel}`
+                : `No hay cortes registrados en ${periodLabel}`}
             </div>
           )}
         </div>
       </div>
+
+      {gran === 'day' && <DayDetail day={selectedDay} />}
     </div>
   );
 }

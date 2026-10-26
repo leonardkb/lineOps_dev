@@ -8,6 +8,7 @@ import { RefreshCw, ClipboardList, Clock, CheckCircle, Scissors, Layers, FileSpr
 import * as ExcelJS from "exceljs";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import { colorForWO } from "../../lib/workOrderColors";
+import CutRequestButton from "./CutRequestButton";
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
@@ -465,23 +466,39 @@ export default function CuttingDashboard() {
         }))
         .filter((g) => g.items.length > 0);
     }
-    // Por día: fecha ascendente; dentro del día, por prioridad.
-    const byDay = new Map();
+    // Por día de CORTE REALIZADO: cada marcada verificada (m.done) aporta sus
+    // piezas al día de su `completedAt` — la fecha en que el supervisor la
+    // verificó en CutVerification —, NO a la fecha planeada `cut_date`. Así el
+    // día refleja lo que se cortó ese día (Sep 9, 8, 7…). Una orden cuyas
+    // marcadas se cortaron en días distintos aparece en cada uno de esos días,
+    // con las piezas cortadas ESE día.
+    const byDay = new Map(); // dayKey -> Map(orderId -> { co, pieces, markerCount })
     visibleOrders.forEach((co) => {
-      const d = co.cut_date ? String(co.cut_date).slice(0, 10) : "";
-      if (!byDay.has(d)) byDay.set(d, []);
-      byDay.get(d).push(co);
+      markersOf(co).forEach((m) => {
+        if (!m || !m.done) return; // sólo marcadas ya verificadas = corte hecho
+        const dk = m.completedAt ? String(m.completedAt).slice(0, 10) : ""; // "" = verificada sin fecha (dato viejo)
+        if (!byDay.has(dk)) byDay.set(dk, new Map());
+        const bucket = byDay.get(dk);
+        const entry = bucket.get(co.id) || { co, pieces: 0, markerCount: 0 };
+        entry.pieces += markerTotalPieces(m);
+        entry.markerCount += 1;
+        bucket.set(co.id, entry);
+      });
     });
+    // Más reciente primero (hoy arriba); "Sin fecha" queda al final.
     const keys = [...byDay.keys()].sort((a, b) => {
-      const da = a ? new Date(`${a}T00:00:00`).getTime() : Infinity;
-      const db = b ? new Date(`${b}T00:00:00`).getTime() : Infinity;
-      return da - db;
+      const da = a ? new Date(`${a}T00:00:00`).getTime() : -Infinity;
+      const db = b ? new Date(`${b}T00:00:00`).getTime() : -Infinity;
+      return db - da;
     });
     return keys.map((d) => {
-      const items = byDay.get(d).sort(byPriorityThenDate);
+      const entries = [...byDay.get(d).values()].sort((x, y) => byPriorityThenDate(x.co, y.co));
+      const items = entries.map((e) => e.co);
       const breakdown = { urgent: 0, intermediate: 0, normal: 0 };
-      items.forEach((co) => breakdown[co.priority || "normal"]++);
-      return { key: d || "sin-fecha", kind: "day", label: fmtDayHeader(d), items, breakdown };
+      entries.forEach((e) => breakdown[e.co.priority || "normal"]++);
+      const dayPieces = entries.reduce((s, e) => s + e.pieces, 0);
+      const piecesByOrder = new Map(entries.map((e) => [e.co.id, e.pieces]));
+      return { key: d || "sin-fecha", kind: "day", label: fmtDayHeader(d), items, breakdown, dayPieces, piecesByOrder };
     });
   }, [visibleOrders, viewMode]);
 
@@ -563,6 +580,8 @@ export default function CuttingDashboard() {
           <p className="text-sm text-gray-500">Estado de las órdenes de corte y pendientes por cortar</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* Pedir a planeación que asigne una orden a corte */}
+          <CutRequestButton />
           <button
             onClick={exportExcel}
             disabled={totalMarkers === 0}
@@ -655,7 +674,7 @@ export default function CuttingDashboard() {
                 {visibleOrders.length === cutOrders.length
                   ? `${cutOrders.length} órdenes`
                   : `${visibleOrders.length} de ${cutOrders.length} órdenes`}
-                {" · "}agrupadas por {viewMode === "priority" ? "prioridad" : "día de corte"}
+                {" · "}agrupadas por {viewMode === "priority" ? "prioridad" : "día en que se cortó"}
               </p>
             </div>
 
@@ -718,6 +737,12 @@ export default function CuttingDashboard() {
           <div className="p-8 text-center text-gray-500">Sin órdenes de corte.</div>
         ) : visibleOrders.length === 0 ? (
           <div className="p-8 text-center text-gray-500">Ninguna orden coincide con el filtro.</div>
+        ) : groups.length === 0 ? (
+          <div className="p-8 text-center text-gray-500">
+            {viewMode === "day"
+              ? "Aún no hay corte registrado por día. El día aparece cuando el supervisor verifica una marcada."
+              : "Ninguna orden coincide con el filtro."}
+          </div>
         ) : (
           <div className="max-h-[60vh] overflow-y-auto">
             {groups.map((g) => {
@@ -739,6 +764,12 @@ export default function CuttingDashboard() {
                     <span className={`text-[11px] rounded-full px-2 leading-5 ${g.kind === "priority" ? g.meta.count : "bg-gray-200 text-gray-700"}`}>
                       {g.items.length}
                     </span>
+                    {/* En vista por día: total de piezas cortadas ese día */}
+                    {g.kind === "day" && g.dayPieces > 0 && (
+                      <span className="text-[11px] rounded-full px-2 leading-5 bg-blue-100 text-blue-700 font-semibold">
+                        {Math.round(g.dayPieces).toLocaleString()} pzas cortadas
+                      </span>
+                    )}
                     {/* En vista por día: mini-desglose de prioridad */}
                     {g.kind === "day" && (
                       <span className="ml-1 inline-flex items-center gap-2">
@@ -788,9 +819,18 @@ export default function CuttingDashboard() {
                               </span>
                             )}
                             <span className={`text-[11px] rounded-full px-2 py-0.5 shrink-0 ${meta.pill}`}>{meta.label}</span>
-                            <span className="text-xs text-gray-500 w-24 text-right shrink-0">
-                              {rem > 0 ? <span className="text-amber-600 font-medium">Restan {Math.round(rem).toLocaleString()}</span> : `${Math.round(num(co.quantity)).toLocaleString()} pzas`}
-                            </span>
+                            {viewMode === "day" ? (
+                              <span
+                                className="text-xs w-24 text-right shrink-0 font-semibold text-blue-700"
+                                title="Piezas cortadas este día"
+                              >
+                                {Math.round(num(g.piecesByOrder?.get(co.id))).toLocaleString()} pzas
+                              </span>
+                            ) : (
+                              <span className="text-xs text-gray-500 w-24 text-right shrink-0">
+                                {rem > 0 ? <span className="text-amber-600 font-medium">Restan {Math.round(rem).toLocaleString()}</span> : `${Math.round(num(co.quantity)).toLocaleString()} pzas`}
+                              </span>
+                            )}
                             <button
                               onClick={() => exportOrderExcel(co)}
                               disabled={mkCount === 0}

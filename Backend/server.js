@@ -5,8 +5,13 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
 const planWeekLocks = require("./plan-week-locks"); // 🔒 bloqueo de semanas del Plan Board (CEO)
+const itControlPanel = require("./it-control-panel"); // 🖥️ IT control panel: activity log + users
 const { getCachedPresignedUrl } = require("./presignCache");
 const registerPlanRebalance = require("./plan-rebalance"); // ⚖️ snapshots + redistribución exacta del Plan Board
+
+// Several routes call logger.info / logger.error, but this server has no winston
+// logger: without this line those calls crash with "logger is not defined".
+const logger = { info: console.log, warn: console.warn, error: console.error, debug: () => {} };
 
 const app = express();
 app.use(cors());
@@ -724,6 +729,11 @@ await initQualityMasterData(client);
 
     // Create default users if they don't exist
     await createDefaultUsers(client);
+    // 🖥️ IT control panel: user_activity_log table + last_login/last_seen columns + chk_role
+    // If this fails, the rest of the app still starts; only the panel is affected.
+    await itControlPanel.initSchema({ pool, setSchema }).catch((err) =>
+      console.error("❌ IT control panel initSchema failed:", err.message)
+    );
   } catch (err) {
     console.error("❌ Error creating tables:", err.message);
     throw err;
@@ -920,6 +930,34 @@ const applyRoleAlias = (user) => {
 
 
 
+// ----------------------------------------------------------------------
+// 🖥️ IT CONTROL PANEL — activity tracker (must stay BEFORE every route)
+// ----------------------------------------------------------------------
+// Real client IP. A proxy / load balancer (nginx, ALB) APPENDS the caller's IP to
+// X-Forwarded-For, so the LAST entry is the trustworthy one.
+const getClientIp = (req) => {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    const parts = String(xff).split(",").map((p) => p.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1].replace(/^::ffff:/, "");
+  }
+  return (req.socket?.remoteAddress || req.ip || "").replace(/^::ffff:/, "");
+};
+
+// This server's token is base64("userId:timestamp"); the tracker only needs the id
+// to know who signed out.
+const tokenUserId = (token) => {
+  const [id] = Buffer.from(String(token), "base64").toString("ascii").split(":");
+  return { id: parseInt(id, 10) };
+};
+
+app.use("/api/", itControlPanel.activityTracker({
+  pool,
+  logger,
+  getClientIp,
+  verifyToken: tokenUserId,
+}));
+
 // ✅ Login endpoint
 app.post("/api/login", async (req, res) => {
   const client = await pool.connect();
@@ -935,11 +973,18 @@ app.post("/api/login", async (req, res) => {
       });
     }
 
+    // 🔒 Login lock: make sure users.failed_login_attempts / locked_at exist
+    const lock = itControlPanel.loginLock;
+    const lockOn = await lock.ensureSchema(pool, console);
+    const lockCols = lockOn
+      ? "failed_login_attempts, locked_at"
+      : "0 AS failed_login_attempts, NULL::timestamptz AS locked_at";
+
     // Find user
     const userResult = await client.query(
       `
-      SELECT id, username, password_hash, role, line_number, full_name, is_active
-      FROM users 
+      SELECT id, username, password_hash, role, line_number, full_name, is_active, ${lockCols}
+      FROM users
       WHERE username = $1 AND is_active = TRUE
     `,
       [username]
@@ -954,19 +999,58 @@ app.post("/api/login", async (req, res) => {
 
     const user = userResult.rows[0];
 
+    // 🔒 Already locked → refuse even with the right password (every role, master included).
+    //    Only the IT control panel can unlock.
+    if (user.locked_at) {
+      req.loginLogDetails = { reason: "account_locked" };
+      return res.status(423).json({
+        success: false,
+        locked: true,
+        code: "ACCOUNT_LOCKED",
+        error: lock.LOCKED_MESSAGE,
+      });
+    }
+
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
 
     if (!isValidPassword) {
+      if (!lockOn) {
+        return res.status(401).json({
+          success: false,
+          error: "Invalid username or password",
+        });
+      }
+
+      const f = await lock.recordFailure(client, user.id);
+
+      if (f.locked) {
+        console.warn(`🔒 User ${username} locked after ${f.attempts} failed logins`);
+        req.loginLogDetails = { reason: "locked_now", attempts: f.attempts };
+        return res.status(423).json({
+          success: false,
+          locked: true,
+          code: "ACCOUNT_LOCKED",
+          error: lock.LOCKED_MESSAGE,
+        });
+      }
+
+      req.loginLogDetails = { reason: "invalid_password", attempts: f.attempts };
       return res.status(401).json({
         success: false,
-        error: "Invalid username or password",
+        attemptsLeft: f.remaining,
+        error: `Invalid username or password. ${f.remaining} attempt${f.remaining === 1 ? "" : "s"} left before the user is locked.`,
       });
     }
 
+    // Correct password: reset the counter, keep lock columns out of the response
+    if (lockOn && user.failed_login_attempts > 0) await lock.clear(client, user.id);
+    delete user.failed_login_attempts;
+    delete user.locked_at;
+
     // Remove password hash from response
     delete user.password_hash;
-    applyRoleAlias(user); 
+    applyRoleAlias(user);
 
     // Generate a simple token (in production, use JWT)
     const token = Buffer.from(`${user.id}:${Date.now()}`).toString("base64");
@@ -1244,6 +1328,16 @@ registerEfficiencyPermission(app, { authenticateToken, pool, setSchema });
 
 planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "skyrina", "master"] });
 
+
+// 🖥️ IT control panel. itRoles = who can open it.
+itControlPanel(app, {
+  authenticateToken,
+  pool,
+  setSchema,
+  logger,
+  getClientIp,
+  itRoles: ["admin"],
+});
 
 // ⚖️ Plan Board: snapshot + redistribución secuencial exacta (misma línea, días reempacados).
 registerPlanRebalance(app, {
@@ -7729,10 +7823,13 @@ async function heldByLineForDate(client, date) {
   const out = {};
   if (!(await preOrderHoldsTableExists(client))) return out;
   const r = await client.query(
-    `SELECT line_no::text AS line_no, COALESCE(SUM(quantity), 0) AS held
-       FROM pre_order_day_holds
-      WHERE assigned_date::date = $1::date
-      GROUP BY line_no::text`,
+    `SELECT h.line_no, COALESCE(SUM(h.quantity), 0) AS held
+  FROM pre_order_day_holds h
+  LEFT JOIN pre_orders p ON p.id = h.pre_order_id
+ WHERE h.assigned_date = $1
+   -- PRE convertida/cancelada: su PO real ya ocupa la línea; no contar doble.
+   AND COALESCE(p.status, 'pending') NOT IN ('converted','cancelled')
+ GROUP BY h.line_no`,
     [date]
   );
   r.rows.forEach((row) => { out[String(row.line_no)] = parseFloat(row.held) || 0; });
@@ -12739,6 +12836,8 @@ const PACKING_OP_MATCH = `(
   OR oo.operation_name ILIKE '%termin%'
   OR oo.operation_name ILIKE '%finish%'
 )`;
+
+
 
 // ✅ Health check
 app.get("/api/health", async (req, res) => {

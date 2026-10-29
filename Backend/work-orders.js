@@ -1751,6 +1751,10 @@ function registerWorkOrders(app, deps) {
       const planBefore = await snapshotOrderForPlan(client, id);
 
       const set = {};   // column -> value
+      // Separacion por item code (solo cuando llega `lines`):
+      let allCells = [];        // todas las celdas recibidas, de todos los item codes
+      let splitGroups = [];     // [{ itemCode, cells }] que salen a POs nuevas
+      const createdOrders = []; // POs nuevas creadas por la separacion
 
       // -------- header fields the caller sent explicitly -------------------
       if (customerId !== undefined) {
@@ -1776,7 +1780,7 @@ function registerWorkOrders(app, deps) {
       if (Array.isArray(lines)) {
         // Each line may carry several telas, each with its own code and yield.
         // The scalars below stay as the representative (first-tela) header copy.
-        const cells = lines
+        let cells = lines
           .map((l) => {
             const fabrics = buildLineFabrics(l);
             const primary = fabrics[0] || {};
@@ -1823,6 +1827,32 @@ function registerWorkOrders(app, deps) {
           dupKey.add(k);
         }
 
+        // ---- SEPARAR POR ITEM CODE ------------------------------------------
+        // Igual que al crear (POST /api/production-orders): un item code = una
+        // PO. Esta orden se queda con UN item code y cada item code adicional
+        // nace como una PO nueva autonumerada.
+        // ¿Cual se queda? El primero (en el orden de las lineas) que esta orden
+        // ya tenia; si ninguno, el primero capturado. El modal usa la misma
+        // regla (keepItemCodeOf) para mostrar el resumen antes de guardar.
+        allCells = cells;
+        const prevIc = await client.query(
+          "SELECT DISTINCT COALESCE(item_code, '') AS ic FROM work_order_lines WHERE work_order_id = $1",
+          [id]
+        );
+        const prevItemCodes = new Set(prevIc.rows.map((r) => r.ic));
+        const byItemCode = new Map();
+        for (const c of cells) {
+          const k = c.itemCode || "";
+          if (!byItemCode.has(k)) byItemCode.set(k, []);
+          byItemCode.get(k).push(c);
+        }
+        const icKeys = [...byItemCode.keys()];
+        const keepKey = icKeys.find((k) => prevItemCodes.has(k)) ?? icKeys[0];
+        cells = byItemCode.get(keepKey);
+        splitGroups = icKeys
+          .filter((k) => k !== keepKey)
+          .map((k) => ({ itemCode: k, cells: byItemCode.get(k) }));
+
         // Master codes for the (possibly new) combinations. The style prefix is
         // fixed for this PO; the 3-letter customer code comes from an existing
         // master code, falling back to customers.code.
@@ -1858,7 +1888,8 @@ function registerWorkOrders(app, deps) {
         const description = set.style_description ?? wo.style_description;
         const samNum = set.sam_minutes ?? (parseFloat(wo.sam_minutes) || 0);
         const codeToId = {};
-        for (const cell of cells) {
+        // Todas las celdas: las POs nuevas tambien necesitan sus codigos.
+        for (const cell of allCells) {
           const code = `${styleCode}${cell.talla}${CLI}-${cell.color}-${cell.estilo}`;
           if (codeToId[code] === undefined) {
             const r = await client.query(
@@ -1908,6 +1939,82 @@ function registerWorkOrders(app, deps) {
           cells.flatMap((c) => (c.fabrics || []).map((f) => f.name)).filter(Boolean)
         )];
         set.fabric_supplier = set.fabric_name;
+
+        // ---- POs NUEVAS: una por cada item code adicional --------------------
+        // Heredan cliente, estilo, descripcion, SAM, temporada y conjunto de
+        // esta orden. El stock de almacen y los extras se quedan en la orden
+        // original (como al crear: solo la primera PO los lleva), asi que la
+        // nueva produce exactamente lo pedido. Nacen en 'pending' y sin celdas
+        // en el Plan Board: aparecen en la bolsa para que el planner las asigne.
+        if (splitGroups.length > 0) {
+          const maxRes = await client.query(
+            `SELECT COALESCE(MAX((substring(work_order_no from '^SKM([0-9]+)'))::int), 0) AS maxseq
+               FROM work_orders WHERE work_order_no LIKE 'SKM%'`
+          );
+          let seq = parseInt(maxRes.rows[0].maxseq, 10) || 0;
+          const custId = set.customer_id ?? wo.customer_id;
+          const custName = set.customer_name ?? wo.customer_name;
+          const seasonVal = set.season !== undefined ? set.season : wo.season;
+
+          for (const g of splitGroups) {
+            const gCells = g.cells;
+            let woNo;
+            do {
+              seq += 1;
+              woNo = `SKM${String(seq).padStart(4, "0")}-${CLI}-${styleCode}`;
+              // eslint-disable-next-line no-await-in-loop
+            } while ((await client.query("SELECT 1 FROM work_orders WHERE work_order_no = $1", [woNo])).rows.length > 0);
+
+            const gFirst = (k) => gCells.find((c) => c[k] != null && c[k] !== "")?.[k] ?? null;
+            const gQty = gCells.reduce((s, c) => s + c.quantity, 0);
+            const gFabricNames = [...new Set(
+              gCells.flatMap((c) => (c.fabrics || []).map((f) => f.name)).filter(Boolean)
+            )];
+            const gFabricName = gFirst("fabricName") || gFabricNames[0] || null;
+            const gPo = [...new Set(gCells.map((c) => c.customerPo).filter(Boolean))].join(", ") || null;
+            const gMaster = codeToId[`${styleCode}${gCells[0].talla}${CLI}-${gCells[0].color}-${gCells[0].estilo}`];
+
+            const ins = await client.query(
+              `INSERT INTO work_orders (
+                  work_order_no, quantity, customer_id, customer_name, style_description,
+                  color, fabric_supplier, style_code, estilo, fabrics, warehouse_stock,
+                  extra_quantity, total_to_produce, commitment_date, master_code_id,
+                  sam_minutes, season, customer_po, fabric_name, fabric_code,
+                  yield_per_piece, created_by, set_id, set_component, set_ratio,
+                  created_at, updated_at, status
+               )
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW(),NOW(),'pending')
+               RETURNING id, work_order_no`,
+              [
+                woNo, gQty, custId, custName, description,
+                [...new Set(gCells.map((c) => c.color))].join(", "), gFabricName, styleCode, gCells[0].estilo,
+                gFabricNames, gQty,
+                gFirst("commitmentDate"), gMaster, samNum, seasonVal ?? null, gPo,
+                gFabricName, gFirst("fabricCode"), gFirst("yieldPerPiece"),
+                req.user?.id ?? null,                 // created_by: el merchant que separo la orden
+                wo.set_id ?? null, wo.set_component ?? null, wo.set_ratio ?? null,
+              ]
+            );
+            const newId = ins.rows[0].id;
+
+            for (const cell of gCells) {
+              const code = `${styleCode}${cell.talla}${CLI}-${cell.color}-${cell.estilo}`;
+              await client.query(
+                `INSERT INTO work_order_lines
+                   (work_order_id, master_code_id, talla, color, estilo, customer_po,
+                    commitment_date, fabric_name, fabric_code, yield_per_piece, quantity, fabrics,
+                    packing_qty, sku_qty, item_code)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+                [newId, codeToId[code], cell.talla, cell.color, cell.estilo,
+                 cell.customerPo, cell.commitmentDate, cell.fabricName,
+                 cell.fabricCode, cell.yieldPerPiece, cell.quantity,
+                 JSON.stringify(cell.fabrics || []),
+                 cell.packingQty ?? 0, cell.skuQty ?? 0, cell.itemCode]
+              );
+            }
+            createdOrders.push({ id: newId, work_order_no: ins.rows[0].work_order_no, itemCode: g.itemCode || null, quantity: gQty });
+          }
+        }
       }
 
       // -------- style image (applies to EVERY master code of this order) ----
@@ -2013,7 +2120,37 @@ function registerWorkOrders(app, deps) {
         delete row.master_code_photo_filename;
       }
 
-      res.json({ success: true, message: "Production order updated", workOrder: row, planSync });
+      // POs nuevas que salieron de la separacion por item code, con su desglose.
+      let newOrders = [];
+      if (createdOrders.length > 0) {
+        const nb = await client.query(
+          `SELECT wo.*, to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
+                  ${LINES_SUBQUERY}, mc.photo_filename AS master_code_photo_filename
+             FROM work_orders wo
+             LEFT JOIN master_codes mc ON mc.id = wo.master_code_id
+            WHERE wo.id = ANY($1::bigint[])
+            ORDER BY wo.work_order_no`,
+          [createdOrders.map((o) => o.id)]
+        );
+        newOrders = nb.rows.map((r) => {
+          const out = { ...r };
+          out.master_code_photo_url = r.master_code_photo_filename
+            ? generatePresignedGetUrl(r.master_code_photo_filename, 3600)
+            : null;
+          delete out.master_code_photo_filename;
+          return out;
+        });
+      }
+
+      res.json({
+        success: true,
+        message: newOrders.length > 0
+          ? `Production order updated · ${newOrders.length} new order(s) created by item code`
+          : "Production order updated",
+        workOrder: row,
+        createdOrders: newOrders,   // [] cuando no hubo separacion
+        planSync,
+      });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       // The browser already pushed the replacement image to S3; if the DB write

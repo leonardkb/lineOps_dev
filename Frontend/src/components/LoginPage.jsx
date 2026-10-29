@@ -58,7 +58,7 @@ export default function LoginPage() {
       }else if(roleNorm === "corte") {
         navigate("/cutting", { replace: true });
       }else if(roleNorm === "admin") {
-        navigate("/users", { replace: true });
+        navigate("/it-control", { replace: true });
       }else if(roleNorm === "finishedwarehouse") {
         navigate("/fws", { replace: true });
       }else if(roleNorm === "qualityhead") {

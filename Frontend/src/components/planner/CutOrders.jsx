@@ -1126,6 +1126,71 @@ const pct1 = (v) => `${(Math.round(num(v) * 10) / 10).toLocaleString()}%`;
 const shortDay = (ymd) => (ymd ? `${String(ymd).slice(8, 10)}/${String(ymd).slice(5, 7)}` : "—");
 const progressColor = (p) => (p >= 100 ? "#16a34a" : p >= 75 ? "#65a30d" : p >= 40 ? "#f59e0b" : p > 0 ? "#f97316" : "#94a3b8");
 
+// ---------------------------------------------------------------------------
+// Equivalencia de tallas: talla numérica ↔ talla en letra (mismo catálogo
+// que el paso "Tallas y colores" de la orden de trabajo).
+// Si se agrega una talla, se agrega aquí y el panel lateral la toma sola.
+// ---------------------------------------------------------------------------
+const SIZE_EQUIV = [
+  { numero: "130", letra: "XXXS" },
+  { numero: "132", letra: "XXS" },
+  { numero: "134", letra: "XS" },
+  { numero: "136", letra: "S" },
+  { numero: "138", letra: "M" },
+  { numero: "140", letra: "L" },
+  { numero: "142", letra: "XL" },
+  { numero: "144", letra: "XXL" },
+  { numero: "146", letra: "XXXL" },
+  { numero: "148", letra: "S-T" },
+  { numero: "150", letra: "M-T" },
+  { numero: "152", letra: "L-T" },
+  { numero: "154", letra: "XL-T" },
+  { numero: "156", letra: "2XL-T" },
+  { numero: "004", letra: "I-XS" },
+  { numero: "006", letra: "S" },
+  { numero: "008", letra: "M" },
+  { numero: "010", letra: "L" },
+];
+const normTalla = (t) => String(t ?? "").toUpperCase().replace(/[\s\-_.]/g, "");
+// Número → fila: también acepta "4" por "004".
+// Letra → fila: solo si la letra es de UNA sola talla. S, M y L existen en
+// 136/138/140 y en 006/008/010, así que una talla escrita "S" no se adivina.
+const SIZE_EQUIV_INDEX = (() => {
+  const m = new Map();
+  const letterCount = new Map();
+  for (const row of SIZE_EQUIV) {
+    const k = normTalla(row.letra);
+    letterCount.set(k, (letterCount.get(k) || 0) + 1);
+  }
+  for (const row of SIZE_EQUIV) {
+    m.set(normTalla(row.numero), row);
+    m.set(String(parseInt(row.numero, 10)), row);
+    const k = normTalla(row.letra);
+    if (letterCount.get(k) === 1) m.set(k, row);
+  }
+  return m;
+})();
+// Fila de equivalencia de una talla (escrita en número o en letra), o null.
+const sizeEquivOf = (talla) => SIZE_EQUIV_INDEX.get(normTalla(talla)) || null;
+// La "otra" forma de la talla: 134 → XS, XS → 134.
+const otherSizeOf = (talla) => {
+  const row = sizeEquivOf(talla);
+  if (!row) return "";
+  return normTalla(talla) === normTalla(row.letra) ? row.numero : row.letra;
+};
+
+// Etiqueta pequeña con la equivalencia, igual que en las tarjetas de marcada.
+function SizeBadge({ talla, className = "" }) {
+  const other = otherSizeOf(talla);
+  if (!other) return null;
+  return (
+    <span className={`inline-flex items-center justify-center rounded border border-gray-200 bg-white px-1.5 text-[10px] font-medium text-gray-700 leading-4 whitespace-nowrap ${className}`}
+      title={`Talla ${talla} = ${other}`}>
+      {other}
+    </span>
+  );
+}
+
 function DrawerProgress({ value }) {
   const v = Math.min(Math.max(num(value), 0), 100);
   return (
@@ -1291,7 +1356,10 @@ function CutBreakdownDrawer({ co, cutNo, onClose }) {
                     {sizes.map((s) => (
                       <tr key={s.talla} className="align-top">
                         <td className="py-2 px-4">
-                          <span className="font-semibold text-gray-900">{s.talla}</span>
+                          <span className="inline-flex items-center gap-1.5">
+                            <span className="font-semibold text-gray-900">{s.talla}</span>
+                            <SizeBadge talla={s.talla} />
+                          </span>
                           {s.markers > 0 && <span className="block text-[10px] text-gray-400">{s.markers} marcada{s.markers > 1 ? "s" : ""}</span>}
                         </td>
                         <td className="py-2 px-2 text-right text-gray-600 tabular-nums">
@@ -1373,6 +1441,7 @@ function CutBreakdownDrawer({ co, cutNo, onClose }) {
                             <span key={`${l.talla}-${i}`} title={`${l.perPanel} por panel × ${m.panels} paneles`}
                               className="inline-flex items-center gap-1 text-[10px] rounded-md border border-gray-100 bg-white px-1.5 py-0.5">
                               <span className="font-medium text-gray-700">{l.talla}</span>
+                              {otherSizeOf(l.talla) && <span className="text-indigo-600 font-medium">{otherSizeOf(l.talla)}</span>}
                               <span className="text-gray-400">×{fmtN(l.perPanel)}</span>
                               <span className="text-gray-900">{fmtN(l.pieces)}</span>
                             </span>

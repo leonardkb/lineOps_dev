@@ -14,6 +14,7 @@ import ActualEfficiency from "./pages/ActualEfficiency";
 import QualityInspectorPage from "./pages/QualityInspectorPage";
 import QualityAnalytics from "./pages/QualityAnalytics";
 import EditOperationPlanner from "./pages/EditOperationPlanner";
+import ITControlPanel from "./components/IT/ITControlPanel";
 import MerchantDashboard from "./pages/merchant/MerchantDashboard";
 import MerchantPage from "./pages/merchant/MerchantPage";
 import MechanicsDashboard from "./pages/MechanicsDashboard";
@@ -79,6 +80,8 @@ export default function App() {
         <Route path='/clientes'  element={<ClientCatalogPage/>} /> {/*clientes route */}
         <Route path='/products' element={<ProductCatalogPage/>} /> {/*products route */}
         <Route path='/bom' element={<BillOfMaterialsPage/>} /> {/*bom route */}
+
+        <Route path='/it-control' element={<ITControlPanel />} /> {/*admin dashboard route */}
 
         <Route path='/style-order' element={<StyleOrderWizard/>} /> {/*style order wizard route */}
 

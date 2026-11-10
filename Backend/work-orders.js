@@ -131,6 +131,10 @@ async function initSchema({ pool, setSchema }) {
     // Per-PO customer purchase-order reference (nullable).
     await client.query("ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS customer_po VARCHAR(60);");
 
+    // Numero de tech pack de Nike (nullable). Solo se captura para ordenes de
+    // Nike; es del ESTILO, asi que en un conjunto cada prenda lleva el suyo.
+    await client.query("ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS tech_pack_no VARCHAR(40);");
+
     // Representative copy of the first line's fabric/yield on the PO header, so
     // the list view and searches don't have to join work_order_lines.
     // commitment_date already exists on work_orders (created in server.js schema).
@@ -494,7 +498,7 @@ function registerWorkOrders(app, deps) {
           to_char(wo.run_date, 'YYYY-MM-DD') AS run_date, wo.warehouse_stock,
           wo.extra_quantity, wo.total_to_produce,
           to_char(wo.commitment_date, 'YYYY-MM-DD') AS commitment_date,
-          wo.master_code_id, wo.sam_minutes, wo.customer_po,
+          wo.master_code_id, wo.sam_minutes, wo.customer_po, wo.tech_pack_no,
           wo.fabric_name, wo.fabric_code, wo.yield_per_piece,
           wo.created_at, wo.updated_at,wo.season,wo.status,
           wo.created_by,
@@ -780,6 +784,48 @@ function registerWorkOrders(app, deps) {
       });
     } catch (err) {
       console.error("\u274c Error en day-balances:", err.message);
+      res.status(500).json({ success: false, error: err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ---- GET /api/customer-production?customer=NAME&from=&to= -------------
+  //
+  // Piezas terminadas por (ORDEN, LINEA, DIA) de TODAS las ordenes de un
+  // cliente. Lo usa el panel de detalle de «Resumen por cliente» para pintar
+  // en que lineas se ha cosido, el historico semanal y el ritmo real con el
+  // que se proyecta la fecha de entrega. Mismo enlace line_runs->orden y las
+  // mismas operaciones de empaque que produced_quantity
+  // (producedByLineDayForMany), asi que los totales cuadran con la lista.
+  //
+  // Incluye ordenes completadas/canceladas: el cliente puede tener produccion
+  // historica aunque hoy tenga 0 ordenes activas.
+  app.get("/api/customer-production", authenticateToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await setSchema(client);
+      const customer = String(req.query.customer || "").trim();
+      if (!customer) {
+        return res.status(400).json({ success: false, error: "Falta el parametro customer" });
+      }
+      const { rows: wos } = await client.query(
+        `SELECT id FROM work_orders WHERE UPPER(TRIM(customer_name)) = UPPER($1)`,
+        [customer]
+      );
+      const ids = wos.map((r) => Number(r.id));
+      // Sin ordenes no se llama al helper: con una lista vacia regresaria la
+      // produccion de TODOS los clientes.
+      if (ids.length === 0) return res.json({ success: true, resolved: true, rows: [] });
+
+      const rows = await producedByLineDayForMany(client, {
+        workOrderIds: ids,
+        from: req.query.from || null,
+        to: req.query.to || null,
+      });
+      res.json({ success: true, resolved: !!RESOLVED_RUN_LINK, rows });
+    } catch (err) {
+      console.error("\u274c Error en customer-production:", err.message);
       res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
@@ -1087,6 +1133,9 @@ function registerWorkOrders(app, deps) {
         photoKey: incomingPhotoKey,   // browser uploaded the image straight to S3 (presigned PUT)
         lines, orders, workOrderNo,
         commitmentDate, season, fabrics, warehouseStock, extraQuantity, customerPo,
+        // Tech pack de Nike (legacy / una prenda). En components[] cada prenda
+        // trae el suyo en techPackNo.
+        techPackNo,
         // PO-header fabric/yield (legacy single-PO payload; per-order values
         // inside `orders` win when present).
         fabricName: bodyFabricName, fabricCode: bodyFabricCode, yield: bodyYield,
@@ -1220,6 +1269,8 @@ function registerWorkOrders(app, deps) {
           // pantalones. Sin components[] se conserva el comportamiento previo.
           warehouseStock: parseFloat(c.warehouseStock ?? (ci === 0 ? warehouseStock : 0)) || 0,
           extraQuantity: parseFloat(c.extraQuantity ?? (ci === 0 ? extraQuantity : 0)) || 0,
+          // Tech pack de Nike: del estilo, por prenda. NULL si no aplica.
+          techPackNo: (txt(c.techPackNo ?? (ci === 0 ? techPackNo : null)) || "").toUpperCase().slice(0, 40) || null,
           orderSpecs,
         };
       });
@@ -1470,9 +1521,9 @@ function registerWorkOrders(app, deps) {
               extra_quantity, total_to_produce, commitment_date, master_code_id,
               sam_minutes, season, customer_po, fabric_name, fabric_code,
               yield_per_piece, created_by, set_id, set_component, set_ratio,
-              created_at, updated_at, status
+              tech_pack_no, created_at, updated_at, status
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,NOW(),NOW(),'pending')
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW(),NOW(),'pending')
            RETURNING *`,
           [
             woNo, orderedQty, parseInt(customerId), customerName, description,
@@ -1485,6 +1536,7 @@ function registerWorkOrders(app, deps) {
             // Etiqueta del conjunto. NULL en una PO suelta: produccion no ve
             // ninguna diferencia, solo FWH y el tablero del merchant.
             orderSet?.id ?? null, comp.component, comp.ratio,
+            comp.techPackNo,                          // tech pack de Nike (o NULL)
           ]
         );
         const workOrder = woResult.rows[0];
@@ -1714,6 +1766,7 @@ function registerWorkOrders(app, deps) {
         customerId, styleDescription, status, season, samMinutes,
         warehouseStock, extraQuantity, totalToProduce,
         customerPo, commitmentDate, fabricName, fabricCode, yield: yieldPerPiece,
+        techPackNo,                // tech pack de Nike; null / "" lo borra
         lines,
         photoKey: photoKeyInput,   // replacement style image (from /api/master-codes/photo-upload-url)
         removePhoto,               // boolean: clear the style image
@@ -1770,6 +1823,7 @@ function registerWorkOrders(app, deps) {
       if (status !== undefined) set.status = status;
       if (season !== undefined) set.season = txt(season);
       if (samMinutes !== undefined) set.sam_minutes = num(samMinutes);
+      if (techPackNo !== undefined) set.tech_pack_no = (txt(techPackNo) || "").toUpperCase().slice(0, 40) || null;
 
       const wStock = warehouseStock !== undefined ? (parseFloat(warehouseStock) || 0) : parseFloat(wo.warehouse_stock) || 0;
       const xtra = extraQuantity !== undefined ? (parseFloat(extraQuantity) || 0) : parseFloat(wo.extra_quantity) || 0;
@@ -1981,9 +2035,9 @@ function registerWorkOrders(app, deps) {
                   extra_quantity, total_to_produce, commitment_date, master_code_id,
                   sam_minutes, season, customer_po, fabric_name, fabric_code,
                   yield_per_piece, created_by, set_id, set_component, set_ratio,
-                  created_at, updated_at, status
+                  tech_pack_no, created_at, updated_at, status
                )
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW(),NOW(),'pending')
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW(),NOW(),'pending')
                RETURNING id, work_order_no`,
               [
                 woNo, gQty, custId, custName, description,
@@ -1993,6 +2047,8 @@ function registerWorkOrders(app, deps) {
                 gFabricName, gFirst("fabricCode"), gFirst("yieldPerPiece"),
                 req.user?.id ?? null,                 // created_by: el merchant que separo la orden
                 wo.set_id ?? null, wo.set_component ?? null, wo.set_ratio ?? null,
+                // Mismo estilo -> mismo tech pack que la orden de origen.
+                set.tech_pack_no !== undefined ? set.tech_pack_no : (wo.tech_pack_no ?? null),
               ]
             );
             const newId = ins.rows[0].id;

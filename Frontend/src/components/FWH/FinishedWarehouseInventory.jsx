@@ -1,67 +1,33 @@
 // components/warehouse/FinishedWarehouseInventory.jsx
 // Almacén de Producto Terminado — Inventario.
-//
-// Muestra el inventario de producto terminado (finished_inventory): lo que ha
-// entrado, ya sea al confirmar una lista de pre-empaque o al hacer "check-in" de
-// un ticket escaneado. Cada renglón es un SKU (cliente + orden + estilo + color +
-// talla) con sus piezas y cajas acumuladas.
-//
-// Backend:
-//   GET /api/finished-inventory?q=texto   → { inventory, totalPieces }
-//
-// Se conecta a la pestaña «Inventario» de FinishedWarehouseNav. Pase onNavigate
-// (misma firma que la barra) para el botón «Escanear tickets».
+// Finished goods in stock (finished_inventory), one row per SKU
+// (customer + order + style + color + size) with its pieces and boxes.
+// Pieces come in from a confirmed pre-packing list or a ticket check-in.
+//   GET /api/finished-inventory?q=texto → { inventory, totalPieces }
 //
 //   <FinishedWarehouseInventory onNavigate={setTab} />
-//
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { Boxes, Package, PackageCheck, RefreshCw, ScanLine, Users, ChevronRight } from "lucide-react";
 import {
-  Boxes, Package, PackageCheck, Search, RefreshCw, Loader2,
-  AlertCircle, ScanLine, X,
-} from "lucide-react";
-import { API_URL } from "../../lib/masterCodeCatalog";
-
-const authHeaders = () => ({
-  "Content-Type": "application/json",
-  Authorization: `Bearer ${localStorage.getItem("token")}`,
-});
-
-async function api(path) {
-  const res = await fetch(`${API_URL}${path}`, { headers: authHeaders() });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.success === false) throw new Error(data.error || `Error ${res.status}`);
-  return data;
-}
-
-const num = (v) => Math.round(Number(v) || 0).toLocaleString();
-
-// Size code -> etiqueta imprimible. En sincronía con SIZE_LABELS del backend.
-const SIZE_LABELS = {
-  "130": "xxxs", "132": "xxs", "134": "xs", "136": "(S)", "138": "(M)",
-  "140": "L", "142": "XL", "144": "XXL",
-  "004": "I-XS", "006": "S", "008": "M", "010": "L",
-};
-const sizeText = (code) => {
-  const k = String(code ?? "").trim();
-  if (!k) return "—";
-  const lbl = SIZE_LABELS[k];
-  return lbl && lbl !== k ? `${k} · ${lbl}` : k;
-};
+  api, num, sizeText, takePendingSearch, PageHeader, Card, CardHeader, Button, Pill, Stat,
+  SearchInput, EmptyState, Loading, Banner, Th, Td,
+  PageFrame,
+} from "./finishedShared";
+import FinishedOrderDrawer from "./FinishedOrderDrawer";
 
 export default function FinishedWarehouseInventory({ onNavigate = null }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  const [q, setQ] = useState("");        // texto en el cuadro
-  const [query, setQuery] = useState(""); // texto aplicado a la búsqueda
+  const [q, setQ] = useState(() => takePendingSearch());  // text in the box
+  const [query, setQuery] = useState(q);                    // text applied to the search
+  const [sel, setSel] = useState(null);                     // row whose order is open in the side panel
 
   const load = useCallback(async (search) => {
     setLoading(true);
     setError(null);
     try {
-      const qs = search ? `?q=${encodeURIComponent(search)}` : "";
-      const d = await api(`/api/finished-inventory${qs}`);
+      const d = await api(`/api/finished-inventory${search ? `?q=${encodeURIComponent(search)}` : ""}`);
       setRows(d.inventory || []);
     } catch (e) {
       setError(e.message || "No se pudo cargar el inventario");
@@ -69,158 +35,126 @@ export default function FinishedWarehouseInventory({ onNavigate = null }) {
       setLoading(false);
     }
   }, []);
-
   useEffect(() => { load(query); }, [load, query]);
 
-  const applySearch = () => setQuery(q.trim());
-  const clearSearch = () => { setQ(""); setQuery(""); };
+  // Search from the top bar while this page is open.
+  useEffect(() => {
+    const h = (e) => { takePendingSearch(); setQ(e.detail || ""); setQuery(e.detail || ""); };
+    window.addEventListener("fw:search", h);
+    return () => window.removeEventListener("fw:search", h);
+  }, []);
 
-  // Totales desde los renglones cargados.
-  const totalPieces = rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0);
-  const totalBoxes = rows.reduce((s, r) => s + (Number(r.box_count) || 0), 0);
-  const skus = rows.length;
+  const onChange = (v) => { setQ(v); if (!v) setQuery(""); };
+
+  const totals = useMemo(() => ({
+    pieces: rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0),
+    boxes: rows.reduce((s, r) => s + (Number(r.box_count) || 0), 0),
+    customers: new Set(rows.map((r) => r.customer_name || r.customer_code)).size,
+  }), [rows]);
 
   return (
-    <div className="max-w-6xl mx-auto p-5 space-y-5">
-      <header className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center">
-          <Boxes className="w-5 h-5" />
-        </div>
-        <div className="min-w-0">
-          <h1 className="text-lg font-semibold text-gray-900">Inventario</h1>
-          <p className="text-sm text-gray-500">Producto terminado en existencia, por SKU.</p>
-        </div>
-        {onNavigate && (
-          <button
-            onClick={() => onNavigate("escaneo")}
-            className="ml-auto inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50"
-          >
-            <ScanLine className="w-4 h-4" /> Escanear tickets
-          </button>
-        )}
-        <button
-          onClick={() => load(query)}
-          className={`${onNavigate ? "" : "ml-auto "}inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50`}
-        >
-          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Actualizar
-        </button>
-      </header>
+    <PageFrame>
+      <PageHeader
+        title="Inventario"
+        subtitle="Producto terminado en existencia, por SKU."
+        actions={<>
+          {onNavigate && <Button variant="secondary" icon={ScanLine} onClick={() => onNavigate("escaneo")}>Escanear tickets</Button>}
+          <Button variant="secondary" icon={RefreshCw} loading={loading} onClick={() => load(query)}>Actualizar</Button>
+        </>}
+      />
 
-      {/* Summary tiles */}
-      <div className="grid grid-cols-3 gap-3">
-        <Tile icon={Package} label="Piezas en inventario" value={totalPieces} accent="emerald" />
-        <Tile icon={Boxes} label="SKUs" value={skus} accent="indigo" />
-        <Tile icon={PackageCheck} label="Cajas" value={totalBoxes} accent="gray" />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <Stat icon={Package} label="Piezas en inventario" value={totals.pieces} tone="emerald" />
+        <Stat icon={Boxes} label="SKUs" value={rows.length} tone="indigo" />
+        <Stat icon={PackageCheck} label="Cajas" value={totals.boxes} />
+        <Stat icon={Users} label="Clientes" value={totals.customers} />
       </div>
 
-      {/* Search */}
-      <div className="relative max-w-md">
-        <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-        <input
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") applySearch(); }}
-          placeholder="Buscar por cliente, estilo, PO o color…"
-          className="w-full pl-9 pr-9 py-2.5 rounded-lg border border-gray-300 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+      <Card className="overflow-hidden">
+        <CardHeader
+          icon={Boxes}
+          title="Existencias"
+          subtitle={`${num(rows.length)} SKU(s) · clic en un renglón para ver el detalle de la orden`}
+          actions={<>
+            {query && <Pill tone="indigo">«{query}»</Pill>}
+            <SearchInput value={q} onChange={onChange} onEnter={() => setQuery(q.trim())} placeholder="Cliente, estilo, PO o color… (Enter)" className="w-full sm:w-80" />
+          </>}
         />
-        {q && (
-          <button
-            onClick={clearSearch}
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-300 hover:text-gray-500"
-            title="Limpiar"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        )}
-      </div>
-
-      {/* Inventory table */}
-      <section className="bg-white rounded-xl border shadow-sm overflow-hidden">
-        <div className="px-4 py-3 border-b flex items-center gap-2">
-          <Boxes className="w-4 h-4 text-gray-500" />
-          <h2 className="text-sm font-semibold text-gray-800">Existencias</h2>
-          <span className="text-xs text-gray-400">{rows.length} SKU(s)</span>
-          {query && (
-            <span className="text-xs rounded-full px-2 py-0.5 font-medium bg-indigo-50 text-indigo-700">
-              «{query}»
-            </span>
-          )}
-        </div>
 
         {error ? (
-          <div className="p-4 text-sm text-amber-700 bg-amber-50 flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0" /> {error}
-          </div>
+          <div className="p-5"><Banner kind="err" onClose={() => setError(null)}>{error}</Banner></div>
         ) : loading ? (
-          <div className="p-8 text-center text-gray-400 text-sm flex items-center justify-center gap-2">
-            <Loader2 className="w-4 h-4 animate-spin" /> Cargando…
-          </div>
+          <Loading />
         ) : rows.length === 0 ? (
-          <div className="p-8 text-center text-gray-400 text-sm">
-            {query
-              ? "No hay existencias que coincidan con la búsqueda."
-              : "El inventario está vacío. Haga check-in de un ticket escaneado o confirme una lista de pre-empaque para sumar piezas."}
-          </div>
+          <EmptyState
+            icon={Boxes}
+            title={query ? "Sin resultados" : "El inventario está vacío"}
+            text={query ? "No hay existencias que coincidan con la búsqueda." : "Haga check-in de un ticket escaneado o confirme una lista de pre-empaque para sumar piezas."}
+            action={!query && onNavigate ? <Button icon={ScanLine} onClick={() => onNavigate("escaneo")}>Escanear tickets</Button> : null}
+          />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm whitespace-nowrap">
-              <thead>
-                <tr className="text-left text-xs text-gray-500 border-b bg-gray-50/60">
-                  <th className="px-3 py-2 font-medium">Cliente</th>
-                  <th className="px-3 py-2 font-medium">Orden (PO)</th>
-                  <th className="px-3 py-2 font-medium">PO cliente (MO)</th>
-                  <th className="px-3 py-2 font-medium">Estilo</th>
-                  <th className="px-3 py-2 font-medium">Color</th>
-                  <th className="px-3 py-2 font-medium">Talla</th>
-                  <th className="px-3 py-2 font-medium text-right">Cajas</th>
-                  <th className="px-3 py-2 font-medium text-right">Piezas</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {rows.map((r) => (
-                  <tr key={r.id} className="hover:bg-gray-50">
-                    <td className="px-3 py-2 text-gray-700">{r.customer_name || r.customer_code || "—"}</td>
-                    <td className="px-3 py-2 font-mono">{r.po || "—"}</td>
-                    <td className="px-3 py-2 font-mono">{r.mo || "—"}</td>
-                    <td className="px-3 py-2">{r.style || "—"}</td>
-                    <td className="px-3 py-2">{r.color_name || r.color_code || "—"}</td>
-                    <td className="px-3 py-2">{sizeText(r.size_code)}</td>
-                    <td className="px-3 py-2 text-right font-mono text-gray-600">{num(r.box_count)}</td>
-                    <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">{num(r.quantity)}</td>
+          <>
+            {/* Phone / PDA: cards */}
+            <ul className="md:hidden divide-y divide-slate-100">
+              {rows.map((r) => (
+                <li key={r.id} onClick={() => setSel(r)} className="px-4 py-3 flex items-start gap-3 cursor-pointer active:bg-slate-100">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-semibold text-slate-900 truncate">{r.style || "—"} · {r.color_name || r.color_code || "—"}</div>
+                    <div className="text-xs text-slate-500 truncate">{r.customer_name || r.customer_code || "—"} · PO {r.po || "—"} · {sizeText(r.size_code)}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-semibold text-slate-900 tabular-nums">{num(r.quantity)} pzas</div>
+                    <div className="text-xs text-slate-400 tabular-nums">{num(r.box_count)} caja(s)</div>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-slate-300 self-center" />
+                </li>
+              ))}
+            </ul>
+            {/* Desktop: table */}
+            <div className="hidden md:block overflow-x-auto max-h-[65vh]">
+              <table className="w-full text-sm">
+                <thead className="bg-slate-50 sticky top-0 z-10">
+                  <tr>
+                    <Th>Cliente</Th><Th>Orden (PO)</Th><Th>PO cliente (MO)</Th><Th>Estilo</Th>
+                    <Th>Color</Th><Th>Talla</Th><Th right>Cajas</Th><Th right>Piezas</Th><Th />
                   </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr className="border-t bg-gray-50/60 text-sm">
-                  <td className="px-3 py-2 font-medium text-gray-500" colSpan={6}>Total</td>
-                  <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">{num(totalBoxes)}</td>
-                  <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">{num(totalPieces)}</td>
-                </tr>
-              </tfoot>
-            </table>
-          </div>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {rows.map((r) => (
+                    <tr key={r.id} onClick={() => setSel(r)} title="Ver detalle de la orden"
+                        className={sel?.id === r.id ? "bg-indigo-50/60 cursor-pointer" : "hover:bg-slate-50 cursor-pointer"}>
+                      <Td>{r.customer_name || r.customer_code || "—"}</Td>
+                      <Td mono>{r.po || "—"}</Td>
+                      <Td mono>{r.mo || "—"}</Td>
+                      <Td>{r.style || "—"}</Td>
+                      <Td>{r.color_name || r.color_code || "—"}</Td>
+                      <Td>{sizeText(r.size_code)}</Td>
+                      <Td right className="text-slate-500">{num(r.box_count)}</Td>
+                      <Td right strong>{num(r.quantity)}</Td>
+                      <Td className="w-8 pl-0"><ChevronRight className="w-4 h-4 text-slate-300" /></Td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="bg-slate-50 sticky bottom-0">
+                  <tr className="border-t border-slate-200">
+                    <Td colSpan={6} className="font-medium text-slate-500">Total</Td>
+                    <Td right strong>{num(totals.boxes)}</Td>
+                    <Td right strong>{num(totals.pieces)}</Td>
+                    <Td />
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </>
         )}
-      </section>
-    </div>
-  );
-}
-
-function Tile({ icon: Icon, label, value, accent = "gray" }) {
-  const accents = {
-    amber: "text-amber-600 bg-amber-50",
-    emerald: "text-emerald-600 bg-emerald-50",
-    indigo: "text-indigo-600 bg-indigo-50",
-    gray: "text-gray-600 bg-gray-100",
-  };
-  return (
-    <div className="bg-white rounded-xl border shadow-sm p-3">
-      <div className="flex items-center gap-2">
-        <span className={`w-7 h-7 rounded-lg flex items-center justify-center ${accents[accent] || accents.gray}`}>
-          {Icon && <Icon className="w-4 h-4" />}
-        </span>
-        <span className="text-xs text-gray-500">{label}</span>
-      </div>
-      <div className="mt-2 text-xl font-semibold text-gray-900">{num(value)}</div>
-    </div>
+      </Card>
+      <FinishedOrderDrawer
+        open={!!sel}
+        workOrder={sel?.po}
+        customerPo={sel?.mo}
+        highlight={sel ? { size: sel.size_code, color: sel.color_name || sel.color_code } : null}
+        onClose={() => setSel(null)}
+      />
+    </PageFrame>
   );
 }

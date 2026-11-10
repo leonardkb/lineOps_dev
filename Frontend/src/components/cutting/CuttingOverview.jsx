@@ -143,6 +143,7 @@ function CompletedTooltip({ active, payload }) {
             {orders.slice(0, 5).map((o) => (
               <li key={o.cut_order_id} className="text-gray-500">
                 <span className="font-mono text-gray-700">{cutNo(o.cut_order_id)}</span>
+                {o.group_no && <span className="text-indigo-600"> · {o.group_no}</span>}
                 {o.work_order_no ? ` · ${o.work_order_no}` : ''} · {o.marcadas}
               </li>
             ))}
@@ -164,7 +165,9 @@ function DayDetail({ day }) {
       <div className="flex items-baseline justify-between gap-2 px-3 py-2 border-b border-gray-100">
         <h3 className="text-sm font-bold text-gray-800">{day.full}</h3>
         <span className="text-[11px] text-gray-500">
-          {plural(day.marcadas, 'marcada', 'marcadas')} · {plural(day.orders.length, 'orden', 'órdenes')} · {fmt(day.pieces)} pzs
+          {plural(day.marcadas, 'marcada', 'marcadas')}
+          {day.trazos > 0 && day.trazos < day.marcadas ? ` (${plural(day.trazos, 'trazo', 'trazos')} en mesa)` : ''}
+          {' · '}{plural(day.orders.length, 'orden', 'órdenes')} · {fmt(day.pieces)} pzs
         </span>
       </div>
       {day.orders.length === 0 ? (
@@ -183,7 +186,17 @@ function DayDetail({ day }) {
             <tbody>
               {day.orders.map((o) => (
                 <tr key={o.cut_order_id} className="border-t border-gray-50 align-top">
-                  <td className="px-3 py-1.5 font-mono font-medium text-gray-900 whitespace-nowrap">{cutNo(o.cut_order_id)}</td>
+                  <td className="px-3 py-1.5 font-mono font-medium text-gray-900 whitespace-nowrap">
+                    {cutNo(o.cut_order_id)}
+                    {o.group_no && (
+                      <span
+                        className="block w-fit mt-0.5 text-[10px] font-sans font-medium rounded-full px-1.5 py-0.5 bg-indigo-100 text-indigo-700"
+                        title="Se cortó junto con otras órdenes del mismo grupo"
+                      >
+                        {o.group_no}
+                      </span>
+                    )}
+                  </td>
                   <td className="px-3 py-1.5 text-gray-700">
                     {o.work_order_no || '—'}
                     <span className="block text-[10px] text-gray-400">
@@ -268,7 +281,7 @@ export default function CuttingOverview() {
       // después del catch-all que sirve index.html, o falta el proxy /api del
       // dev server. Lo separamos para no mostrar un error genérico.
       if (typeof res.data !== 'object' || res.data === null) {
-        console.error('[CuttingOverview] respuesta no-JSON de /api/cut-orders/analytics:', res.data);
+        console.error('[CuttingOverview] respuesta no-JSON de http://localhost:5000/api/cut-orders/analytics:', res.data);
         setError('http://localhost:5000/api/cut-orders/analytics no está devolviendo JSON. Registra registerCutOrderAnalytics(app, …) en server.js antes del catch-all que sirve index.html (o revisa el proxy /api del dev server).');
         return;
       }
@@ -316,7 +329,7 @@ export default function CuttingOverview() {
     const byKey = new Map((data?.byCompletedDay || []).map((d) => [d.day, d]));
     return bucketsFor('day', anchor).map((b) => {
       const d = byKey.get(b.key);
-      return { ...b, marcadas: d?.marcadas || 0, pieces: d?.pieces || 0, orders: d?.orders || [] };
+      return { ...b, marcadas: d?.marcadas || 0, trazos: d?.trazos || 0, pieces: d?.pieces || 0, orders: d?.orders || [] };
     });
   }, [data, gran, anchor]);
 
@@ -409,7 +422,9 @@ export default function CuttingOverview() {
         {gran === 'day' ? (
           <>
             <Kpi label="Marcadas completadas" value={fmt(s.completed_marcadas_in_range)}
-              sub={`en ${plural(s.completed_marcadas_orders || 0, 'orden', 'órdenes')}`} tone="indigo" />
+              sub={`en ${plural(s.completed_marcadas_orders || 0, 'orden', 'órdenes')}${
+                s.completed_trazos_in_range && s.completed_trazos_in_range < (s.completed_marcadas_in_range || 0)
+                  ? ` · ${plural(s.completed_trazos_in_range, 'trazo', 'trazos')} en mesa` : ''}`} tone="indigo" />
             <Kpi label="Piezas completadas" value={fmt(s.completed_pieces_in_range)} sub="en esas marcadas" tone="teal" />
             <Kpi label="Asignado" value={fmt(asignado)} sub={`${fmt(s.total_orders)} órdenes creadas en el mes`} />
             <Kpi label="Por cortar" value={fmt(s.total_remaining)} sub={`${fmt(s.in_progress_orders)} en proceso`} />
@@ -419,7 +434,8 @@ export default function CuttingOverview() {
             <Kpi label="Asignado" value={fmt(asignado)} sub={`${fmt(s.total_orders)} órdenes`} tone="indigo" />
             <Kpi label="Cortado" value={fmt(cortado)} sub={pct(avance)} tone="teal" />
             <Kpi label="Por cortar" value={fmt(s.total_remaining)} sub={`${fmt(s.in_progress_orders)} en proceso`} />
-            <Kpi label="Terminadas" value={fmt(s.completed_orders)} sub={`${fmt(s.total_marcadas)} marcadas`} />
+            <Kpi label="Terminadas" value={fmt(s.completed_orders)}
+              sub={`${fmt(s.total_marcadas)} marcadas${s.groups_count ? ` · ${plural(s.groups_count, 'grupo', 'grupos')}` : ''}`} />
           </>
         )}
       </div>

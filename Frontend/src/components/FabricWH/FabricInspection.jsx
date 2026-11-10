@@ -1,382 +1,309 @@
 // components/FabricWH/FabricInspection.jsx
 // Almacén de Tela — Inspección.
-//   Por enviar      Requests from the inspection team. Pick list sorted by
-//                   position; scan each roll as you pull it, then send.
-//   Nueva solicitud The team chooses rolls in stock and asks for them.
-//   En inspección   Rolls with the team come back approved or rejected
-//                   (rejected ones are offered for return to the supplier).
+//   Enviar        Lugar (A01) → contenedor (F01) → rollos → confirmar «Enviar».
+//                 PDA: one narrow column with the send button fixed at the bottom.
+//                 Desktop (lg+): scanner on the left, scanned rolls table on the right.
+//   En inspección Rolls that are with the inspection team right now.
+// Scanning another location at any time switches container; rolls already
+// scanned stay in the list until they are sent.
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { MapPin, Package, Layers, Send, X, RotateCcw, Microscope, RefreshCw } from "lucide-react";
 import {
-  Microscope, Send, CheckCircle2, Circle, ThumbsUp, ThumbsDown, Plus, RefreshCw,
-  ClipboardList, Inbox, XCircle,
-} from "lucide-react";
-import {
-  api, post, num, cx, beep, Card, CardHeader, Button, PageHeader, SegTabs, SearchInput,
-  ScanBox, RollTable, ActionBar, LocationPicker, EmptyState, Modal, Field, ProgressBar, Pill,
-  locationText, boxSortKey, useSelection, useToast, useConfirm, timeAgo, fmtDateTime, inputCls, notifyChange,
+  api, post, num, cx, beep, Card, Button, PageHeader, SegTabs, SearchInput, ScanBox, EmptyState,
+  locationText, timeAgo, useToast, useConfirm, notifyChange,
 } from "./fabricShared";
 
-export default function FabricInspection({ onNavigate = () => {} }) {
+export default function FabricInspection() {
   const [view, setView] = useState("send");
-  const [counts, setCounts] = useState({ send: null, back: null });
+  const [atInspection, setAtInspection] = useState(null);
 
-  const refreshCounts = useCallback(async () => {
+  const refreshCount = useCallback(async () => {
     try {
-      const [a, b] = await Promise.all([api("/inspection-requests?status=open,partial"), api("/rolls?status=at_inspection&limit=2000")]);
-      setCounts({ send: (a.requests || []).length, back: (b.rolls || []).length });
-    } catch { /* counts are optional */ }
+      const d = await api("/rolls?status=at_inspection&limit=2000");
+      setAtInspection((d.rolls || []).length);
+    } catch { /* the count is optional */ }
   }, []);
-  useEffect(() => { refreshCounts(); }, [refreshCounts, view]);
-
-  const changed = () => { refreshCounts(); notifyChange(); };
+  useEffect(() => { refreshCount(); }, [refreshCount, view]);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 lg:space-y-6">
       <PageHeader
         title="Inspección de tela"
-        subtitle="Rollos que pide el equipo de inspección: prepararlos, enviarlos y recibirlos de regreso con su resultado."
+        subtitle="Escanee lugar → contenedor → rollos y envíelos al equipo de inspección."
         actions={
           <SegTabs
             value={view}
             onChange={setView}
             tabs={[
-              { key: "send", label: "Por enviar", icon: Send, count: counts.send },
-              { key: "new", label: "Nueva solicitud", icon: Plus },
-              { key: "back", label: "En inspección", icon: Microscope, count: counts.back },
+              { key: "send", label: "Enviar", icon: Send },
+              { key: "at", label: "En inspección", icon: Microscope, count: atInspection },
             ]}
           />
         }
       />
-      {view === "send" && <SendRequests onChanged={changed} onNew={() => setView("new")} />}
-      {view === "new" && <NewRequest onCreated={() => { changed(); setView("send"); }} />}
-      {view === "back" && <ReturnFromInspection onChanged={changed} onNavigate={onNavigate} />}
+      {view === "send" && <SendByScan onSent={refreshCount} />}
+      {view === "at" && <AtInspection />}
     </div>
   );
 }
 
-// --- Warehouse: open requests → pick by scanning → send ---------------------
-function SendRequests({ onChanged, onNew }) {
+// --- Send: scan location → container → rolls ------------------------------
+const STEPS = [
+  { key: "location", label: "Lugar", icon: MapPin },
+  { key: "box", label: "Contenedor", icon: Package },
+  { key: "roll", label: "Rollos", icon: Layers },
+];
+const PROMPT = { location: "Escanee el lugar…", box: "Escanee el contenedor…", roll: "Escanee los rollos…" };
+
+function SendByScan({ onSent }) {
   const toast = useToast();
   const confirm = useConfirm();
-  const [requests, setRequests] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [activeId, setActiveId] = useState(null);
-  const [picked, setPicked] = useState(() => new Set());
-  const [lastScan, setLastScan] = useState(null);
+  const [location, setLocation] = useState(null);
+  const [box, setBox] = useState(null);
+  const [rolls, setRolls] = useState([]);   // newest first
+  const [msg, setMsg] = useState(null);     // { kind: ok|dup|err, text }
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const d = await api("/inspection-requests?status=open,partial");
-      const list = d.requests || [];
-      setRequests(list);
-      setActiveId((cur) => (list.some((r) => r.id === cur) ? cur : list[0]?.id ?? null));
-    } catch (e) { toast({ kind: "err", text: e.message }); }
-    finally { setLoading(false); }
-  }, [toast]);
-  useEffect(() => { load(); }, [load]);
+  const step = !location ? "location" : !box ? "box" : "roll";
+  const idx = STEPS.findIndex((s) => s.key === step);
+  const yards = rolls.reduce((s, r) => s + (Number(r.yards) || 0), 0);
 
-  const active = requests.find((r) => r.id === activeId);
-  const pickList = useMemo(() => {
-    const rolls = active?.rolls || [];
-    return [...rolls].sort((a, b) =>
-      Number(!!a.sent_at) - Number(!!b.sent_at) ||
-      boxSortKey(a).localeCompare(boxSortKey(b), "es", { numeric: true }));
-  }, [active]);
-  const pending = pickList.filter((r) => !r.sent_at);
+  const say = (kind, text) => { beep(kind); setMsg({ kind, text }); };
 
   const onScan = async (raw) => {
-    if (!active) return;
+    if (busy) return;
     try {
-      const d = await post("/lookup", { raw });
-      const match = d.rolls.find((r) => pending.some((p) => p.id === r.id));
-      if (!match) {
-        beep("err");
-        setLastScan({ kind: "err", text: `${d.rolls[0]?.roll_no || raw} no está en ${active.request_no}` });
-        return;
+      const d = await post("/inspection/scan", { raw, step, locationId: location?.id, boxId: box?.id });
+      if (d.kind === "location") {
+        setLocation(d.location); setBox(null);
+        say("ok", `Lugar ${d.location.code}. Ahora escanee el contenedor.`);
+      } else if (d.kind === "box") {
+        setBox(d.box);
+        say("ok", `Contenedor ${d.box.code}. Ahora escanee los rollos.`);
+      } else if (d.kind === "roll") {
+        const r = d.roll;
+        if (rolls.some((x) => String(x.id) === String(r.id))) { say("dup", `${r.roll_no} ya estaba escaneado`); return; }
+        setRolls((list) => [r, ...list]);
+        say("ok", `${r.roll_no} agregado`);
       }
-      if (picked.has(match.id)) { beep("dup"); setLastScan({ kind: "dup", text: `${match.roll_no} ya estaba escaneado` }); return; }
-      beep("ok");
-      setPicked((p) => new Set(p).add(match.id));
-      setLastScan({ kind: "ok", text: `${match.roll_no} listo` });
-    } catch (e) { beep("err"); setLastScan({ kind: "err", text: e.message }); }
+    } catch (e) { say("err", e.message); }
   };
 
-  const send = async (all) => {
-    const ids = all ? pending.map((r) => r.id) : [...picked];
-    if (!ids.length) return;
-    if (all && !(await confirm({ title: `¿Enviar ${ids.length} rollo(s) sin escanear?`, text: "Se marcarán como enviados aunque no se verificaron con el escáner.", confirmLabel: "Enviar todos" }))) return;
+  const restart = () => { setLocation(null); setBox(null); setMsg(null); };
+  const remove = (id) => setRolls((list) => list.filter((r) => r.id !== id));
+  const clearAll = async () => {
+    if (await confirm({ title: `¿Quitar los ${rolls.length} rollo(s) escaneados?`, confirmLabel: "Quitar", cancelLabel: "Volver", danger: true })) setRolls([]);
+  };
+
+  const send = async () => {
+    if (!rolls.length) return;
+    if (!(await confirm({ title: `¿Enviar ${rolls.length} rollo(s) a inspección?`, text: `${num(yards, 1)} yd en total.`, confirmLabel: "Enviar" }))) return;
     setBusy(true);
     try {
-      const d = await post(`/inspection-requests/${active.id}/send`, { rollIds: ids });
-      toast({ kind: "ok", title: `${d.sent} rollo(s) enviados a inspección`, text: d.status === "sent" ? `${active.request_no} completa.` : `${active.request_no}: faltan rollos por enviar.` });
-      setPicked(new Set()); setLastScan(null);
-      onChanged();
-      await load();
-    } catch (e) { toast({ kind: "err", text: e.message }); }
+      const d = await post("/rolls/send-to-inspection", { ids: rolls.map((r) => r.id) });
+      toast({ kind: "ok", title: `${d.sent} rollo(s) enviados a inspección` });
+      setRolls([]); restart();
+      notifyChange(); onSent();
+    } catch (e) { say("err", e.message); }
     finally { setBusy(false); }
   };
 
-  const cancel = async () => {
-    if (!(await confirm({ title: `¿Cancelar ${active.request_no}?`, danger: true, confirmLabel: "Cancelar solicitud", cancelLabel: "Volver" }))) return;
-    try {
-      await post(`/inspection-requests/${active.id}/cancel`);
-      toast({ kind: "info", text: `${active.request_no} cancelada.` });
-      onChanged();
-      await load();
-    } catch (e) { toast({ kind: "err", text: e.message }); }
-  };
-
-  if (!loading && !requests.length) {
-    return (
-      <Card>
-        <EmptyState icon={Inbox} title="No hay solicitudes por enviar" text="Cuando el equipo de inspección pida rollos, aparecerán aquí ordenados por contenedor." action={<Button variant="secondary" icon={Plus} onClick={onNew}>Crear una solicitud</Button>} />
-      </Card>
-    );
-  }
+  const sendLabel = `Enviar ${rolls.length || ""} rollo(s) a inspección`;
 
   return (
-    <div className="grid lg:grid-cols-12 gap-6 items-start">
-      <div className="lg:col-span-4 space-y-3">
-        <div className="flex items-center justify-between px-1">
-          <span className="text-sm font-semibold text-slate-700">Solicitudes</span>
-          <Button size="sm" variant="ghost" icon={RefreshCw} loading={loading} onClick={load}>Actualizar</Button>
-        </div>
-        {requests.map((r) => {
-          const sent = r.rolls.filter((x) => x.sent_at).length;
-          const on = r.id === activeId;
-          return (
-            <button
-              key={r.id}
-              onClick={() => { setActiveId(r.id); setPicked(new Set()); setLastScan(null); }}
-              className={cx("w-full text-left rounded-2xl p-4 ring-1 transition",
-                on ? "bg-white ring-2 ring-indigo-500 shadow-sm" : "bg-white ring-slate-200 hover:ring-indigo-300")}
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-mono font-semibold text-slate-900">{r.request_no}</span>
-                <span className="text-xs text-slate-400">{timeAgo(r.created_at)}</span>
+    <div className="max-w-xl mx-auto lg:max-w-none grid lg:grid-cols-12 gap-4 lg:gap-6 items-start pb-24 lg:pb-0">
+      {/* Scanner column */}
+      <div className="lg:col-span-5 space-y-4 lg:sticky lg:top-4">
+        <div className="grid grid-cols-3 gap-2">
+          {STEPS.map((s, i) => {
+            const done = i < idx;
+            const on = i === idx;
+            const value = s.key === "location" ? location?.code : s.key === "box" ? box?.code : rolls.length || null;
+            return (
+              <div key={s.key} className={cx("rounded-xl px-3 py-2.5 ring-1 text-center",
+                on ? "bg-indigo-50 ring-2 ring-indigo-500" : done ? "bg-emerald-50 ring-emerald-200" : "bg-white ring-slate-200")}>
+                <s.icon className={cx("w-5 h-5 mx-auto", on ? "text-indigo-600" : done ? "text-emerald-600" : "text-slate-300")} />
+                <div className="text-[11px] text-slate-500 mt-1">{i + 1}. {s.label}</div>
+                <div className="font-mono font-bold text-lg text-slate-900 leading-tight min-h-[1.5rem]">{value ?? "—"}</div>
               </div>
-              <div className="text-xs text-slate-500 mt-0.5">{r.requested_by_name || "—"} · {r.rolls.length} rollo(s)</div>
-              {r.notes && <div className="text-xs text-slate-600 mt-1.5 line-clamp-2 bg-slate-50 rounded-lg px-2 py-1">“{r.notes}”</div>}
-              <ProgressBar value={sent} max={r.rolls.length} tone="violet" className="h-1.5 mt-3" />
-              <div className="text-[11px] text-slate-500 mt-1 fab-tnum">{sent}/{r.rolls.length} enviados</div>
-            </button>
-          );
-        })}
+            );
+          })}
+        </div>
+
+        <Card className="p-4 space-y-3">
+          <ScanBox onScan={onScan} placeholder={PROMPT[step]} />
+          {msg && (
+            <div className={cx("rounded-lg px-3 py-2.5 text-base font-semibold",
+              msg.kind === "ok" ? "bg-emerald-50 text-emerald-800" : msg.kind === "dup" ? "bg-amber-50 text-amber-800" : "bg-red-50 text-red-700")}>
+              {msg.text}
+            </div>
+          )}
+          {location && <Button size="sm" variant="ghost" icon={RotateCcw} onClick={restart}>Cambiar lugar</Button>}
+        </Card>
+
+        {/* Desktop: send button inline under the scanner */}
+        <Button icon={Send} className="hidden lg:flex w-full justify-center py-3 text-base" disabled={!rolls.length} loading={busy} onClick={send}>
+          {sendLabel}
+        </Button>
       </div>
 
-      <Card className="lg:col-span-8 overflow-hidden">
-        {!active ? <EmptyState icon={ClipboardList} title="Elija una solicitud" /> : (
+      {/* Scanned rolls */}
+      <Card className="lg:col-span-7 overflow-hidden">
+        <div className="px-4 lg:px-5 py-3 border-b border-slate-100 flex items-center gap-3">
+          <span className="font-semibold text-slate-800">Rollos escaneados</span>
+          <span className="ml-auto text-sm text-slate-500 fab-tnum">{rolls.length} · {num(yards, 1)} yd</span>
+          {rolls.length > 0 && <Button size="sm" variant="ghost" icon={X} className="hidden lg:inline-flex" onClick={clearAll}>Quitar todos</Button>}
+        </div>
+        {!rolls.length ? (
+          <EmptyState icon={Layers} title="Sin rollos" text="Escanee el lugar, el contenedor y después los rollos." />
+        ) : (
           <>
-            <CardHeader
-              title={<span className="font-mono">{active.request_no}</span>}
-              subtitle={`Solicitada por ${active.requested_by_name || "—"} · ${fmtDateTime(active.created_at)}`}
-              actions={active.status === "open" && <Button size="sm" variant="ghost" icon={XCircle} onClick={cancel}>Cancelar solicitud</Button>}
-            />
-            <div className="p-5 space-y-4 border-b border-slate-100">
-              <ScanBox onScan={onScan} placeholder="Escanee cada rollo al sacarlo de su contenedor…" />
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="flex-1 min-w-[200px]">
-                  <ProgressBar value={picked.size} max={pending.length} tone="emerald" className="h-2" />
-                  <div className="text-xs text-slate-500 mt-1 fab-tnum">{picked.size} de {pending.length} escaneados</div>
-                </div>
-                {lastScan && (
-                  <span className={cx("text-sm font-medium", lastScan.kind === "ok" ? "text-emerald-700" : lastScan.kind === "dup" ? "text-amber-700" : "text-red-600")}>
-                    {lastScan.text}
-                  </span>
-                )}
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button icon={Send} disabled={!picked.size} loading={busy} onClick={() => send(false)}>Enviar {picked.size || ""} escaneado(s)</Button>
-                <Button variant="secondary" disabled={!pending.length || busy} onClick={() => send(true)}>Enviar todos sin escanear</Button>
-              </div>
-            </div>
-            <ul className="divide-y divide-slate-100 max-h-[55vh] overflow-y-auto">
-              {pickList.map((r) => {
-                const isPicked = picked.has(r.id);
-                return (
-                  <li key={r.id} className={cx("px-5 py-3 flex items-center gap-4", r.sent_at ? "opacity-50" : isPicked && "bg-emerald-50")}>
-                    {r.sent_at || isPicked
-                      ? <CheckCircle2 className={cx("w-5 h-5 shrink-0", r.sent_at ? "text-slate-400" : "text-emerald-600")} />
-                      : <Circle className="w-5 h-5 shrink-0 text-slate-300" />}
-                    <div className="w-28 shrink-0">
-                      <div className="text-[11px] text-slate-400">Contenedor · lugar</div>
-                      <div className="font-semibold text-slate-900">{locationText(r)}</div>
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="font-mono text-sm font-semibold text-slate-900">{r.roll_no}</div>
-                      <div className="text-xs text-slate-500 truncate">{r.fabric_name || "—"} · {r.color || "—"} · Lote {r.lot || "—"} · PO {r.po_number || "—"}</div>
-                    </div>
-                    <div className="text-right text-sm fab-tnum text-slate-600">{num(r.yards, 1)} yd</div>
-                    <div className="w-24 text-right">
-                      {r.sent_at ? <Pill tone="slate">Enviado</Pill> : isPicked ? <Pill tone="emerald">Listo</Pill> : <Pill tone="amber">Por sacar</Pill>}
-                    </div>
-                  </li>
-                );
-              })}
+            {/* PDA: compact list */}
+            <ul className="lg:hidden divide-y divide-slate-100">
+              {rolls.map((r) => (
+                <li key={r.id} className="px-4 py-3 flex items-center gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="font-mono font-semibold text-slate-900">{r.roll_no}</div>
+                    <div className="text-xs text-slate-500 truncate">{locationText(r)} · {r.fabric_name || "—"} · {r.color || "—"}</div>
+                  </div>
+                  <div className="text-sm fab-tnum text-slate-600">{num(r.yards, 1)} yd</div>
+                  <RemoveBtn roll={r} onClick={() => remove(r.id)} />
+                </li>
+              ))}
             </ul>
+            {/* Desktop: table */}
+            <div className="hidden lg:block overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-slate-50 text-slate-500 text-xs">
+                  <tr>
+                    <Th>Rollo</Th><Th>Tela</Th><Th>Lote</Th><Th>PO</Th><Th>Contenedor · lugar</Th><Th right>Yardas</Th><Th />
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {rolls.map((r) => (
+                    <tr key={r.id} className="hover:bg-slate-50">
+                      <Td mono>{r.roll_no}</Td>
+                      <Td>{r.fabric_name || "—"} <span className="text-slate-400">· {r.color || "—"}</span></Td>
+                      <Td>{r.lot || "—"}</Td>
+                      <Td>{r.po_number || "—"}</Td>
+                      <Td>{locationText(r)}</Td>
+                      <Td right>{num(r.yards, 1)}</Td>
+                      <td className="px-3 py-2 text-right"><RemoveBtn roll={r} onClick={() => remove(r.id)} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </>
         )}
       </Card>
+
+      {/* PDA: send button fixed at the bottom */}
+      <div className="lg:hidden fixed inset-x-0 bottom-0 z-20 bg-white/95 backdrop-blur border-t border-slate-200 p-3"
+           style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom, 0px))" }}>
+        <Button icon={Send} className="w-full justify-center py-3 text-base" disabled={!rolls.length} loading={busy} onClick={send}>
+          {sendLabel}
+        </Button>
+      </div>
     </div>
   );
 }
 
-// --- Inspection team: choose rolls in stock ---------------------------------
-function NewRequest({ onCreated }) {
+// --- Rolls currently with the inspection team -------------------------------
+function AtInspection() {
   const toast = useToast();
   const [rolls, setRolls] = useState([]);
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
-  const [open, setOpen] = useState(false);
-  const [notes, setNotes] = useState("");
-  const [busy, setBusy] = useState(false);
-  const { sel, toggle, setAll, clear } = useSelection();
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const d = await api("/rolls?status=in_stock");
-        setRolls((d.rolls || []).filter((r) => !r.open_inspection_request));
-      } catch (e) { toast({ kind: "err", text: e.message }); }
-      finally { setLoading(false); }
-    })();
-  }, [toast]);
-
-  const shown = useMemo(() => {
-    const t = q.trim().toLowerCase();
-    if (!t) return rolls;
-    return rolls.filter((r) => [r.roll_no, r.po_number, r.supplier, r.fabric_name, r.fabric_item_number, r.color, r.lot, r.customer].some((v) => String(v ?? "").toLowerCase().includes(t)));
-  }, [rolls, q]);
-  const chosen = rolls.filter((r) => sel.has(r.id));
-
-  const create = async () => {
-    setBusy(true);
-    try {
-      const d = await post("/inspection-requests", { rollIds: [...sel], notes });
-      toast({ kind: "ok", title: `Solicitud ${d.request.request_no} creada`, text: `${sel.size} rollo(s). El almacén la verá en «Por enviar».` });
-      clear(); setNotes(""); setOpen(false);
-      onCreated();
-    } catch (e) { toast({ kind: "err", text: e.message }); }
-    finally { setBusy(false); }
-  };
-
-  const columns = [
-    { key: "roll_no", label: "Rollo", mono: true },
-    { key: "fabric_name", label: "Tela", render: (r) => <span>{r.fabric_name || "—"} <span className="text-slate-400">· {r.color || "—"}</span></span> },
-    { key: "fabric_item_number", label: "Item" },
-    { key: "lot", label: "Lote" },
-    { key: "po_number", label: "PO" },
-    { key: "supplier", label: "Proveedor" },
-    { key: "yards", label: "Yardas", align: "right", render: (r) => num(r.yards, 1) },
-    { key: "box_code", label: "Contenedor", sortValue: boxSortKey, render: (r) => locationText(r) },
-    { key: "inspection_result", label: "Inspección previa", render: (r) => r.inspection_result === "approved" ? <Pill tone="emerald">Aprobado</Pill> : r.inspection_result === "rejected" ? <Pill tone="red">Rechazado</Pill> : <span className="text-slate-300">—</span> },
-  ];
-
-  return (
-    <>
-      <Card className="overflow-hidden">
-        <div className="px-5 py-3.5 border-b border-slate-100 flex flex-wrap items-center gap-3">
-          <div className="text-sm text-slate-600">Elija los rollos que quiere inspeccionar.</div>
-          <SearchInput value={q} onChange={setQ} placeholder="Rollo, tela, lote, PO…" className="ml-auto w-full sm:w-80" />
-        </div>
-        <RollTable
-          rows={shown}
-          columns={columns}
-          selected={sel}
-          onToggle={toggle}
-          onToggleAll={(on, ids) => setAll(ids, on)}
-          onRowClick={(r) => toggle(r.id)}
-          loading={loading}
-          empty={<EmptyState icon={Microscope} title="No hay rollos disponibles" text="Solo se pueden pedir rollos en inventario que no estén ya en otra solicitud." />}
-        />
-      </Card>
-      <ActionBar count={sel.size} summary={`${num(chosen.reduce((s, r) => s + (Number(r.yards) || 0), 0), 1)} yd`} onClear={clear}>
-        <Button icon={Send} onClick={() => setOpen(true)}>Solicitar inspección</Button>
-      </ActionBar>
-      <Modal
-        open={open}
-        onClose={() => setOpen(false)}
-        title={`Solicitar ${sel.size} rollo(s) a inspección`}
-        footer={<><Button variant="secondary" onClick={() => setOpen(false)}>Cancelar</Button><Button icon={Send} loading={busy} onClick={create}>Enviar solicitud</Button></>}
-      >
-        <Field label="Nota para el almacén (opcional)" hint="Ej. revisar tono contra el lote anterior">
-          <textarea className={cx(inputCls, "w-full")} rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} autoFocus />
-        </Field>
-        <div className="mt-4 text-xs text-slate-500">{chosen.slice(0, 12).map((r) => r.roll_no).join(", ")}{chosen.length > 12 ? ` y ${chosen.length - 12} más` : ""}</div>
-      </Modal>
-    </>
-  );
-}
-
-// --- Rolls come back from inspection ---------------------------------------
-function ReturnFromInspection({ onChanged, onNavigate }) {
-  const toast = useToast();
-  const [rolls, setRolls] = useState([]);
-  const [containers, setContainers] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [locationId, setLocationId] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const { sel, toggle, setAll, clear } = useSelection();
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [r, c] = await Promise.all([api("/rolls?status=at_inspection"), api("/containers")]);
-      setRolls(r.rolls || []);
-      setContainers(c.containers || []);
+      const d = await api("/rolls?status=at_inspection&limit=2000");
+      const list = d.rolls || [];
+      list.sort((a, b) => String(b.out_at || "").localeCompare(String(a.out_at || "")));
+      setRolls(list);
     } catch (e) { toast({ kind: "err", text: e.message }); }
     finally { setLoading(false); }
   }, [toast]);
   useEffect(() => { load(); }, [load]);
 
-  const back = async (result) => {
-    setBusy(true);
-    try {
-      const d = await post("/rolls/return-from-inspection", { ids: [...sel], result, boxId: locationId || undefined });
-      toast({
-        kind: "ok",
-        title: `${d.updated} rollo(s) ${result === "approved" ? "aprobados" : "rechazados"}`,
-        text: "Regresaron al inventario.",
-        action: result === "rejected" ? { label: "Devolver al proveedor →", onClick: () => onNavigate("devoluciones") } : undefined,
-      });
-      clear(); setLocationId(null);
-      onChanged();
-      await load();
-    } catch (e) { toast({ kind: "err", text: e.message }); }
-    finally { setBusy(false); }
-  };
-
-  const columns = [
-    { key: "roll_no", label: "Rollo", mono: true },
-    { key: "fabric_name", label: "Tela", render: (r) => <span>{r.fabric_name || "—"} <span className="text-slate-400">· {r.color || "—"}</span></span> },
-    { key: "lot", label: "Lote" },
-    { key: "po_number", label: "PO" },
-    { key: "yards", label: "Yardas", align: "right", render: (r) => num(r.yards, 1) },
-    { key: "box_code", label: "Contenedor original", sortValue: boxSortKey, render: (r) => locationText(r) },
-    { key: "out_at", label: "Enviado", render: (r) => timeAgo(r.out_at) },
-  ];
+  const shown = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    if (!t) return rolls;
+    return rolls.filter((r) => [r.roll_no, r.po_number, r.supplier, r.fabric_name, r.color, r.lot, r.box_code, r.location_code]
+      .some((v) => String(v ?? "").toLowerCase().includes(t)));
+  }, [rolls, q]);
+  const yards = shown.reduce((s, r) => s + (Number(r.yards) || 0), 0);
 
   return (
-    <>
-      <Card className="overflow-hidden">
-        <CardHeader title="Rollos con el equipo de inspección" subtitle="Seleccione los que regresan y marque el resultado." actions={<Button size="sm" variant="ghost" icon={RefreshCw} loading={loading} onClick={load}>Actualizar</Button>} />
-        <RollTable
-          rows={rolls}
-          columns={columns}
-          selected={sel}
-          onToggle={toggle}
-          onToggleAll={(on, ids) => setAll(ids, on)}
-          loading={loading}
-          empty={<EmptyState icon={Microscope} title="No hay rollos en inspección" />}
-        />
-      </Card>
-      <ActionBar count={sel.size} onClear={clear}>
-        <LocationPicker containers={containers} value={locationId} onChange={setLocationId} allowEmpty emptyLabel="A su contenedor original" />
-        <Button variant="success" icon={ThumbsUp} loading={busy} onClick={() => back("approved")}>Aprobados</Button>
-        <Button variant="danger" icon={ThumbsDown} loading={busy} onClick={() => back("rejected")}>Rechazados</Button>
-      </ActionBar>
-    </>
+    <Card className="overflow-hidden">
+      <div className="px-4 lg:px-5 py-3 border-b border-slate-100 flex flex-wrap items-center gap-3">
+        <span className="font-semibold text-slate-800">Rollos en inspección</span>
+        <span className="text-sm text-slate-500 fab-tnum">{shown.length} · {num(yards, 1)} yd</span>
+        <div className="ml-auto flex items-center gap-2 w-full sm:w-auto">
+          <SearchInput value={q} onChange={setQ} placeholder="Rollo, tela, lote, PO…" className="flex-1 sm:w-72" />
+          <Button size="sm" variant="ghost" icon={RefreshCw} loading={loading} onClick={load}>Actualizar</Button>
+        </div>
+      </div>
+      {!loading && !shown.length ? (
+        <EmptyState icon={Microscope} title={q ? "Sin resultados" : "No hay rollos en inspección"} />
+      ) : (
+        <>
+          {/* PDA: compact list */}
+          <ul className="lg:hidden divide-y divide-slate-100">
+            {shown.map((r) => (
+              <li key={r.id} className="px-4 py-3 flex items-center gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="font-mono font-semibold text-slate-900">{r.roll_no}</div>
+                  <div className="text-xs text-slate-500 truncate">{locationText(r)} · {r.fabric_name || "—"} · {r.color || "—"}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-sm fab-tnum text-slate-600">{num(r.yards, 1)} yd</div>
+                  <div className="text-[11px] text-slate-400">{timeAgo(r.out_at)}</div>
+                </div>
+              </li>
+            ))}
+          </ul>
+          {/* Desktop: table */}
+          <div className="hidden lg:block overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-slate-500 text-xs">
+                <tr>
+                  <Th>Rollo</Th><Th>Tela</Th><Th>Lote</Th><Th>PO</Th><Th>Proveedor</Th><Th>Contenedor original</Th><Th right>Yardas</Th><Th>Enviado</Th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {shown.map((r) => (
+                  <tr key={r.id} className="hover:bg-slate-50">
+                    <Td mono>{r.roll_no}</Td>
+                    <Td>{r.fabric_name || "—"} <span className="text-slate-400">· {r.color || "—"}</span></Td>
+                    <Td>{r.lot || "—"}</Td>
+                    <Td>{r.po_number || "—"}</Td>
+                    <Td>{r.supplier || "—"}</Td>
+                    <Td>{locationText(r)}</Td>
+                    <Td right>{num(r.yards, 1)}</Td>
+                    <Td><span title={r.out_at || ""}>{timeAgo(r.out_at)}</span></Td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Card>
   );
 }
+
+// --- small bits -------------------------------------------------------------
+const Th = ({ children, right }) => (
+  <th className={cx("px-3 py-2 font-medium whitespace-nowrap", right ? "text-right" : "text-left")}>{children}</th>
+);
+const Td = ({ children, right, mono }) => (
+  <td className={cx("px-3 py-2.5 whitespace-nowrap text-slate-700", right && "text-right fab-tnum", mono && "font-mono font-semibold text-slate-900")}>{children}</td>
+);
+const RemoveBtn = ({ roll, onClick }) => (
+  <button onClick={onClick} className="p-2 -mr-2 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50" aria-label={`Quitar ${roll.roll_no}`} title="Quitar">
+    <X className="w-5 h-5" />
+  </button>
+);

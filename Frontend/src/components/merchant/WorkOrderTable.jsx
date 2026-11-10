@@ -271,6 +271,7 @@ export default function WorkOrderTable({ orders, onEdit }) {
                         )}
                         <Meta label="Descripción" value={o.style_description} />
                         <Meta label="Temporada" value={o.season} mono />
+                        {o.tech_pack_no && <Meta label="Tech pack" value={o.tech_pack_no} mono />}
                         <Meta label="SAM" value={fmtNum(o.sam_minutes)} mono />
                         <Meta label="Rendimiento" value={fmtNum(o.yield_per_piece)} mono />
                         <Meta label="Telas" value={fabricSummary(headerFabrics)} />

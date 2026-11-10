@@ -9,8 +9,8 @@ import CutOrders from "../components/planner/CutOrders";
 import LineAssignmentForm from "../components/planner/LineAssignmentForm";
 import PlanBoard from "../components/planner/PlanBoard";
 import HolidaysManager from "../components/planner/HolidaysManager";
-// Daily line efficiency (planner version of the Skyrina board)
-import DailyEfficiency from "../components/planner/DailyEfficiency";
+// Daily line efficiency (same screen as the Skyrina page, compact embedded mode)
+import SkyrinaDashboard from "./SkyrinaDashboard";
 
 // Tabs that stand on their own — switching to one drops the selected order.
 const STANDALONE_TABS = ["dashboard", "list", "planboard", "status", "efficiency", "cut", "holidays"];
@@ -23,6 +23,15 @@ export default function AdvancedPlanningPage() {
   const [woMode, setWoMode] = useState(null);
   const [userRole, setUserRole] = useState(null);
   const [message, setMessage] = useState("");
+  // Which board the "Plan Board" tab shows: the real plan or the customer
+  // forecast. Remembered per browser.
+  const [boardMode, setBoardMode] = useState(() => {
+    try { return localStorage.getItem("planboard.mode") === "forecast" ? "forecast" : "plan"; } catch { return "plan"; }
+  });
+  const changeBoardMode = (m) => {
+    setBoardMode(m);
+    try { localStorage.setItem("planboard.mode", m); } catch { /* ignore */ }
+  };
 
   const [workOrderData, setWorkOrderData] = useState({
     workOrderNo: "",
@@ -152,13 +161,17 @@ export default function AdvancedPlanningPage() {
         <div className="space-y-6">
           {activeTab === "dashboard" && <PlanningDashboard />}
 
-          {activeTab === "planboard" && <PlanBoard />}
+          {/* Plan Board / Pronóstico: the selector sits in the board's own title.
+              `key` remounts the board so each one loads only its own data. */}
+          {activeTab === "planboard" && (
+            <PlanBoard key={boardMode} mode={boardMode} onModeChange={changeBoardMode} />
+          )}
 
           {/* Read-only order status view (assignment happens in Plan Board) */}
           {activeTab === "status" && <OrderStatus />}
 
           {/* Daily line efficiency — read-only, auto-refreshes every 5 min */}
-          {activeTab === "efficiency" && <DailyEfficiency />}
+          {activeTab === "efficiency" && <SkyrinaDashboard embedded />}
 
           {activeTab === "cut" && <CutOrders />}
 

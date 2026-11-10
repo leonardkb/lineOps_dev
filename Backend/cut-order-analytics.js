@@ -40,6 +40,18 @@
 //
 //   There is no schema to create — it only reads cut_orders — so there is no
 //   initSchema call to add.
+//
+// CORTES AGRUPADOS ----------------------------------------------------------
+// CutPlanning puede agrupar varias CORTES (mismo estilo + tela, o mismo item
+// code) y planearlas como un solo tendido. Cada orden sigue siendo su propia
+// fila de cut_orders con SU parte de cada marcada, así que todos los totales
+// por orden siguen igual. Además se reporta:
+//   • cut_group_id / group_no / group_by / group_key en cada fila de `detail`
+//   • byGroup: un renglón por grupo con la suma de sus órdenes
+//   • trazos: marcadas FÍSICAS. Una marcada de grupo vive copiada en cada
+//     orden; como marcada cuenta una vez por orden (marcadas), como trazo
+//     cuenta una sola vez (trazos). Así no se infla lo que se tendió en la mesa.
+// Si cut_group_id todavía no existe, todo esto sale vacío y nada truena.
 // ---------------------------------------------------------------------------
 
 // Roles allowed to see the executive cut board. Matches the broad exec set used
@@ -206,6 +218,41 @@ async function hasVerifyCols(client) {
   return VERIFY_COLS;
 }
 
+// ¿Ya existe la agrupación de cortes (cut_orders.cut_group_id + cut_groups)?
+// No se cachea el "no": la columna la crea cut-orders.js al arrancar, y puede
+// aparecer después de la primera consulta.
+let GROUP_COLS = false;
+async function hasGroupCols(client) {
+  if (GROUP_COLS) return true;
+  const { rows } = await client.query(`
+    SELECT
+      EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'cut_orders' AND column_name = 'cut_group_id'
+                 AND table_schema = ANY (current_schemas(false))) AS col,
+      EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_name = 'cut_groups'
+                 AND table_schema = ANY (current_schemas(false))) AS tbl
+  `);
+  GROUP_COLS = !!(rows[0] && rows[0].col && rows[0].tbl);
+  return GROUP_COLS;
+}
+
+const groupNo = (id) => (id ? `GRUPO-${String(id).padStart(4, '0')}` : null);
+const GROUP_BY_LABEL = { style_fabric: 'Estilo + tela', item_code: 'Item code' };
+
+// Clave de la marcada FÍSICA: las copias de una marcada de grupo comparten id.
+const trazoKey = (row, m, i) =>
+  row.cut_group_id && m && m.id ? `G${row.cut_group_id}:${m.id}` : `C${row.id}:${(m && m.id) || i}`;
+
+// Condición de búsqueda: work order, PO, id del corte o "GRUPO-0003".
+function searchCond(p, grouped) {
+  return `(wo.work_order_no::text ILIKE ${p}
+        OR wo.customer_po::text ILIKE ${p}
+        OR co.id::text ILIKE ${p}
+        OR ('CORTE-' || lpad(co.id::text, 4, '0')) ILIKE ${p}${grouped ? `
+        OR ('GRUPO-' || lpad(co.cut_group_id::text, 4, '0')) ILIKE ${p}` : ''})`;
+}
+
 function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) {
   app.get('/api/cut-orders/analytics', authenticateToken, async (req, res) => {
     const client = await pool.connect();
@@ -238,6 +285,8 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       const toDay = allDates ? null : endDate;
       const inRange = (day) => !!day && (!fromDay || day >= fromDay) && (!toDay || day <= toDay);
 
+      const grouped = await hasGroupCols(client);
+
       const params = [];
       const conds = [];
       if (byCompleted) {
@@ -253,9 +302,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         // Escapa los comodines de LIKE para que "%" o "_" se busquen literalmente.
         params.push(`%${search.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
         const p = `$${params.length}`;
-        conds.push(`(wo.work_order_no::text ILIKE ${p}
-                  OR wo.customer_po::text ILIKE ${p}
-                  OR co.id::text ILIKE ${p})`);
+        conds.push(searchCond(p, grouped));
       }
       const where = conds.length ? conds.join(' AND ') : 'TRUE';
 
@@ -263,6 +310,10 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       const verifiedSelect = verified
         ? `co.verified_at, co.verified_by,`
         : `NULL::timestamptz AS verified_at, NULL::text AS verified_by,`;
+      const groupSelect = grouped
+        ? `co.cut_group_id, cg.group_by, cg.group_key,`
+        : `NULL::bigint AS cut_group_id, NULL::text AS group_by, NULL::text AS group_key,`;
+      const groupJoin = grouped ? `LEFT JOIN cut_groups cg ON cg.id = co.cut_group_id` : '';
 
       const { rows: allRows } = await client.query(`
         SELECT co.id,
@@ -275,6 +326,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
                co.total_length,
                co.status,
                ${verifiedSelect}
+               ${groupSelect}
                co.fabric,
                co.fabric_code,
                COALESCE(co.color, wo.color)      AS color,
@@ -288,6 +340,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
                wo.style_description
           FROM cut_orders co
           JOIN work_orders wo ON wo.id = co.work_order_id
+          ${groupJoin}
          WHERE ${where}
          ORDER BY co.cut_date DESC, co.created_at DESC
       `, params);
@@ -350,6 +403,13 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         tallas: 0,
         fabrics_count: 0,
         verification_enabled: verified,
+        // Agrupación de cortes
+        grouping_enabled: grouped,
+        grouped_orders: 0,
+        groups_count: 0,
+        // Marcadas físicas (una marcada de grupo cuenta una vez).
+        total_trazos: 0,
+        completed_trazos: 0,
       };
 
       const byStatus = Object.fromEntries(STATUSES.map((s) => [s, { status: s, orders: 0, quantity: 0, cut: 0 }]));
@@ -359,6 +419,10 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       const byDay = new Map();     // day -> { day, orders, quantity, cut }
       const tallaSet = new Set();
       const fabricSet = new Set();
+      const byGroup = new Map();   // cut_group_id -> roll-up del grupo
+      const trazos = new Map();    // trazoKey -> cerrado (true si alguna copia está cerrada)
+      // Orden de etapas para saber qué tan atrás va un grupo (la más atrasada manda).
+      const STAGE_RANK = { planning: 0, ready: 1, cutting: 2, verification: 3, verified: 4, cancelled: 5 };
       const detail = [];
       // Acumuladores para el promedio global de eficiencia de marcada.
       let effSum = 0;
@@ -434,6 +498,48 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         const marcadasDone = markers.reduce((s, m) => s + (markerDone(m, spByTalla, stage) ? 1 : 0), 0);
         summary.total_marcadas += markers.length;
         summary.completed_marcadas += marcadasDone;
+        markers.forEach((m, i) => {
+          const k = trazoKey(row, m, i);
+          trazos.set(k, trazos.get(k) || markerDone(m, spByTalla, stage));
+        });
+
+        // Grupo
+        if (row.cut_group_id) {
+          summary.grouped_orders += 1;
+          const gid = Number(row.cut_group_id);
+          const g = byGroup.get(gid) || {
+            group_id: gid,
+            group_no: groupNo(gid),
+            group_by: row.group_by || null,
+            group_by_label: GROUP_BY_LABEL[row.group_by] || null,
+            group_key: row.group_key || null,
+            orders: 0,
+            order_ids: [],
+            work_orders: [],
+            customers: [],
+            quantity: 0,
+            cut: 0,
+            remaining: 0,
+            over: 0,
+            trazoKeys: new Set(),
+            trazosDone: new Set(),
+            stage: null,
+            cut_date: null,
+          };
+          g.orders += 1;
+          g.order_ids.push(row.id);
+          if (row.work_order_no && !g.work_orders.includes(row.work_order_no)) g.work_orders.push(row.work_order_no);
+          if (row.customer_name && !g.customers.includes(row.customer_name)) g.customers.push(row.customer_name);
+          g.quantity += planned; g.cut += cut; g.remaining += remaining; g.over += over;
+          markers.forEach((m, i) => {
+            const k = trazoKey(row, m, i);
+            g.trazoKeys.add(k);
+            if (markerDone(m, spByTalla, stage)) g.trazosDone.add(k);
+          });
+          if (stage !== 'cancelled' && (g.stage == null || STAGE_RANK[stage] < STAGE_RANK[g.stage])) g.stage = stage;
+          if (row.cut_date && (!g.cut_date || row.cut_date < g.cut_date)) g.cut_date = row.cut_date;
+          byGroup.set(gid, g);
+        }
 
         // Eficiencia de marcada de esta orden (promedio + rango).
         const eff = markerEfficiencyStats(markers);
@@ -472,6 +578,10 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
             over,
             status,
             stage,
+            cut_group_id: row.cut_group_id ? Number(row.cut_group_id) : null,
+            group_no: groupNo(row.cut_group_id),
+            group_by: row.group_by || null,
+            group_key: row.group_key || null,
             verified_at: row.verified_at || null,
             verified_by: row.verified_by || null,
             panels: row.panels != null ? num(row.panels) : null,
@@ -495,6 +605,19 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       }
 
       summary.tallas = tallaSet.size;
+      summary.groups_count = byGroup.size;
+      summary.total_trazos = trazos.size;
+      summary.completed_trazos = [...trazos.values()].filter(Boolean).length;
+      const byGroupOut = [...byGroup.values()]
+        .map(({ trazoKeys, trazosDone, ...g }) => ({
+          ...g,
+          stage: g.stage || 'cancelled',
+          order_ids: g.order_ids.sort((a, b) => a - b),
+          trazos: trazoKeys.size,
+          trazos_done: trazosDone.size,
+          progress: g.quantity > 0 ? Math.min(Math.round((g.cut / g.quantity) * 100), 100) : 0,
+        }))
+        .sort((a, b) => (a.cut_date || '') < (b.cut_date || '') ? 1 : (a.cut_date || '') > (b.cut_date || '') ? -1 : b.group_id - a.group_id);
       summary.fabrics_count = fabricSet.size;
       // Promedio global de eficiencia de marcada (null si ninguna marcada trae dato).
       summary.avg_efficiency = effCount > 0 ? Math.round((effSum / effCount) * 10) / 10 : null;
@@ -522,10 +645,11 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       if (search) {
         cParams.push(`%${search.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
         const p = `$${cParams.length}`;
-        cConds.push(`(wo.work_order_no::text ILIKE ${p} OR wo.customer_po::text ILIKE ${p} OR co.id::text ILIKE ${p})`);
+        cConds.push(searchCond(p, grouped));
       }
       ({ rows: doneRows } = await client.query(`
-        SELECT co.id, co.markers, wo.work_order_no, wo.customer_po, wo.customer_name
+        SELECT co.id, co.markers, wo.work_order_no, wo.customer_po, wo.customer_name,
+               ${grouped ? 'co.cut_group_id' : 'NULL::bigint AS cut_group_id'}
           FROM cut_orders co
           JOIN work_orders wo ON wo.id = co.work_order_id
          WHERE ${cConds.join(' AND ')}
@@ -539,14 +663,17 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
           const day = localDay(m.completedAt);
           if (!inRange(day)) return;
           const pieces = markerPieces(m);
-          const d = completedByDay.get(day) || { day, marcadas: 0, pieces: 0, orders: new Map() };
+          const d = completedByDay.get(day) || { day, marcadas: 0, pieces: 0, orders: new Map(), trazos: new Set() };
           d.marcadas += 1;
           d.pieces += pieces;
+          d.trazos.add(trazoKey(row, m, i));
           const o = d.orders.get(row.id) || {
             cut_order_id: row.id,
             work_order_no: row.work_order_no,
             customer_po: row.customer_po,
             customer_name: row.customer_name,
+            cut_group_id: row.cut_group_id ? Number(row.cut_group_id) : null,
+            group_no: groupNo(row.cut_group_id),
             marcadas: 0,
             pieces: 0,
             markers: [],
@@ -563,6 +690,8 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         .map((d) => ({
           day: d.day,
           marcadas: d.marcadas,
+          // Marcadas físicas completadas ese día (una de grupo cuenta una vez).
+          trazos: d.trazos.size,
           pieces: d.pieces,
           orders: [...d.orders.values()].sort((a, b) => b.marcadas - a.marcadas || a.cut_order_id - b.cut_order_id),
         }));
@@ -570,6 +699,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       summary.completed_marcadas_in_range = byCompletedDay.reduce((s, d) => s + d.marcadas, 0);
       summary.completed_pieces_in_range = byCompletedDay.reduce((s, d) => s + d.pieces, 0);
       summary.completed_marcadas_orders = completedOrderIds.size;
+      summary.completed_trazos_in_range = byCompletedDay.reduce((s, d) => s + d.trazos, 0);
 
       res.json({
         success: true,
@@ -581,6 +711,7 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
         byTalla: [...byTalla.values()].sort((a, b) => cmpTalla(a.talla, b.talla)),
         byFabric: [...byFabric.values()].sort((a, b) => b.quantity - a.quantity),
         byDay: [...byDay.values()].sort((a, b) => (a.day < b.day ? -1 : 1)),
+        byGroup: byGroupOut,
         byCompletedDay,
         detail,
       });
@@ -728,6 +859,9 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
           completed_day: m && m.completedAt ? localDay(m.completedAt) : null,
           efficiency: m && m.efficiency != null && m.efficiency !== '' && num(m.efficiency) > 0 ? num(m.efficiency) : null,
           length: m && m.length != null && m.length !== '' ? num(m.length) : null,
+          // Marcada de grupo: tamaño del tendido completo (esta orden lleva una parte).
+          group_panels: m && m.groupPanels ? num(m.groupPanels) : null,
+          group_pieces: m && m.groupPieces ? num(m.groupPieces) : null,
           lines: lines.sort((a, b) => cmpTalla(a.talla, b.talla)),
         };
       });
@@ -755,6 +889,52 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
       if (!panelsTotal && co.panels != null) panelsTotal = num(co.panels);
       const eff = markerEfficiencyStats(markers);
 
+      // Grupo: las otras órdenes que se tienden junto con ésta.
+      let group = null;
+      const gid = co.cut_group_id ? Number(co.cut_group_id) : null;
+      if (gid && (await hasGroupCols(client))) {
+        const { rows: gRows } = await client.query(`
+          SELECT cg.group_by, cg.group_key,
+                 co.id, co.quantity, co.amount_cut, co.remaining_to_cut, co.status, co.size_progress,
+                 wo.work_order_no, wo.customer_name, wo.customer_po
+            FROM cut_groups cg
+            JOIN cut_orders co ON co.cut_group_id = cg.id
+            JOIN work_orders wo ON wo.id = co.work_order_id
+           WHERE cg.id = $1
+           ORDER BY co.id
+        `, [gid]);
+        if (gRows.length) {
+          const members = gRows.map((g) => {
+            const gsp = asArray(g.size_progress);
+            const gPlanned = num(g.quantity);
+            const gCut = cutOf(g, gsp);
+            return {
+              id: g.id,
+              work_order_no: g.work_order_no,
+              customer_name: g.customer_name,
+              customer_po: g.customer_po,
+              status: g.status,
+              quantity: gPlanned,
+              cut: gCut,
+              remaining: remainingOf(g, gsp, gCut, gPlanned),
+              current: Number(g.id) === Number(co.id),
+            };
+          });
+          group = {
+            id: gid,
+            group_no: groupNo(gid),
+            group_by: gRows[0].group_by,
+            group_by_label: GROUP_BY_LABEL[gRows[0].group_by] || null,
+            group_key: gRows[0].group_key,
+            orders: members.length,
+            quantity: members.reduce((a, m) => a + m.quantity, 0),
+            cut: members.reduce((a, m) => a + m.cut, 0),
+            remaining: members.reduce((a, m) => a + m.remaining, 0),
+            members,
+          };
+        }
+      }
+
       res.json({
         success: true,
         order: {
@@ -776,7 +956,10 @@ function registerCutOrderAnalytics(app, { authenticateToken, pool, setSchema }) 
           verified_by: co.verified_by || null,
           verification_notes: co.verification_notes || null,
           notes: co.notes || null,
+          cut_group_id: gid,
+          group_no: groupNo(gid),
         },
+        group,
         totals: {
           planned,
           cut,

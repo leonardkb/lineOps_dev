@@ -657,6 +657,15 @@ const getRowsFromData = () => {
   const handleCopyRun = async () => {
     if (!copyDialog.run || !newDate) return;
 
+    // Sin orden de trabajo no se puede crear la línea: debe revisarse con el
+    // planner para un cambio de estilo urgente.
+    if (!selectedWorkOrderId) {
+      setMessage(
+        "❌ La línea no se puede crear. Por favor revise con el planner para un cambio de estilo urgente."
+      );
+      return;
+    }
+
     setCopyLoading(true);
     setMessage("");
     try {
@@ -692,7 +701,12 @@ const getRowsFromData = () => {
 
       const data = await response.json();
       if (data.success) {
-        setMessage(`✅ Corrida duplicada correctamente. Nuevo ID: ${data.newRunId}`);
+        setMessage(
+          `✅ Corrida duplicada correctamente. Nuevo ID: ${data.newRunId}` +
+            (data.sharedHoursFromRunId
+              ? " · Usa las horas de trabajo de la corrida del mismo estilo (misma cuadrilla)."
+              : "")
+        );
         setCopyDialog({ open: false, run: null });
         setNewDate("");
         setCopyWorkOrders([]);
@@ -764,6 +778,11 @@ const getRowsFromData = () => {
     return Array.from(map.values());
   })();
 
+  // "Sin orden de trabajo" seleccionado con una fecha ya elegida: la copia
+  // queda bloqueada y se muestra la tarjeta de aviso.
+  const copyBlockedNoWorkOrder =
+    copyDialog.open && !!newDate && !loadingCopyWorkOrders && !selectedWorkOrderId;
+
   // Work order currently chosen in the copy dialog (full object, not just id).
   // When chosen, the duplicated run takes the order's style (tipo+modelo+
   // correlativo) and color; otherwise it keeps the source run's style/color.
@@ -805,9 +824,13 @@ const getRowsFromData = () => {
       .map((r) => ({
         id: r.id,
         color: String(r.color || "").trim(),
+        workOrderNo: String(r.work_order_no || "").trim(),
         target_pcs: r.target_pcs,
       }))
-      .sort((a, b) => a.color.localeCompare(b.color));
+      .sort(
+        (a, b) =>
+          a.color.localeCompare(b.color) || a.workOrderNo.localeCompare(b.workOrderNo)
+      );
   })();
 
   // Suma de metas de todos los colores de la corrida abierta. La tarjeta de la
@@ -1020,7 +1043,8 @@ const getRowsFromData = () => {
           )}
           {isMerged && (
             <span className="px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 text-[10px] font-bold uppercase tracking-wide">
-              {group.colors.length || group.count} colores
+              {group.count}{" "}
+              {group.colors.length === group.count ? "colores" : "corridas"}
             </span>
           )}
         </div>
@@ -1143,10 +1167,28 @@ const getRowsFromData = () => {
               ) : null}
             </label>
 
+            {/* Aviso: sin orden de trabajo la línea no se puede crear */}
+            {copyBlockedNoWorkOrder && (
+              <div
+                role="alert"
+                className="mb-4 flex gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3"
+              >
+                <span className="text-lg leading-none" aria-hidden="true">⚠️</span>
+                <div>
+                  <p className="text-sm font-semibold text-red-800">
+                    La línea no se puede crear
+                  </p>
+                  <p className="mt-1 text-xs text-red-700">
+                    Por favor revise con el planner para un cambio de estilo urgente.
+                  </p>
+                </div>
+              </div>
+            )}
+
             {/* Vista previa. Al elegir una orden, el estilo se arma con
                 tipo+modelo+correlativo y el color se guarda por separado, de modo
                 que el mismo estilo en otro color queda como una corrida distinta. */}
-            {copyDialog.run && (
+            {copyDialog.run && !copyBlockedNoWorkOrder && (
               <div className="mb-4 rounded-xl bg-gray-50 px-3 py-2 text-xs text-gray-600">
                 Se creará la corrida con estilo{" "}
                 <span className="font-semibold text-gray-900">
@@ -1184,7 +1226,7 @@ const getRowsFromData = () => {
               </button>
               <button
                 onClick={handleCopyRun}
-                disabled={!newDate || copyLoading}
+                disabled={!newDate || copyLoading || copyBlockedNoWorkOrder}
                 className="px-4 py-2 text-sm bg-gray-900 text-white rounded-xl hover:bg-gray-800 disabled:opacity-50"
               >
                 {copyLoading ? "Copiando..." : "Copiar"}
@@ -1395,6 +1437,11 @@ const getRowsFromData = () => {
                       title={cr.target_pcs != null ? `Meta: ${cr.target_pcs} pzas` : undefined}
                     >
                       {cr.color || "Sin color"}
+                      {/* Mismo color en dos órdenes: mostrar la orden para distinguirlas */}
+                      {cr.workOrderNo &&
+                        currentColorRuns.filter((o) => o.color === cr.color).length > 1 && (
+                          <span className="ml-1 text-xs opacity-70">· {cr.workOrderNo}</span>
+                        )}
                     </button>
                   );
                 })}

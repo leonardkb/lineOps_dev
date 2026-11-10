@@ -3,6 +3,12 @@ import { useState, useEffect, useCallback } from "react";
 import { Link, NavLink, useNavigate, useLocation } from "react-router-dom";
 import { API_URL } from "../lib/masterCodeCatalog";
 import NavFactoryDirector from "./NavFactoryDirector";
+// Avisos del Verificador (correcciones de producción y descargas de reportes).
+import CeoActivityBell, {
+  useVerificadorActivity,
+  CeoActivityBanner,
+  CeoActivityToasts,
+} from "./CeoActivityBell";
 
 // Real role of the logged-in user. The backend reports the Factory Director as
 // role "master" (same permissions as the CEO) and keeps the real one in
@@ -26,6 +32,8 @@ export default function NavCeo() {
 function NavCeoPanel() {
   const [open, setOpen] = useState(false);
   const navigate = useNavigate();
+  // Avisos del Verificador: un solo estado para campana, banner y tarjetas.
+  const activity = useVerificadorActivity();
   const location = useLocation();
 
   // Pending efficiency-change requests waiting for CEO approval → badge on
@@ -125,7 +133,7 @@ function NavCeoPanel() {
 
   const menu = [
     { name: "Production Monitor", path: "/overview" },
-   
+    
     { name: "Plan Analytics", path: "/planner-analytics", badge: "eff" },
     { name: "Quality Monitor", path: "/quality-monitor" },
     { name: "Mechanics", path: "/mecanics" },
@@ -178,6 +186,7 @@ function NavCeoPanel() {
           Skyrina CEO Panel
         </Link>
 
+        <div className="flex items-center gap-4 lg:gap-6">
         {/* Desktop Menu */}
         <ul className="hidden md:flex gap-6 lg:gap-8 font-medium">
           {menu.map((item) => (
@@ -209,6 +218,9 @@ function NavCeoPanel() {
           </li>
         </ul>
 
+        {/* Campana del Verificador: visible en escritorio y en móvil */}
+        <CeoActivityBell activity={activity} />
+
         {/* Hamburger Menu Button */}
         <button
           onClick={() => setOpen(!open)}
@@ -221,7 +233,13 @@ function NavCeoPanel() {
             <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500" />
           )}
         </button>
+        </div>
       </div>
+
+      {/* Banner fijo mientras haya avisos sin ver (todas las pantallas del CEO) */}
+      <CeoActivityBanner activity={activity} />
+      {/* Tarjetas emergentes cuando llega un aviso nuevo */}
+      <CeoActivityToasts activity={activity} />
 
       {/* Mobile Menu */}
       {open && (

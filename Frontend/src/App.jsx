@@ -31,11 +31,11 @@ import PreOrdenWizard from "./components/merchant/PreOrdenWizard";
 import TicketCard from "./components/cutting/TicketCard";
 import SupermarketPage from "./pages/supermarket/SupermarketPage";
 import PlannerAnalytics from "./components/planner/PlannerAnalytics";
-import VerificadorPage from "./pages/Verificadorpage";
 import ClientCatalogPage from "./pages/merchant/ClientCatalogPage";
 import ProductCatalogPage from "./pages/merchant/ProductCatalogPage";
 import BillOfMaterialsPage from "./pages/merchant/Billofmaterialspage";
 import StyleOrderWizard from "./components/merchant/StyleOrderWizard";
+import VerificadorSection from "./components/verificador/VerificadorSection";
 
 export default function App() {
   return (
@@ -76,7 +76,7 @@ export default function App() {
 
         <Route path='/supermarket-plan' element={<SupermarketPage/>} /> {/*supermarket plan route */}
         <Route path='/planner-analytics' element={<PlannerAnalytics/>} /> {/*planner analytics route */}
-        <Route path='/verificador' element={<VerificadorPage/>} /> {/*verificador route */}
+        <Route path="/verificador" element={<VerificadorSection />} />
         <Route path='/clientes'  element={<ClientCatalogPage/>} /> {/*clientes route */}
         <Route path='/products' element={<ProductCatalogPage/>} /> {/*products route */}
         <Route path='/bom' element={<BillOfMaterialsPage/>} /> {/*bom route */}
@@ -85,7 +85,7 @@ export default function App() {
 
         <Route path='/style-order' element={<StyleOrderWizard/>} /> {/*style order wizard route */}
 
-
+       
         <Route path="/corte/ticket" element={<TicketCard />} />
       </Routes>
     </Router>

@@ -237,7 +237,9 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
 
   const [styleDescription, setStyleDescription] = useState(order?.style_description || "");
   const [status, setStatus] = useState(order?.status || "pending");
+  const [season, setSeason] = useState(order?.season || "");
   const [samMinutes, setSamMinutes] = useState(num(order?.sam_minutes));
+  const [techPackNo, setTechPackNo] = useState(order?.tech_pack_no || "");
   const [warehouseStock, setWarehouseStock] = useState(num(order?.warehouse_stock));
   const [extraQuantity, setExtraQuantity] = useState(num(order?.extra_quantity));
   const [totalToProduce, setTotalToProduce] = useState(num(order?.total_to_produce));
@@ -294,6 +296,11 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
   };
   const clearPhoto = () => { setPhotoFile(null); setPhotoPreview(""); setRemovePhoto(true); };
   const undoPhotoChange = () => { setPhotoFile(null); setPhotoPreview(""); setRemovePhoto(false); };
+
+  // Temporada: texto libre (ej. "SP26", "FA25"). Se guarda en mayúsculas y
+  // sin espacios al inicio/final; vacío = sin temporada.
+  const handleSeasonChange = (e) => setSeason(e.target.value.toUpperCase().slice(0, 40));
+  const seasonOut = season.trim() || null;
 
   // ------- row helpers --------------------------------------------------
   const setRowField = (i, key, val) =>
@@ -492,6 +499,12 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
   const valid = problems.length === 0;
 
   const selectedCustomer = customers.find((c) => String(c.id) === String(customerId));
+  // Tech pack solo para Nike. Mientras el catálogo carga se usa el nombre que
+  // ya trae la orden, para no borrar el tech pack por accidente.
+  const isNike = /nike/i.test(
+    selectedCustomer ? `${selectedCustomer.name || ""} ${selectedCustomer.code || ""}` : (order?.customer_name || "")
+  );
+  const techPackOut = isNike ? (techPackNo.trim().toUpperCase() || null) : null;
 
   // ------- save ---------------------------------------------------------
   const handleSave = async () => {
@@ -506,7 +519,9 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
         customer_name: selectedCustomer ? selectedCustomer.name : order?.customer_name,
         style_description: styleDescription,
         status,
+        season: seasonOut,
         sam_minutes: samMinutes === "" ? order?.sam_minutes : parseFloat(samMinutes) || 0,
+        tech_pack_no: techPackOut,
         master_code_photo_url: photoFile
           ? (photoPreview || order?.master_code_photo_url || null)
           : (removePhoto ? null : (order?.master_code_photo_url || null)),
@@ -548,11 +563,13 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
         uploadedPhotoKey = pres.photoKey;
       }
 
-      const body = { styleDescription, status, totalToProduce: total, lines: cells };
+      const body = { styleDescription, status, season: seasonOut, totalToProduce: total, lines: cells };
       if (customerId) body.customerId = Number(customerId);
       if (warehouseStock !== "") body.warehouseStock = parseFloat(warehouseStock) || 0;
       if (extraQuantity !== "") body.extraQuantity = parseFloat(extraQuantity) || 0;
       if (samMinutes !== "") body.samMinutes = parseFloat(samMinutes) || 0;
+      // Siempre se envía: si la orden dejó de ser de Nike, se limpia.
+      body.techPackNo = techPackOut;
       if (uploadedPhotoKey) body.photoKey = uploadedPhotoKey;
       else if (removePhoto) body.removePhoto = true;
 
@@ -621,6 +638,24 @@ export default function WorkOrderEditModal({ order, apiOnline = true, onClose, o
                   {STATUSES.map((s) => <option key={s.value} value={s.value}>{s.label}</option>)}
                 </select>
               </Field>
+              <Field label="Temporada" hint="Opcional · ej. SP26, FA25. Déjalo vacío para quitarla.">
+                <input
+                  value={season}
+                  onChange={handleSeasonChange}
+                  placeholder="Ej. SP26"
+                  className={`${fieldCls} uppercase`}
+                />
+              </Field>
+              {isNike && (
+                <Field label="N° Tech pack Nike" hint="Opcional · del estilo de esta orden.">
+                  <input
+                    value={techPackNo}
+                    onChange={(e) => setTechPackNo(e.target.value.toUpperCase().slice(0, 40))}
+                    placeholder="Ej. TP-123456"
+                    className={`${fieldCls} font-mono uppercase`}
+                  />
+                </Field>
+              )}
             </div>
             <Field label="Descripción del estilo">
               <textarea

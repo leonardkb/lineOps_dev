@@ -232,6 +232,7 @@ const newComponent = (label = "") => ({
   photo: null,
   ratio: "1",            // piezas de esta prenda por conjunto
   warehouseStock: "", extraQuantity: "",
+  techPackNo: "",        // N° de tech pack de Nike (solo clientes Nike)
   autoFilling: false,
 });
 
@@ -331,10 +332,12 @@ export default function NuevaOrdenWizard() {
 
   // Cliente Nike -> activa el item code por línea (no lo apaga si se cambia de
   // cliente: lo ya capturado no se pierde, el merchant lo apaga a mano).
+  // isNike también decide si se muestra/envía el N° de tech pack (paso 4).
+  const selectedCustomerObj = customers.find((x) => String(x.id) === String(customerId));
+  const isNike = !!selectedCustomerObj && /nike/i.test(`${selectedCustomerObj.name || ""} ${selectedCustomerObj.code || ""}`);
   useEffect(() => {
-    const c = customers.find((x) => String(x.id) === String(customerId));
-    if (c && /nike/i.test(`${c.name || ""} ${c.code || ""}`)) setUseItemCodes(true);
-  }, [customerId, customers]);
+    if (isNike) setUseItemCodes(true);
+  }, [isNike]);
 
   // Carga la pre-orden y precarga los pasos 1, 3 y 4 con lo que ya se sabe.
   useEffect(() => {
@@ -788,6 +791,8 @@ export default function NuevaOrdenWizard() {
           // pantalones.
           warehouseStock: parseFloat(c.warehouseStock) || 0,
           extraQuantity: parseFloat(c.extraQuantity) || 0,
+          // Tech pack de Nike: solo viaja si el cliente es Nike.
+          techPackNo: isNike ? ((c.techPackNo || "").trim() || null) : null,
           orders: ordersOf(plans[ci] || []),
         })),
         // Solo se usa cuando hay 2+ prendas.
@@ -796,6 +801,7 @@ export default function NuevaOrdenWizard() {
         // Compat con el cuerpo viejo (un solo estilo).
         warehouseStock: parseFloat(warehouseStock) || 0,
         extraQuantity: parseFloat(extraQuantity) || 0,
+        techPackNo: isNike ? ((primary.techPackNo || "").trim() || null) : null,
       };
       const res = await fetch(`${API_URL}/api/production-orders`, {
         method: "POST", headers: authHeaders(), body: JSON.stringify(payload),
@@ -1384,6 +1390,17 @@ export default function NuevaOrdenWizard() {
                       inputMode="decimal" placeholder="0"
                       className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
                   </div>
+                  {/* Solo Nike: N° de tech pack del estilo (uno por prenda). */}
+                  {isNike && (
+                    <div className="sm:col-span-2">
+                      <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wide">N° Tech pack Nike (opcional)</label>
+                      <input value={c.techPackNo}
+                        onChange={(e) => setComp(ci, { techPackNo: e.target.value.toUpperCase().slice(0, 40) })}
+                        placeholder="Ej. TP-123456"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm uppercase focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                      <p className="text-[11px] text-slate-400 mt-1">Se guarda en todas las POs de {isSet ? "esta prenda" : "este estilo"}.</p>
+                    </div>
+                  )}
                 </div>
               </SectionCard>
             ))}
@@ -1495,6 +1512,10 @@ export default function NuevaOrdenWizard() {
               <Info label="SAM"
                 value={components.map((c, i) => (isSet ? `${compName(c, i)} ${c.sam || "—"}` : `${c.sam || "—"} min`)).join(" · ")} />
               <Info label="Temporada" value={season || "—"} />
+              {isNike && (
+                <Info label="Tech pack Nike"
+                  value={components.map((c, i) => (isSet ? `${compName(c, i)} ${c.techPackNo || "—"}` : (c.techPackNo || "—"))).join(" · ")} />
+              )}
               <Info label="Total a producir" value={totalToProduce.toLocaleString()} />
             </div>
 

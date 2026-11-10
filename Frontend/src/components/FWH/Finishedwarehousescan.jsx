@@ -1,106 +1,52 @@
 // components/warehouse/FinishedWarehouseScan.jsx
 // Almacén de Producto Terminado — Escaneo de tickets (intake).
+// The line leader prints tickets whose QR carries the batch info. The operator
+// scans each ticket; the system records ticket, PO, work order, size, color,
+// date, SCAN TIME and pieces, and lets them check it in to inventory.
 //
-// New logic: the line leader prints tickets whose QR carries all the info of that
-// batch of pieces. Here the warehouse operator SCANS each physical ticket and the
-// system records + shows: número de ticket, PO, orden de trabajo, talla, color,
-// fecha, HORA DE ESCANEO y piezas.
+// Scanning: hardware scanner (types into the focused box + Enter, or a JSON QR
+// that ends in "}") or the camera (native BarcodeDetector when available).
 //
-// Scanning works two ways:
-//   1. Hardware scanner (recommended): a USB/Bluetooth 2D scanner acts as a
-//      keyboard — it "types" the QR text into the focused box and hits Enter.
-//      The box stays auto-focused so the operator just keeps scanning.
-//   2. Camera: uses the browser's native BarcodeDetector when available.
-//
-// Backend used:
-//   POST   /api/finished-warehouse/scan             { raw }  -> { ticket, duplicate }
-//   GET    /api/finished-warehouse/scanned-tickets           -> { tickets, totals }
+//   POST   /api/finished-warehouse/scan                          { raw } → { ticket, duplicate }
+//   GET    /api/finished-warehouse/scanned-tickets?date=&tz=&limit=       → { tickets, totals }
 //   DELETE /api/finished-warehouse/scanned-tickets/:id
+//   POST   /api/finished-warehouse/scanned-tickets/:id/check-in
+//   POST   /api/finished-warehouse/scanned-tickets/check-in-bulk           { ids } → { checkedIn, piecesAdded, tickets }
+//   POST   /api/finished-warehouse/scanned-tickets/:id/undo-check-in
 //
 //   <FinishedWarehouseScan onNavigate={setTab} />
-//
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   ScanLine, Camera, CameraOff, RefreshCw, Loader2, AlertCircle, CheckCircle2,
-  Trash2, Package, Boxes, ClipboardList, Clock, ArrowLeft, X, PackageCheck,
+  Trash2, Package, Boxes, ClipboardList, Clock, X, PackageCheck, RotateCcw, CalendarDays, FilterX, BarChart3,
 } from "lucide-react";
-import { API_URL } from "../../lib/masterCodeCatalog";
+import {
+  api, num, cx, beep, fmtTime, fmtDate, sizeText, notifyChange, useConfirm,
+  PageHeader, Card, CardHeader, Button, Pill, Stat, SegTabs, EmptyState, Loading, Banner, Modal, Th, Td,
+  PageFrame,
+} from "./finishedShared";
 
-const authHeaders = () => ({
-  "Content-Type": "application/json",
-  Authorization: `Bearer ${localStorage.getItem("token")}`,
-});
-
-// Une API_URL + path sin duplicar la base (evita http://host http://host/...).
-function apiUrl(path) {
-  const base = String(API_URL || "").replace(/\/+$/, "");
-  let p = String(path || "");
-  if (/^https?:\/\//i.test(p)) return p;          // ya es absoluta
-  if (base && p.startsWith(base)) return p;        // ya incluye la base
-  return base + (p.startsWith("/") ? p : `/${p}`);
-}
-
-async function api(path, opts = {}) {
-  const res = await fetch(apiUrl(path), { headers: authHeaders(), ...opts });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.success === false) throw new Error(data.error || `Error ${res.status}`);
-  return data;
-}
-
-const num = (v) => Math.round(Number(v) || 0).toLocaleString();
-
-// Hora de escaneo (local, con segundos) y fecha corta.
-function fmtTime(ts) {
-  if (!ts) return "—";
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return "—";
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-function fmtDate(v) {
-  if (!v) return "—";
-  const s = String(v);
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? s : d.toLocaleDateString();
-}
-const sizeText = (t) => {
-  const code = String(t.size_code ?? "").trim();
-  const lbl = String(t.size_label ?? "").trim();
-  if (code && lbl && lbl !== code) return `${code} · ${lbl}`;
-  return code || lbl || "—";
-};
-
-// Pitido corto de confirmación (WebAudio). ok=éxito, dup/err=tono distinto.
-function beep(kind = "ok") {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = beep._ctx || (beep._ctx = new Ctx());
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.connect(g); g.connect(ctx.destination);
-    o.type = "sine";
-    o.frequency.value = kind === "ok" ? 880 : kind === "dup" ? 520 : 300;
-    g.gain.value = 0.08;
-    o.start();
-    o.stop(ctx.currentTime + (kind === "ok" ? 0.09 : 0.18));
-  } catch { /* silencio si el navegador lo bloquea */ }
-}
+const tSize = (t) => sizeText(t.size_code, t.size_label);
+const TZ = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; } })();
+const localYmd = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const NO_FILTERS = { customer: "", order: "", style: "", sizes: [], hours: [], status: "" };
 
 export default function FinishedWarehouseScan({ onNavigate = null }) {
+  const confirm = useConfirm();
   const [rows, setRows] = useState([]);
-  const [totals, setTotals] = useState({ tickets: 0, pieces: 0, pending: 0, pendingPieces: 0, checkedIn: 0 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [flash, setFlash] = useState(null); // { kind: "ok"|"dup"|"err", ticket, msg }
-  const [onlyToday, setOnlyToday] = useState(true);
+  const [day, setDay] = useState("today");   // "today" | "all" | "YYYY-MM-DD" (scan date)
+  const [f, setF] = useState(NO_FILTERS);    // client-side filters over the loaded tickets
+  const [view, setView] = useState("tickets"); // "tickets" | "hours"
 
-  // Check-in a inventario: ticket pendiente de confirmación (null = cerrado) + estado.
   const [confirmTicket, setConfirmTicket] = useState(null);
   const [checkinBusy, setCheckinBusy] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   const inputRef = useRef(null);
   const submitLock = useRef(false);
@@ -109,20 +55,19 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
     setLoading(true);
     setError(null);
     try {
-      const qs = onlyToday ? `?date=${new Date().toISOString().slice(0, 10)}` : "";
-      const d = await api(`/api/finished-warehouse/scanned-tickets${qs}`);
+      const qs = new URLSearchParams({ limit: "1000", tz: TZ });
+      if (day !== "all") qs.set("date", day === "today" ? localYmd() : day);
+      const d = await api(`/api/finished-warehouse/scanned-tickets?${qs}`);
       setRows(d.tickets || []);
-      setTotals(d.totals || { tickets: 0, pieces: 0, pending: 0, pendingPieces: 0, checkedIn: 0 });
     } catch (e) {
       setError(e.message || "No se pudieron cargar los tickets");
     } finally {
       setLoading(false);
     }
-  }, [onlyToday]);
-
+  }, [day]);
   useEffect(() => { load(); }, [load]);
 
-  // Mantener el cuadro de escaneo enfocado: el escáner de hardware "teclea" ahí.
+  // Keep the scan box focused: the hardware scanner "types" there.
   const focusInput = useCallback(() => {
     const el = inputRef.current;
     if (el && document.activeElement !== el) el.focus();
@@ -145,27 +90,17 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
     setBusy(true);
     setValue("");
     try {
-      const d = await api("/api/finished-warehouse/scan", {
-        method: "POST",
-        body: JSON.stringify({ raw: text }),
-      });
+      const d = await api("/api/finished-warehouse/scan", { method: "POST", body: JSON.stringify({ raw: text }) });
       const t = d.ticket;
       if (d.duplicate) {
         beep("dup");
         setFlash({ kind: "dup", ticket: t, msg: "Ticket ya escaneado" });
-        // Resáltalo si está en la lista; no lo dupliques.
         if (t) setRows((prev) => prev.map((r) => (r.id === t.id ? { ...r, _flash: Date.now() } : r)));
       } else {
         beep("ok");
         setFlash({ kind: "ok", ticket: t, msg: "Ticket registrado" });
         setRows((prev) => [{ ...t, _flash: Date.now() }, ...prev.filter((r) => r.id !== t.id)]);
-        setTotals((prev) => ({
-          ...prev,
-          tickets: prev.tickets + 1,
-          pieces: prev.pieces + (Number(t.pieces) || 0),
-          pending: (prev.pending || 0) + (t.checked_in_at ? 0 : 1),
-          pendingPieces: (prev.pendingPieces || 0) + (t.checked_in_at ? 0 : (Number(t.pieces) || 0)),
-        }));
+        notifyChange();
       }
     } catch (e) {
       beep("err");
@@ -177,43 +112,29 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
     }
   }, [focusInput]);
 
-  // Auto-submit cuando el valor "se ve completo" (QR JSON termina en "}"), y
-  // también con Enter. Se limpia el valor al enviar para no duplicar.
+  // Auto-submit when a JSON QR looks complete; also on Enter.
   const onInputChange = (e) => {
     const v = e.target.value;
     setValue(v);
     const t = v.trim();
-    if (t.startsWith("{") && t.endsWith("}") && t.length > 8) {
-      submitScan(t);
-    }
+    if (t.startsWith("{") && t.endsWith("}") && t.length > 8) submitScan(t);
   };
   const onInputKeyDown = (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      submitScan(value);
-    }
+    if (e.key === "Enter") { e.preventDefault(); submitScan(value); }
   };
 
   const removeRow = async (row) => {
-    if (!window.confirm(`¿Quitar el ticket ${row.ticket_no || row.id} del registro?`)) return;
+    if (!(await confirm({ title: `¿Quitar el ticket ${row.folio || row.ticket_no || row.id}?`, text: "Se borra del registro de escaneos.", confirmLabel: "Quitar", danger: true }))) return focusInput();
     try {
       await api(`/api/finished-warehouse/scanned-tickets/${row.id}`, { method: "DELETE" });
       setRows((prev) => prev.filter((r) => r.id !== row.id));
-      setTotals((prev) => ({
-        ...prev,
-        tickets: Math.max(0, prev.tickets - 1),
-        pieces: Math.max(0, prev.pieces - (Number(row.pieces) || 0)),
-        pending: Math.max(0, (prev.pending || 0) - (row.checked_in_at ? 0 : 1)),
-        pendingPieces: Math.max(0, (prev.pendingPieces || 0) - (row.checked_in_at ? 0 : (Number(row.pieces) || 0))),
-        checkedIn: Math.max(0, (prev.checkedIn || 0) - (row.checked_in_at ? 1 : 0)),
-      }));
+      notifyChange();
     } catch (e) {
       setError(e.message || "No se pudo quitar el ticket");
-    }
+    } finally { focusInput(); }
   };
 
-  // Confirmar la entrada del ticket al inventario. Suma sus piezas al inventario
-  // en el servidor y marca el ticket como ingresado aquí.
+  // Check the ticket's pieces in to inventory.
   const doCheckIn = async () => {
     const t = confirmTicket;
     if (!t || checkinBusy) return;
@@ -223,18 +144,10 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
       const checkedAt = d.ticket?.checked_in_at || new Date().toISOString();
       const wasAlready = !!d.alreadyCheckedIn;
       setRows((prev) => prev.map((r) => (r.id === t.id ? { ...r, checked_in_at: checkedAt, _flash: Date.now() } : r)));
-      setTotals((prev) => ({
-        ...prev,
-        pending: Math.max(0, (prev.pending || 0) - (wasAlready ? 0 : 1)),
-        pendingPieces: Math.max(0, (prev.pendingPieces || 0) - (wasAlready ? 0 : (Number(t.pieces) || 0))),
-        checkedIn: (prev.checkedIn || 0) + (wasAlready ? 0 : 1),
-      }));
-      // Si el ticket ingresado es el que muestra la tarjeta de escaneo, refléjalo.
-      setFlash((f) => (f && f.ticket && f.ticket.id === t.id
-        ? { ...f, ticket: { ...f.ticket, checked_in_at: checkedAt } }
-        : f));
+      setFlash((f) => (f && f.ticket && f.ticket.id === t.id ? { ...f, ticket: { ...f.ticket, checked_in_at: checkedAt } } : f));
       beep("ok");
       setConfirmTicket(null);
+      notifyChange();
     } catch (e) {
       setError(e.message || "No se pudo registrar la entrada al inventario");
       setConfirmTicket(null);
@@ -244,59 +157,120 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
     }
   };
 
-  // Resumen por orden de trabajo (tickets + piezas).
-  const byOrder = useMemo(() => {
+  // Check in every pending ticket currently shown (respects the active filters).
+  const checkInAll = async () => {
+    const pending = shown.filter((r) => !r.checked_in_at);
+    if (!pending.length || bulkBusy) return;
+    const pieces = pending.reduce((t, r) => t + (Number(r.pieces) || 0), 0);
+    if (!(await confirm({
+      title: `¿Ingresar ${num(pending.length)} ticket(s) al inventario?`,
+      text: `Se sumarán ${num(pieces)} pzas al inventario de producto terminado${activeFilters ? " (solo los tickets que coinciden con los filtros)" : ""}.`,
+      confirmLabel: "Ingresar todos",
+    }))) return focusInput();
+    setBulkBusy(true);
+    try {
+      const d = await api("/api/finished-warehouse/scanned-tickets/check-in-bulk", {
+        method: "POST", body: JSON.stringify({ ids: pending.map((r) => r.id) }),
+      });
+      const byId = new Map((d.tickets || []).map((t) => [t.id, t]));
+      const now = Date.now();
+      setRows((prev) => prev.map((r) => (byId.has(r.id) ? { ...r, ...byId.get(r.id), _flash: now } : r)));
+      beep("ok");
+      setFlash({ kind: "ok", ticket: null, msg: `${num(d.checkedIn)} ticket(s) ingresados al inventario · ${num(d.piecesAdded)} pzas` });
+      notifyChange();
+    } catch (e) {
+      setError(e.message || "No se pudieron ingresar los tickets al inventario");
+    } finally {
+      setBulkBusy(false);
+      focusInput();
+    }
+  };
+
+  // Undo the check-in: back to pending, pieces subtracted from inventory.
+  const undoCheckIn = async (row) => {
+    if (!(await confirm({
+      title: `¿Sacar ${row.folio || row.ticket_no || row.id} del inventario?`,
+      text: `Se restarán ${num(row.pieces)} pzas y el ticket volverá a quedar pendiente de entrada.`,
+      confirmLabel: "Sacar del inventario", danger: true,
+    }))) return focusInput();
+    try {
+      await api(`/api/finished-warehouse/scanned-tickets/${row.id}/undo-check-in`, { method: "POST" });
+      setRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, checked_in_at: null, _flash: Date.now() } : r)));
+      setFlash((f) => (f && f.ticket && f.ticket.id === row.id ? { ...f, ticket: { ...f.ticket, checked_in_at: null } } : f));
+      notifyChange();
+    } catch (e) {
+      setError(e.message || "No se pudo deshacer la entrada al inventario");
+    } finally { focusInput(); }
+  };
+
+  // Interactive filters (client-side over what was loaded for the chosen day).
+  const fieldOf = {
+    customer: (r) => r.customer_name || r.customer_code || "—",
+    order: (r) => r.work_order_no || "—",
+    style: (r) => r.style || "—",
+    size: (r) => String(r.size_code ?? "").trim() || "—",
+    hour: (r) => { const d = new Date(r.scanned_at); return isNaN(d.getTime()) ? -1 : d.getHours(); },
+    status: (r) => (r.checked_in_at ? "in" : "pending"),
+  };
+  const matches = (r, skip) => (
+    (skip === "customer" || !f.customer || fieldOf.customer(r) === f.customer) &&
+    (skip === "order" || !f.order || fieldOf.order(r) === f.order) &&
+    (skip === "style" || !f.style || fieldOf.style(r) === f.style) &&
+    (skip === "size" || !f.sizes.length || f.sizes.includes(fieldOf.size(r))) &&
+    (skip === "hour" || !f.hours.length || f.hours.includes(fieldOf.hour(r))) &&
+    (skip === "status" || !f.status || fieldOf.status(r) === f.status)
+  );
+  const shown = useMemo(() => rows.filter((r) => matches(r, null)), [rows, f]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Options for each filter, counted with the OTHER filters applied (faceted).
+  const facet = (key) => {
     const m = new Map();
     for (const r of rows) {
-      const k = r.work_order_no || "—";
-      const cur = m.get(k) || { wo: k, tickets: 0, pieces: 0 };
-      cur.tickets += 1;
-      cur.pieces += Number(r.pieces) || 0;
-      m.set(k, cur);
+      if (!matches(r, key)) continue;
+      const k = fieldOf[key](r);
+      const c = m.get(k) || { key: k, tickets: 0, pieces: 0 };
+      c.tickets += 1; c.pieces += Number(r.pieces) || 0;
+      m.set(k, c);
     }
-    return [...m.values()].sort((a, b) => b.pieces - a.pieces);
-  }, [rows]);
+    return m;
+  };
+  const facets = useMemo(() => ({
+    customer: [...facet("customer").values()].sort((a, b) => b.pieces - a.pieces),
+    order: [...facet("order").values()].sort((a, b) => b.pieces - a.pieces),
+    style: [...facet("style").values()].sort((a, b) => b.pieces - a.pieces),
+    size: [...facet("size").values()].sort((a, b) => String(a.key).localeCompare(String(b.key), "es", { numeric: true })),
+    hour: facet("hour"),
+    status: facet("status"),
+  }), [rows, f]); // eslint-disable-line react-hooks/exhaustive-deps
+  const activeFilters = (f.customer ? 1 : 0) + (f.order ? 1 : 0) + (f.style ? 1 : 0) + (f.sizes.length ? 1 : 0) + (f.hours.length ? 1 : 0) + (f.status ? 1 : 0);
+
+  const totals = useMemo(() => shown.reduce((t, r) => {
+    const p = Number(r.pieces) || 0;
+    t.tickets += 1; t.pieces += p;
+    if (!r.checked_in_at) { t.pending += 1; t.pendingPieces += p; }
+    t.orders.add(r.work_order_no || "—");
+    return t;
+  }, { tickets: 0, pieces: 0, pending: 0, pendingPieces: 0, orders: new Set() }), [shown]);
+  const dayLabel = day === "today" ? "hoy" : day === "all" ? "" : `del ${day}`;
+
+  const isFresh = (r) => r._flash && Date.now() - r._flash < 2500;
+  const pendingShown = totals.pending;
 
   return (
-    <div className="max-w-6xl mx-auto p-5 space-y-5" onClick={focusInput}>
-      <header className="flex items-center gap-3">
-        {onNavigate && (
-          <button
-            onClick={() => onNavigate("dashboard")}
-            className="inline-flex items-center justify-center w-9 h-9 rounded-lg border text-gray-600 hover:bg-gray-50"
-            title="Volver al tablero"
-          >
-            <ArrowLeft className="w-4 h-4" />
-          </button>
-        )}
-        <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center">
-          <ScanLine className="w-5 h-5" />
-        </div>
-        <div className="min-w-0">
-          <h1 className="text-lg font-semibold text-gray-900">Escaneo de tickets</h1>
-          <p className="text-sm text-gray-500">Escanee cada ticket de producción; el sistema registra su información y la hora de escaneo.</p>
-        </div>
-        {onNavigate && (
-          <button
-            onClick={() => onNavigate("inventario")}
-            className="ml-auto inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50"
-          >
-            <Boxes className="w-4 h-4" /> Inventario
-          </button>
-        )}
-        <button
-          onClick={load}
-          className={`${onNavigate ? "" : "ml-auto "}inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50`}
-        >
-          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Actualizar
-        </button>
-      </header>
+    <PageFrame onClick={focusInput}>
+      <PageHeader
+        title="Escaneo de tickets"
+        subtitle="Escanee cada ticket de producción e ingréselo al inventario."
+        actions={<>
+          {onNavigate && <Button variant="secondary" icon={Boxes} onClick={() => onNavigate("inventario")} className="hidden sm:inline-flex">Inventario</Button>}
+          <Button variant="secondary" icon={RefreshCw} loading={loading} onClick={load}>Actualizar</Button>
+        </>}
+      />
 
-      {/* Scan box + camera */}
-      <section className="bg-white rounded-xl border shadow-sm p-4 space-y-3">
-        <div className="flex items-center gap-3 flex-wrap">
-          <div className="relative flex-1 min-w-[240px]">
-            <ScanLine className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+      {/* Scanner */}
+      <Card className="p-4 sm:p-5 space-y-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="relative flex-1 min-w-[220px]">
+            <span className={cx("absolute left-3.5 top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full", busy ? "bg-amber-400 animate-pulse" : "bg-emerald-500")} />
             <input
               ref={inputRef}
               value={value}
@@ -305,277 +279,420 @@ export default function FinishedWarehouseScan({ onNavigate = null }) {
               autoFocus
               inputMode="text"
               placeholder="Escanee un ticket o pegue el código y presione Enter…"
-              className="w-full pl-9 pr-3 py-2.5 rounded-lg border border-gray-300 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              className="w-full pl-9 pr-9 py-3 rounded-xl bg-white ring-2 ring-inset ring-indigo-500/70 text-sm font-mono placeholder:font-sans placeholder:text-slate-400 focus:outline-none focus:ring-indigo-600"
             />
             {busy && <Loader2 className="w-4 h-4 text-indigo-500 animate-spin absolute right-3 top-1/2 -translate-y-1/2" />}
           </div>
-          <button
-            onClick={() => submitScan(value)}
-            disabled={busy || !value.trim()}
-            className="inline-flex items-center gap-2 px-3 py-2.5 rounded-lg bg-gray-900 text-white text-sm font-medium disabled:bg-gray-300"
-          >
-            Registrar
-          </button>
+          <Button size="lg" className="py-2.5" disabled={busy || !value.trim()} onClick={() => submitScan(value)}>Registrar</Button>
           <CameraScanner onScan={submitScan} />
         </div>
 
-        {/* Last scan feedback */}
         {flash && (
-          <div
-            className={`rounded-lg px-3 py-2.5 text-sm flex items-start gap-2 ${
-              flash.kind === "ok" ? "bg-emerald-50 text-emerald-800"
-              : flash.kind === "dup" ? "bg-amber-50 text-amber-800"
-              : "bg-red-50 text-red-700"
-            }`}
-          >
-            {flash.kind === "ok" ? <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
-              : <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />}
-            <div className="min-w-0">
-              <div className="font-medium">{flash.msg}</div>
+          <div className={cx("rounded-xl px-4 py-3 ring-1 ring-inset flex items-start gap-3",
+            flash.kind === "ok" ? "bg-emerald-50 text-emerald-800 ring-emerald-200"
+              : flash.kind === "dup" ? "bg-amber-50 text-amber-800 ring-amber-200"
+                : "bg-red-50 text-red-700 ring-red-200")}>
+            {flash.kind === "ok" ? <CheckCircle2 className="w-5 h-5 mt-0.5 shrink-0" /> : <AlertCircle className="w-5 h-5 mt-0.5 shrink-0" />}
+            <div className="min-w-0 flex-1">
+              <div className="text-base font-semibold">{flash.msg}</div>
               {flash.ticket && (
-                <div className="text-xs mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 font-mono">
+                <div className="text-xs mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono">
                   <span className="font-semibold">{flash.ticket.folio || flash.ticket.ticket_no || "—"}</span>
                   {flash.ticket.customer_name && <span>{flash.ticket.customer_name}</span>}
                   <span>OT {flash.ticket.work_order_no || "—"}</span>
+                  {flash.ticket.style && <span>Estilo {flash.ticket.style}</span>}
                   <span>PO {flash.ticket.customer_po || "—"}</span>
-                  <span>{sizeText(flash.ticket)}</span>
+                  <span>{tSize(flash.ticket)}</span>
                   <span>{flash.ticket.color || "—"}</span>
-                  <span>{num(flash.ticket.pieces)} pzas</span>
+                  <span className="font-semibold">{num(flash.ticket.pieces)} pzas</span>
                 </div>
               )}
-
-              {/* Check-in a inventario, justo después de un escaneo correcto. */}
               {flash.ticket && flash.kind !== "err" && (
-                flash.ticket.checked_in_at ? (
-                  <div className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700">
-                    <PackageCheck className="w-4 h-4" /> Ya está en inventario
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => setConfirmTicket(flash.ticket)}
-                    className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-700"
-                  >
-                    <PackageCheck className="w-4 h-4" /> Ingresar a inventario
-                  </button>
-                )
+                flash.ticket.checked_in_at
+                  ? <div className="mt-2"><Pill tone="emerald" icon={PackageCheck}>Ya está en inventario</Pill></div>
+                  : <Button variant="success" size="sm" icon={PackageCheck} className="mt-2" onClick={() => setConfirmTicket(flash.ticket)}>Ingresar a inventario</Button>
               )}
             </div>
-            <button onClick={() => setFlash(null)} className="ml-auto text-current/60 hover:text-current">
-              <X className="w-4 h-4" />
-            </button>
+            <button onClick={() => setFlash(null)} className="opacity-60 hover:opacity-100" aria-label="Cerrar"><X className="w-4 h-4" /></button>
           </div>
         )}
-      </section>
+      </Card>
 
-      {/* Summary tiles */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <Tile icon={ClipboardList} label={onlyToday ? "Tickets hoy" : "Tickets"} value={totals.tickets} accent="indigo" />
-        <Tile icon={Package} label="Piezas escaneadas" value={totals.pieces} accent="emerald" />
-        <Tile icon={PackageCheck} label="Pendientes de entrada" value={totals.pending} accent="amber" />
-        <Tile icon={Boxes} label="Órdenes distintas" value={byOrder.length} accent="gray" />
-        <div className="bg-white rounded-xl border shadow-sm p-3 flex items-center">
-          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={onlyToday}
-              onChange={(e) => setOnlyToday(e.target.checked)}
-              className="w-4 h-4 accent-indigo-600"
-            />
-            Solo hoy
-          </label>
-        </div>
+      {/* Stats */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <Stat icon={ClipboardList} label={`Tickets ${dayLabel}`.trim()} value={totals.tickets} hint={activeFilters ? `de ${num(rows.length)} · con filtros` : null} tone="indigo" />
+        <Stat icon={Package} label="Piezas escaneadas" value={totals.pieces} tone="emerald" />
+        <Stat icon={PackageCheck} label="Pendientes de entrada" value={totals.pending} hint={`${num(totals.pendingPieces)} pzas`} tone="amber" />
+        <Stat icon={Boxes} label="Órdenes distintas" value={totals.orders.size} />
       </div>
 
-      {/* Per-order summary */}
-      {byOrder.length > 0 && (
-        <div className="flex items-center gap-2 flex-wrap">
-          {byOrder.map((o) => (
-            <span key={o.wo} className="inline-flex items-center gap-1.5 text-xs rounded-lg border border-gray-100 bg-gray-50 px-2 py-1">
-              <span className="font-medium text-gray-700">OT {o.wo}</span>
-              <span className="text-gray-300">·</span>
-              <span className="font-mono text-gray-900">{num(o.pieces)} pzas</span>
-              <span className="text-gray-400">({o.tickets} tkt)</span>
-            </span>
-          ))}
+      {/* Tickets */}
+      <Card className="overflow-hidden">
+        <CardHeader
+          icon={ScanLine}
+          title="Tickets escaneados"
+          subtitle={activeFilters ? `${num(shown.length)} de ${num(rows.length)} registro(s)` : `${num(rows.length)} registro(s)${dayLabel ? ` ${dayLabel}` : ""}`}
+          actions={<>
+            {activeFilters > 0 && <Button size="sm" variant="ghost" icon={FilterX} onClick={() => setF(NO_FILTERS)}>Quitar filtros ({activeFilters})</Button>}
+            <Button size="sm" variant="success" icon={PackageCheck} loading={bulkBusy} disabled={!pendingShown || loading}
+              onClick={(e) => { e.stopPropagation(); checkInAll(); }}
+              title={activeFilters ? "Ingresar al inventario los tickets pendientes que coinciden con los filtros" : "Ingresar al inventario todos los tickets pendientes"}>
+              Check-in a todos{pendingShown ? ` (${num(pendingShown)})` : ""}
+            </Button>
+          </>}
+        />
+        <div className="px-5 pt-3 pb-3 border-b border-slate-100" onClick={(e) => e.stopPropagation()}>
+          <SegTabs
+            value={view}
+            onChange={setView}
+            tabs={[
+              { key: "tickets", label: "Tickets", icon: ClipboardList, count: shown.length },
+              { key: "hours", label: "Hora de escaneo", icon: BarChart3, count: f.hours.length || undefined },
+            ]}
+          />
         </div>
-      )}
-
-      {/* Scanned tickets table */}
-      <section className="bg-white rounded-xl border shadow-sm overflow-hidden">
-        <div className="px-4 py-3 border-b flex items-center gap-2">
-          <ScanLine className="w-4 h-4 text-gray-500" />
-          <h2 className="text-sm font-semibold text-gray-800">Tickets escaneados</h2>
-          <span className="text-xs text-gray-400">{rows.length} registro(s)</span>
-        </div>
+        <FilterBar day={day} setDay={setDay} f={f} setF={setF} facets={facets} showHours={view === "tickets"} />
 
         {error ? (
-          <div className="p-4 text-sm text-amber-700 bg-amber-50 flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0" /> {error}
-          </div>
+          <div className="p-5"><Banner kind="err" onClose={() => setError(null)}>{error}</Banner></div>
         ) : loading ? (
-          <div className="p-8 text-center text-gray-400 text-sm flex items-center justify-center gap-2">
-            <Loader2 className="w-4 h-4 animate-spin" /> Cargando…
-          </div>
+          <Loading />
         ) : rows.length === 0 ? (
-          <div className="p-8 text-center text-gray-400 text-sm">
-            Aún no se ha escaneado ningún ticket{onlyToday ? " hoy" : ""}. Escanee uno para empezar.
-          </div>
+          <EmptyState icon={ScanLine} title="Sin tickets" text={`Aún no se ha escaneado ningún ticket${dayLabel ? ` ${dayLabel}` : ""}. Escanee uno para empezar.`} />
+        ) : view === "hours" ? (
+          <HourView f={f} setF={setF} facets={facets} onShowTickets={() => setView("tickets")} />
+        ) : shown.length === 0 ? (
+          <EmptyState icon={FilterX} title="Ningún ticket coincide" text="Cambie o quite los filtros." action={<Button variant="secondary" size="sm" onClick={() => setF(NO_FILTERS)}>Quitar filtros</Button>} />
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm whitespace-nowrap">
-              <thead>
-                <tr className="text-left text-xs text-gray-500 border-b bg-gray-50/60">
-                  <th className="px-3 py-2 font-medium">Ticket</th>
-                  <th className="px-3 py-2 font-medium">Cliente</th>
-                  <th className="px-3 py-2 font-medium">Orden</th>
-                  <th className="px-3 py-2 font-medium">PO</th>
-                  <th className="px-3 py-2 font-medium">Talla</th>
-                  <th className="px-3 py-2 font-medium">Color</th>
-                  <th className="px-3 py-2 font-medium">Fecha</th>
-                  <th className="px-3 py-2 font-medium">Hora escaneo</th>
-                  <th className="px-3 py-2 font-medium text-right">Piezas</th>
-                  <th className="px-3 py-2 font-medium">Estado</th>
-                  <th className="px-3 py-2" />
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {rows.map((r) => (
-                  <tr
-                    key={r.id}
-                    className={`transition-colors ${r._flash && Date.now() - r._flash < 2500 ? "bg-emerald-50" : "hover:bg-gray-50"}`}
-                  >
-                    <td
-                      className="px-3 py-2 font-mono font-semibold text-gray-900"
-                      title={r.ticket_no ? `Ticket impreso: ${r.ticket_no}` : undefined}
-                    >
-                      {r.folio || r.ticket_no || "—"}
-                    </td>
-                    <td className="px-3 py-2 text-gray-700">{r.customer_name || r.customer_code || "—"}</td>
-                    <td className="px-3 py-2 font-mono">{r.work_order_no || "—"}</td>
-                    <td className="px-3 py-2 font-mono">{r.customer_po || "—"}</td>
-                    <td className="px-3 py-2">{sizeText(r)}</td>
-                    <td className="px-3 py-2">{r.color || "—"}</td>
-                    <td className="px-3 py-2 text-gray-600">{fmtDate(r.production_date)}</td>
-                    <td className="px-3 py-2 text-gray-600">
-                      <span className="inline-flex items-center gap-1">
-                        <Clock className="w-3 h-3 text-gray-400" />{fmtTime(r.scanned_at)}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">{num(r.pieces)}</td>
-                    <td className="px-3 py-2">
-                      {r.checked_in_at ? (
-                        <span className="inline-flex items-center gap-1 text-xs rounded-full px-2 py-0.5 font-medium bg-emerald-50 text-emerald-700">
-                          <PackageCheck className="w-3 h-3" /> En inventario
-                        </span>
-                      ) : (
-                        <button
-                          onClick={() => setConfirmTicket(r)}
-                          className="inline-flex items-center gap-1 text-xs rounded-lg px-2 py-1 font-medium bg-emerald-600 text-white hover:bg-emerald-700"
-                          title="Ingresar las piezas de este ticket al inventario"
-                        >
-                          <PackageCheck className="w-3.5 h-3.5" /> Check-in
-                        </button>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      <button
-                        onClick={() => removeRow(r)}
-                        disabled={!!r.checked_in_at}
-                        className="text-gray-300 hover:text-red-500 disabled:opacity-30 disabled:hover:text-gray-300"
-                        title={r.checked_in_at ? "Ya ingresado; no se puede quitar" : "Quitar ticket"}
-                      >
+          <>
+            {/* Phone / PDA: cards */}
+            <ul className="lg:hidden divide-y divide-slate-100">
+              {shown.map((r) => (
+                <li key={r.id} className={cx("px-4 py-3 transition-colors", isFresh(r) && "bg-emerald-50")}>
+                  <div className="flex items-start gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-mono font-semibold text-slate-900">{r.folio || r.ticket_no || "—"}</div>
+                      <div className="text-xs text-slate-500 truncate">OT {r.work_order_no || "—"}{r.style ? ` · ${r.style}` : ""} · {tSize(r)} · {r.color || "—"}</div>
+                      <div className="text-[11px] text-slate-400 flex items-center gap-1 mt-0.5"><Clock className="w-3 h-3" />{fmtTime(r.scanned_at)}</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="font-semibold text-slate-900 tabular-nums">{num(r.pieces)} pzas</div>
+                    </div>
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <TicketStatus r={r} onCheckIn={() => setConfirmTicket(r)} onUndo={() => undoCheckIn(r)} />
+                    {!r.checked_in_at && (
+                      <button onClick={() => removeRow(r)} className="ml-auto p-2 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50" aria-label="Quitar ticket">
                         <Trash2 className="w-4 h-4" />
                       </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr className="border-t bg-gray-50/60 text-sm">
-                  <td className="px-3 py-2 font-medium text-gray-500" colSpan={8}>Total</td>
-                  <td className="px-3 py-2 text-right font-mono font-semibold text-gray-900">
-                    {num(rows.reduce((s, r) => s + (Number(r.pieces) || 0), 0))}
-                  </td>
-                  <td />
-                  <td />
-                </tr>
-              </tfoot>
-            </table>
-          </div>
-        )}
-      </section>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
 
-      {/* Verificación de entrada a inventario */}
-      {confirmTicket && (
-        <CheckInModal
-          ticket={confirmTicket}
-          busy={checkinBusy}
-          onConfirm={doCheckIn}
-          onCancel={() => !checkinBusy && setConfirmTicket(null)}
-        />
+            {/* Desktop: table */}
+            <div className="hidden lg:block overflow-x-auto max-h-[60vh]">
+              <table className="w-full text-sm">
+                <thead className="bg-slate-50 sticky top-0 z-10">
+                  <tr>
+                    <Th>Ticket</Th><Th>Cliente</Th><Th>Orden</Th><Th>Estilo</Th><Th>PO</Th><Th>Talla</Th><Th>Color</Th>
+                    <Th>Fecha</Th><Th>Hora escaneo</Th><Th right>Piezas</Th><Th>Estado</Th><Th />
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {shown.map((r) => (
+                    <tr key={r.id} className={cx("transition-colors", isFresh(r) ? "bg-emerald-50" : "hover:bg-slate-50")}>
+                      <Td mono strong title={r.ticket_no ? `Ticket impreso: ${r.ticket_no}` : undefined}>{r.folio || r.ticket_no || "—"}</Td>
+                      <Td>{r.customer_name || r.customer_code || "—"}</Td>
+                      <Td mono>{r.work_order_no || "—"}</Td>
+                      <Td>{r.style || "—"}</Td>
+                      <Td mono>{r.customer_po || "—"}</Td>
+                      <Td>{tSize(r)}</Td>
+                      <Td>{r.color || "—"}</Td>
+                      <Td className="text-slate-500">{fmtDate(r.production_date)}</Td>
+                      <Td className="text-slate-500"><span className="inline-flex items-center gap-1"><Clock className="w-3 h-3 text-slate-400" />{fmtTime(r.scanned_at)}</span></Td>
+                      <Td right strong>{num(r.pieces)}</Td>
+                      <Td><TicketStatus r={r} onCheckIn={() => setConfirmTicket(r)} onUndo={() => undoCheckIn(r)} /></Td>
+                      <Td right>
+                        <button
+                          onClick={() => removeRow(r)}
+                          disabled={!!r.checked_in_at}
+                          className="p-1.5 rounded-lg text-slate-300 hover:text-red-600 hover:bg-red-50 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-slate-300"
+                          title={r.checked_in_at ? "Ya ingresado; no se puede quitar" : "Quitar ticket"}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </Td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="bg-slate-50 sticky bottom-0">
+                  <tr className="border-t border-slate-200">
+                    <Td colSpan={9} className="font-medium text-slate-500">Total</Td>
+                    <Td right strong>{num(totals.pieces)}</Td>
+                    <Td /><Td />
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </>
+        )}
+      </Card>
+
+      <Modal
+        open={!!confirmTicket}
+        onClose={() => !checkinBusy && setConfirmTicket(null)}
+        title="Ingresar a inventario"
+        icon={PackageCheck}
+        tone="emerald"
+        size="sm"
+        footer={<>
+          <Button variant="secondary" disabled={checkinBusy} onClick={() => setConfirmTicket(null)}>Cancelar</Button>
+          <Button variant="success" icon={CheckCircle2} loading={checkinBusy} onClick={doCheckIn}>Ingresar</Button>
+        </>}
+      >
+        {confirmTicket && (
+          <>
+            <p className="text-sm text-slate-600">Se sumarán <b className="text-slate-900">{num(confirmTicket.pieces)}</b> pzas al inventario de producto terminado.</p>
+            <div className="mt-3 rounded-xl ring-1 ring-inset ring-slate-200 bg-slate-50 px-3 py-2 text-xs font-mono text-slate-700 flex flex-wrap gap-x-3 gap-y-0.5">
+              <span className="font-semibold text-slate-900">{confirmTicket.folio || confirmTicket.ticket_no || "—"}</span>
+              {confirmTicket.customer_name && <span>{confirmTicket.customer_name}</span>}
+              <span>OT {confirmTicket.work_order_no || "—"}</span>
+              {confirmTicket.style && <span>Estilo {confirmTicket.style}</span>}
+              <span>PO {confirmTicket.customer_po || "—"}</span>
+              <span>{tSize(confirmTicket)}</span>
+              <span>{confirmTicket.color || "—"}</span>
+            </div>
+          </>
+        )}
+      </Modal>
+    </PageFrame>
+  );
+}
+
+// Filters: scan day, client, order, style, status, size chips and an hour histogram.
+function FilterBar({ day, setDay, f, setF, facets, showHours }) {
+  const set = (patch) => setF((p) => ({ ...p, ...patch }));
+  const toggle = (key, v) => setF((p) => ({ ...p, [key]: p[key].includes(v) ? p[key].filter((x) => x !== v) : [...p[key], v] }));
+  const isDate = day !== "today" && day !== "all";
+  const pend = facets.status.get("pending")?.tickets || 0;
+  const inv = facets.status.get("in")?.tickets || 0;
+
+  return (
+    <div className="px-5 py-4 border-b border-slate-100 space-y-4 bg-slate-50/40" onClick={(e) => e.stopPropagation()}>
+      <div className="flex flex-wrap items-end gap-3">
+        <Field label="Fecha de escaneo">
+          <div className="flex items-center gap-2">
+            <SegTabs
+              value={isDate ? "" : day}
+              onChange={setDay}
+              tabs={[{ key: "today", label: "Hoy", icon: CalendarDays }, { key: "all", label: "Todos" }]}
+            />
+            <input
+              type="date"
+              value={isDate ? day : ""}
+              max={localYmd()}
+              onChange={(e) => setDay(e.target.value || "today")}
+              className={cx("h-9 rounded-lg px-2.5 text-sm ring-1 ring-inset focus:outline-none focus:ring-2 focus:ring-indigo-500",
+                isDate ? "ring-indigo-400 bg-indigo-50 text-indigo-800" : "ring-slate-300 bg-white text-slate-700")}
+            />
+          </div>
+        </Field>
+        <Select label="Cliente" value={f.customer} onChange={(v) => set({ customer: v })} options={facets.customer} />
+        <Select label="Orden" value={f.order} onChange={(v) => set({ order: v })} options={facets.order} mono />
+        <Select label="Estilo" value={f.style} onChange={(v) => set({ style: v })} options={facets.style} />
+        <Field label="Estado">
+          <SegTabs
+            value={f.status || "all"}
+            onChange={(k) => set({ status: k === "all" ? "" : k })}
+            tabs={[
+              { key: "all", label: "Todos" },
+              { key: "pending", label: "Pendientes", count: pend },
+              { key: "in", label: "En inventario", count: inv },
+            ]}
+          />
+        </Field>
+      </div>
+
+      <Field label="Talla">
+        <div className="flex flex-wrap gap-1.5">
+          {facets.size.length === 0 && <span className="text-xs text-slate-400">—</span>}
+          {facets.size.map((o) => {
+            const on = f.sizes.includes(o.key);
+            return (
+              <button key={o.key} type="button" onClick={() => toggle("sizes", o.key)}
+                className={cx("rounded-lg px-2.5 py-1 text-xs ring-1 ring-inset transition",
+                  on ? "bg-indigo-600 text-white ring-indigo-600" : "bg-white text-slate-700 ring-slate-300 hover:ring-indigo-300")}>
+                <span className="font-medium">{sizeText(o.key)}</span>
+                <span className={cx("ml-1.5 tabular-nums", on ? "text-indigo-100" : "text-slate-400")}>{num(o.pieces)}</span>
+              </button>
+            );
+          })}
+          {/* Selected sizes that no longer match the other filters stay visible so they can be cleared. */}
+          {f.sizes.filter((k) => !facets.size.some((o) => o.key === k)).map((k) => (
+            <button key={k} type="button" onClick={() => toggle("sizes", k)} className="rounded-lg px-2.5 py-1 text-xs bg-indigo-600 text-white">{sizeText(k)} · 0</button>
+          ))}
+        </div>
+      </Field>
+
+      {/* The hour histogram lives in its own tab; here we only show what's selected so it can be cleared. */}
+      {showHours && f.hours.length > 0 && (
+        <Field label="Hora de escaneo">
+          <div className="flex flex-wrap gap-1.5">
+            {[...f.hours].sort((a, b) => a - b).map((h) => (
+              <button key={h} type="button" onClick={() => toggle("hours", h)}
+                className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs bg-indigo-600 text-white hover:bg-indigo-700"
+                title="Quitar esta hora del filtro">
+                {hourLabel(h)}<X className="w-3 h-3" />
+              </button>
+            ))}
+          </div>
+        </Field>
       )}
     </div>
   );
 }
 
-// Modal de verificación: confirma que las piezas del ticket entren al inventario.
-function CheckInModal({ ticket, busy, onConfirm, onCancel }) {
+const hourLabel = (h) => `${String(h).padStart(2, "0")}:00`;
+
+// "Hora de escaneo" tab: pieces per scan hour. Click a bar (or a row) to filter the tickets.
+// Counts come from facets.hour, which ignores the hour filter itself, so every hour stays visible.
+function HourView({ f, setF, facets, onShowTickets }) {
+  const toggle = (h) => setF((p) => ({ ...p, hours: p.hours.includes(h) ? p.hours.filter((x) => x !== h) : [...p.hours, h] }));
+  const hours = facets.hour;
+  const present = [...hours.keys()].filter((h) => h >= 0);
+  const from = present.length ? Math.min(6, ...present) : 6;
+  const to = present.length ? Math.max(19, ...present) : 19;
+  const range = Array.from({ length: to - from + 1 }, (_, i) => from + i);
+  const max = Math.max(1, ...[...hours.values()].map((h) => h.pieces));
+  const total = present.reduce((t, h) => t + hours.get(h).pieces, 0);
+  const sel = f.hours.length;
+  const selPieces = f.hours.reduce((t, h) => t + (hours.get(h)?.pieces || 0), 0);
+  const listed = range.filter((h) => hours.get(h) || f.hours.includes(h));
+  let running = 0;
+
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      onClick={(e) => { e.stopPropagation(); onCancel(); }}
-    >
-      <div
-        className="w-full max-w-sm bg-white rounded-2xl shadow-xl overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-5 pt-5 pb-3 flex items-start gap-3">
-          <span className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
-            <PackageCheck className="w-5 h-5" />
-          </span>
-          <div className="min-w-0">
-            <h3 className="text-base font-semibold text-gray-900">Ingresar a inventario</h3>
-            <p className="text-sm text-gray-500 mt-0.5">
-              Se sumarán <b className="text-gray-900">{num(ticket.pieces)}</b> pzas al inventario de producto terminado.
-            </p>
-          </div>
-        </div>
+    <div className="p-5 space-y-5" onClick={(e) => e.stopPropagation()}>
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="text-sm text-slate-600 flex-1 min-w-[200px]">
+          {sel
+            ? <><b className="text-slate-900">{sel}</b> hora(s) seleccionada(s) · <b className="text-slate-900">{num(selPieces)}</b> pzas</>
+            : "Haga clic en una barra para filtrar los tickets por hora."}
+        </p>
+        {sel > 0 && <>
+          <Button size="sm" variant="ghost" icon={FilterX} onClick={() => setF((p) => ({ ...p, hours: [] }))}>Quitar horas</Button>
+          <Button size="sm" variant="secondary" icon={ClipboardList} onClick={onShowTickets}>Ver tickets</Button>
+        </>}
+      </div>
 
-        <div className="mx-5 mb-1 rounded-lg border bg-gray-50 px-3 py-2 text-xs font-mono text-gray-700 flex flex-wrap gap-x-3 gap-y-0.5">
-          <span className="font-semibold text-gray-900">{ticket.folio || ticket.ticket_no || "—"}</span>
-          {ticket.customer_name && <span>{ticket.customer_name}</span>}
-          <span>OT {ticket.work_order_no || "—"}</span>
-          <span>PO {ticket.customer_po || "—"}</span>
-          <span>{sizeText(ticket)}</span>
-          <span>{ticket.color || "—"}</span>
+      {/* Histogram */}
+      <div>
+        <div className="flex items-end gap-1 h-48">
+          {range.map((h) => {
+            const v = hours.get(h);
+            const on = f.hours.includes(h);
+            const pct = v ? Math.max(4, Math.round((v.pieces / max) * 100)) : 0;
+            return (
+              <button key={h} type="button" disabled={!v && !on} onClick={() => toggle(h)}
+                title={`${hourLabel(h)}–${String(h).padStart(2, "0")}:59 · ${num(v?.pieces)} pzas · ${num(v?.tickets)} ticket(s)`}
+                aria-pressed={on}
+                className="group flex-1 h-full flex flex-col justify-end items-center disabled:cursor-default focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 rounded">
+                {v && <span className={cx("mb-0.5 text-[10px] tabular-nums hidden sm:block", on ? "text-indigo-700 font-semibold" : "text-slate-400")}>{num(v.pieces)}</span>}
+                <div className={cx("w-full rounded-t transition",
+                  on ? "bg-indigo-600" : v ? (sel ? "bg-slate-300 group-hover:bg-indigo-300" : "bg-emerald-500 group-hover:bg-emerald-600") : "bg-slate-100")}
+                  style={{ height: v ? `${pct}%` : "3px" }} />
+              </button>
+            );
+          })}
         </div>
-
-        <div className="px-5 py-4 flex items-center justify-end gap-2">
-          <button
-            onClick={onCancel}
-            disabled={busy}
-            className="px-3 py-2 rounded-lg border text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-          >
-            Cancelar
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={busy}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 disabled:bg-emerald-300"
-          >
-            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} OK
-          </button>
+        <div className="mt-1 flex gap-1 text-[10px] text-slate-400 tabular-nums">
+          {range.map((h) => <div key={h} className={cx("flex-1 text-center", f.hours.includes(h) && "text-indigo-700 font-semibold")}>{h}</div>)}
         </div>
       </div>
+
+      {/* Per-hour breakdown */}
+      {listed.length === 0 ? (
+        <p className="text-sm text-slate-400">No hay escaneos que coincidan con los filtros.</p>
+      ) : (
+        <div className="overflow-x-auto rounded-xl ring-1 ring-inset ring-slate-200">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50">
+              <tr><Th>Hora</Th><Th right>Tickets</Th><Th right>Piezas</Th><Th right>% del total</Th><Th right>Acumulado</Th></tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {listed.map((h) => {
+                const v = hours.get(h) || { tickets: 0, pieces: 0 };
+                const on = f.hours.includes(h);
+                running += v.pieces;
+                return (
+                  <tr key={h} onClick={() => toggle(h)} className={cx("cursor-pointer", on ? "bg-indigo-50" : "hover:bg-slate-50")}>
+                    <Td mono strong={on}>{hourLabel(h)}–{String(h).padStart(2, "0")}:59</Td>
+                    <Td right>{num(v.tickets)}</Td>
+                    <Td right strong>{num(v.pieces)}</Td>
+                    <Td right className="text-slate-500">{total ? `${Math.round((v.pieces / total) * 100)}%` : "—"}</Td>
+                    <Td right className="text-slate-500">{num(running)}</Td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            <tfoot className="bg-slate-50">
+              <tr className="border-t border-slate-200">
+                <Td className="font-medium text-slate-500">Total</Td>
+                <Td right strong>{num(present.reduce((t, h) => t + hours.get(h).tickets, 0))}</Td>
+                <Td right strong>{num(total)}</Td>
+                <Td /><Td />
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Cámara: usa el BarcodeDetector nativo del navegador cuando está disponible.
-// Si no lo está (algunos navegadores), se oculta y el operador usa el escáner
-// de hardware o el cuadro de texto.
-// ---------------------------------------------------------------------------
+function Field({ label, children }) {
+  return (
+    <div className="min-w-0">
+      <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-slate-400">{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function Select({ label, value, onChange, options, mono }) {
+  const known = !value || options.some((o) => o.key === value);
+  return (
+    <Field label={label}>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={cx("h-9 max-w-[16rem] rounded-lg pl-2.5 pr-8 text-sm ring-1 ring-inset border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500",
+          value ? "ring-indigo-400 bg-indigo-50 text-indigo-800 font-medium" : "ring-slate-300 bg-white text-slate-700", mono && "font-mono")}
+      >
+        <option value="">Todos ({options.length})</option>
+        {!known && <option value={value}>{value} (0)</option>}
+        {options.map((o) => <option key={o.key} value={o.key}>{o.key} · {num(o.pieces)} pzas</option>)}
+      </select>
+    </Field>
+  );
+}
+
+function TicketStatus({ r, onCheckIn, onUndo }) {
+  if (r.checked_in_at) {
+    return (
+      <span className="inline-flex items-center gap-1.5">
+        <Pill tone="emerald" icon={PackageCheck}>En inventario</Pill>
+        <button onClick={onUndo} className="p-1 rounded-md text-slate-300 hover:text-amber-600 hover:bg-amber-50" title="Deshacer entrada (regresar a pendiente)">
+          <RotateCcw className="w-3.5 h-3.5" />
+        </button>
+      </span>
+    );
+  }
+  return <Button variant="success" size="sm" icon={PackageCheck} onClick={onCheckIn} title="Ingresar las piezas de este ticket al inventario">Check-in</Button>;
+}
+
+// Camera scanner (native BarcodeDetector). Hidden when the browser lacks it.
 function CameraScanner({ onScan }) {
   const [supported] = useState(() => typeof window !== "undefined" && "BarcodeDetector" in window);
   const [on, setOn] = useState(false);
@@ -588,29 +705,22 @@ function CameraScanner({ onScan }) {
   const stop = useCallback(() => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
     setOn(false);
   }, []);
-
   useEffect(() => () => stop(), [stop]);
 
   const start = useCallback(async () => {
     setErr(null);
     try {
       const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" } },
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } });
       streamRef.current = stream;
       setOn(true);
       const video = videoRef.current;
-      if (!video) return;
+      if (!video) { stop(); return; }
       video.srcObject = stream;
       await video.play();
-
       const tick = async () => {
         if (!streamRef.current) return;
         try {
@@ -618,13 +728,12 @@ function CameraScanner({ onScan }) {
           if (codes && codes.length) {
             const text = String(codes[0].rawValue || "").trim();
             const now = Date.now();
-            // Evita disparar el mismo QR muchas veces mientras sigue frente a la cámara.
             if (text && (text !== lastRef.current.text || now - lastRef.current.at > 2500)) {
               lastRef.current = { text, at: now };
               onScan(text);
             }
           }
-        } catch { /* frame sin código */ }
+        } catch { /* frame without a code */ }
         rafRef.current = requestAnimationFrame(tick);
       };
       rafRef.current = requestAnimationFrame(tick);
@@ -635,49 +744,22 @@ function CameraScanner({ onScan }) {
   }, [onScan, stop]);
 
   if (!supported) return null;
-
   return (
     <>
-      <button
-        onClick={() => (on ? stop() : start())}
-        className={`inline-flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-medium border ${
-          on ? "border-red-200 text-red-600 hover:bg-red-50" : "text-gray-700 hover:bg-gray-50"
-        }`}
-      >
-        {on ? <CameraOff className="w-4 h-4" /> : <Camera className="w-4 h-4" />}
+      <Button variant="secondary" size="lg" className={cx("py-2.5", on && "text-red-600 ring-red-200")} icon={on ? CameraOff : Camera} onClick={() => (on ? stop() : start())}>
         {on ? "Cerrar cámara" : "Cámara"}
-      </button>
-
-      {on && (
-        <div className="w-full mt-2">
-          <div className="relative w-full max-w-sm mx-auto rounded-xl overflow-hidden border bg-black">
+      </Button>
+      {/* The video stays mounted so start() can attach the stream right away. */}
+      <div className={cx("w-full mt-2", !on && "hidden")}>
+        <div>
+          <div className="relative w-full max-w-sm mx-auto rounded-2xl overflow-hidden bg-black">
             <video ref={videoRef} playsInline muted className="w-full h-auto block" />
-            <div className="pointer-events-none absolute inset-6 border-2 border-white/70 rounded-lg" />
+            <div className="pointer-events-none absolute inset-6 border-2 border-white/70 rounded-xl" />
           </div>
-          <p className="text-xs text-gray-400 text-center mt-1">Apunte la cámara al código QR del ticket.</p>
+          <p className="text-xs text-slate-400 text-center mt-1">Apunte la cámara al código QR del ticket.</p>
         </div>
-      )}
+      </div>
       {err && <p className="text-xs text-red-500 w-full">{err}</p>}
     </>
-  );
-}
-
-function Tile({ icon: Icon, label, value, accent = "gray" }) {
-  const accents = {
-    amber: "text-amber-600 bg-amber-50",
-    emerald: "text-emerald-600 bg-emerald-50",
-    indigo: "text-indigo-600 bg-indigo-50",
-    gray: "text-gray-600 bg-gray-100",
-  };
-  return (
-    <div className="bg-white rounded-xl border shadow-sm p-3">
-      <div className="flex items-center gap-2">
-        <span className={`w-7 h-7 rounded-lg flex items-center justify-center ${accents[accent] || accents.gray}`}>
-          {Icon && <Icon className="w-4 h-4" />}
-        </span>
-        <span className="text-xs text-gray-500">{label}</span>
-      </div>
-      <div className="mt-2 text-xl font-semibold text-gray-900">{num(value)}</div>
-    </div>
   );
 }

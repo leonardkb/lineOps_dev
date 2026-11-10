@@ -11,7 +11,9 @@
 //   • Estado de órdenes La MISMA vista que el planner (OrderStatus.jsx):
 //                       avance, entrega del merchant vs fin de plan, foto del
 //                       merchant, líneas y detalle por línea / día.
-//   • Tablero           El Plan Board del planner en modo consulta.
+//   • Tableros          UNA pestaña con 4 vistas (BoardsHub.jsx): Resumen plan,
+//                       Plan Board (consulta + candados), Resumen pronóstico y
+//                       Tablero de pronóstico (consulta).
 //   • Cierres           Solicitudes de permiso para completar órdenes por
 //                       debajo del umbral + alertas de órdenes cerradas por
 //                       planeación (OrderCloseApprovals.jsx / order-close.js).
@@ -23,13 +25,14 @@ import {
   ClipboardList, Truck, ShieldCheck, Bell,
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
-import PlanBoard from "./PlanBoard";
 import StyleEfficiencyApprovals from "./StyleEfficiencyApprovals";
 import NavCeo from "../NavCeo";
 // Same "Estado de Órdenes" screen the planner sees (photo, lines, per-day detail)
 import OrderStatus from "./OrderStatus";
 // Cierre manual de órdenes: permisos y alertas para el CEO
 import OrderCloseApprovals from "./OrderCloseApprovals";
+// Pestaña «Tableros»: resúmenes + tableros del plan y del pronóstico
+import BoardsHub from "./BoardsHub";
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
@@ -111,7 +114,6 @@ const orderStChip = (raw) => ORDER_ST[String(raw || "").toLowerCase()]
 
 export default function PlannerAnalytics() {
   const [tab, setTab] = useState("board");   // "board" | "orders" | "efficiency" | "sam" — abre en el tablero
-  const [boardVisited, setBoardVisited] = useState(true); // the board is the opening tab
 
   const [workOrders, setWorkOrders] = useState([]);
   const [lineRuns, setLineRuns] = useState([]);
@@ -172,7 +174,6 @@ export default function PlannerAnalytics() {
     return () => clearInterval(t);
   }, []);
 
-  useEffect(() => { if (tab === "board") setBoardVisited(true); }, [tab]);
   // Cambiar de pestaña limpia la búsqueda para no arrastrar un filtro que no aplica.
   useEffect(() => { setSearch(""); }, [tab]);
 
@@ -547,7 +548,7 @@ export default function PlannerAnalytics() {
           <div>
             <h1 className="text-lg sm:text-xl font-bold tracking-tight">Analíticas de Planeación</h1>
             <p className="text-xs text-gray-500">
-              {tab === "board" && "El tablero que armó planeación, en modo consulta."}
+              {tab === "board" && "Plan y pronóstico: resúmenes (piezas, avance, cuándo terminan, días que faltan) y sus tableros en modo consulta."}
               {tab === "orders" && "Estado, avance y fechas de entrega: merchant vs plan del planner."}
               {tab === "efficiency" && "Solicitudes de cambio de eficiencia por estilo del Plan Board, para aprobación del CEO."}
               {tab === "closes" && "Órdenes que planeación quiere completar: permisos por debajo del mínimo producido y alertas de cierre."}
@@ -555,12 +556,13 @@ export default function PlannerAnalytics() {
             </p>
           </div>
           {/* Orders tab brings its own summary bar (same as the planner's) */}
-          {tab !== "orders" && tab !== "closes" && <KpiStrip cards={activeKpis.cards} loading={loading} />}
+          {/* Orders and the boards hub bring their own KPIs */}
+          {tab !== "orders" && tab !== "closes" && tab !== "board" && <KpiStrip cards={activeKpis.cards} loading={loading} />}
         </div>
 
         <div className="max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8">
           <div role="tablist" className="flex gap-1 overflow-x-auto">
-            <Tab active={tab === "board"} onClick={() => setTab("board")} Icon={LayoutGrid}>Tablero del planner</Tab>
+            <Tab active={tab === "board"} onClick={() => setTab("board")} Icon={LayoutGrid}>Tableros: plan y pronóstico</Tab>
             <Tab active={tab === "orders"} onClick={() => setTab("orders")} Icon={ClipboardList}>Estado de órdenes</Tab>
             <Tab active={tab === "efficiency"} onClick={() => setTab("efficiency")} Icon={ShieldCheck}>Permisos de eficiencia</Tab>
             <Tab active={tab === "closes"} onClick={() => setTab("closes")} Icon={Bell}>
@@ -579,16 +581,13 @@ export default function PlannerAnalytics() {
       {/* Contenido */}
       <main className="flex-1 min-h-0">
         {tab === "board" ? (
-          <div className="h-full overflow-auto">
-            {boardVisited && (
-              <PlanBoard
-                readOnly
-                canLockWeeks
-                heading="Tablero del planner"
-                subheading="Vista de consulta. En la vista Semanal, use el candado junto a cada semana para bloquearla o desbloquearla: una semana bloqueada no la puede mover el planner."
-              />
-            )}
-          </div>
+          <BoardsHub
+            workOrders={workOrders}
+            assignments={assignments}
+            loading={loading}
+            errored={errored}
+            onRetry={() => setReloadKey((k) => k + 1)}
+          />
         ) : tab === "orders" ? (
           <div className="h-full max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-3">
             {/* Identical to Planificación Avanzada → Estado de Órdenes */}

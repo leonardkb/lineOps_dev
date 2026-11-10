@@ -1,1536 +1,1972 @@
-// fabric-warehouse.js
+// finished-warehouse.js
 // ---------------------------------------------------------------------------
-// Almacén de Tela (Fabric warehouse) module.
+// Almacén de Producto Terminado (Finished-goods warehouse) module.
 //
-// Same shape as finished-warehouse.js:
-//   const registerFabricWarehouse = require("./fabric-warehouse");
-//   registerFabricWarehouse(app, { authenticateToken, pool, setSchema });
-//   await registerFabricWarehouse.initSchema({ pool, setSchema });   // in runMigrations
+// Follows the same shape as work-orders.js:
+//   const registerFinishedWarehouse = require("./finished-warehouse");
+//   await registerFinishedWarehouse.initSchema({ pool, setSchema });
+//   registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
 //
-// Roll life cycle (fabric_rolls.status):
-//   requested     → pulled from Skytex and requested by Skyrina
-//   assigned      → container chosen (F01, parked on spot A01), waiting for the truck
-//   in_stock      → QR scanned on arrival, stored in its container
-//   at_inspection → sent to the fabric inspection team
-//   returned      → returned to the supplier
-//   cancelled     → request cancelled before arrival
+// Provides:
+//   • Pre-packing lists (draft) with boxes, auto-filled from a work order (PO).
+//   • Confirming a list pushes its boxes into finished_inventory (per SKU).
+//   • Inventory + a light dashboard.
 //
-// Every change writes one row in fabric_roll_movements; the inbound and outbound
-// reports are read from there.
-//
-// Skytex connection (.env):
-//   SKYTEX_API_URL      full URL of the endpoint that returns the rolls JSON
-//   SKYTEX_API_TOKEN    optional, sent as "Authorization: Bearer <token>"
-//   SKYTEX_API_KEY      optional, sent in the header SKYTEX_API_KEY_HEADER (default x-api-key)
-//   SKYTEX_PO_PARAM     optional, query param Skytex uses for the PO (default "po")
-//   FABRIC_AGING_DAYS   optional, days in stock before a roll is flagged (default 30)
-// Until the API is live, the screen also accepts the test JSON pasted or uploaded
-// (POST /api/fabric-warehouse/skytex/preview) and runs it through the same mapper.
+// Field mapping agreed with the team:
+//   PO  = work_orders.work_order_no      (our work order)
+//   MO  = work_orders.customer_po        (PO cliente)
+//   box_code default = "CT_KUBOT_STANDARD"
+//   gross/net weight default 0, encasement_qrcode left blank (system field).
 // ---------------------------------------------------------------------------
 
-const AGING_DAYS = Number(process.env.FABRIC_AGING_DAYS) || 30;
+const DEFAULT_BOX_CODE = "CT_KUBOT_STANDARD";
 
-// ---------------------------------------------------------------------------
-// Field mapping: the 23 fields agreed with Skytex. Each field accepts its Excel
-// header, its snake_case key and a few likely aliases (English/Spanish), compared
-// after removing accents, spaces and punctuation. Unknown keys are ignored but
-// the full original object is kept in fabric_rolls.raw.
-// ---------------------------------------------------------------------------
-const FIELDS = [
-  { key: "po_number", label: "Purchase order number", aliases: ["po", "ponumber", "pono", "purchaseorder", "purchaseorderno", "ordendecompra", "oc"] },
-  { key: "supplier", label: "Supplier", aliases: ["proveedor", "suppliername", "vendor"] },
-  { key: "supplier_code", label: "Supplier Code", aliases: ["codigoproveedor", "vendorcode"] },
-  { key: "roll_no", label: "Rollo de tela", aliases: ["roll", "rollno", "rollnumber", "rollo", "rollid", "numerorollo", "norollo", "rollodetela"] },
-  { key: "yards", label: "Yardas", aliases: ["yards", "yds", "yd", "yardage"], type: "number" },
-  { key: "meters", label: "Metros", aliases: ["meters", "metres", "mts", "mt"], type: "number" },
-  { key: "color", label: "Color", aliases: ["colour", "colorname"] },
-  { key: "lot", label: "Lote", aliases: ["lot", "lotno", "batch", "dyelot"] },
-  { key: "width", label: "Width", aliases: ["ancho"] },
-  { key: "width_unit", label: "Width Unit", aliases: ["unidadancho", "widthuom"] },
-  { key: "weight", label: "Weight", aliases: ["peso", "gsm"] },
-  { key: "composition", label: "Composition", aliases: ["composicion", "content"] },
-  { key: "month_buy", label: "Month Buy", aliases: ["mescompra", "buymonth"] },
-  { key: "fabric_item_number", label: "Fabric item number", aliases: ["itemnumber", "fabricitem", "fabriccode", "articulo"] },
-  { key: "fabric_name", label: "Fabric name", aliases: ["nombretela", "tela", "description"] },
-  { key: "fabric_type", label: "Tipo de tela", aliases: ["typedetela", "fabrictype", "tipo"] },
-  { key: "customer", label: "Cliente", aliases: ["client"] },
-  { key: "arrival_date", label: "Fecha de llegada", aliases: ["arrivaldate", "fechallegada", "eta"], type: "date" },
-  { key: "size", label: "Size", aliases: ["talla"] },
-  { key: "item_sku_code", label: "Item SKU code", aliases: ["sku", "skucode", "itemsku"] },
-  { key: "purchase_term", label: "Término de compra", aliases: ["purchaseterm", "incoterm", "terms"] },
-  { key: "import_ref", label: "Importación", aliases: ["import", "pedimento"] },
-  { key: "remarks", label: "Remarks", aliases: ["observaciones", "comentarios", "notes", "comments"] },
-];
-const FIELD_KEYS = FIELDS.map((f) => f.key);
+// Reused for the order-level "producido" total (production isn't tracked per size).
+const workOrders = require("./work-orders");
 
-const normKey = (s) =>
-  String(s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+// The columns that identify one finished-goods SKU. Confirming a list adds the
+// box quantity onto the matching SKU (or creates it).
+const SKU_FIELDS = ["customer_code", "po", "style", "color_code", "size_code", "sex", "fabric_code"];
+const skuKeyOf = (b) => SKU_FIELDS.map((f) => String(b[f] ?? "").trim()).join("|");
 
-const ALIAS = new Map();
-for (const f of FIELDS) {
-  for (const a of [f.key, f.label, ...f.aliases]) {
-    const k = normKey(a);
-    if (k && !ALIAS.has(k)) ALIAS.set(k, f);
-  }
-}
+// SheetJS is only needed for Excel export. Load it lazily so the module still
+// boots (and CSV export still works) if the package isn't installed yet.
+let XLSX = null;
+try { XLSX = require("xlsx"); } catch { /* run `npm install xlsx` to enable .xlsx/.xls */ }
 
-const str = (v) => {
-  if (v == null) return null;
-  const t = String(v).trim();
-  return t.length ? t : null;
+// Codigo de color = color + talla (e.g. color "NEG" + talla "M" -> "NEGM").
+const colorCodeOf = (color, talla) => `${String(color ?? "").trim()}${String(talla ?? "").trim()}`;
+
+// Size code -> printable label for the packing list. The DB stores only the code
+// (work_order_lines.talla / master_codes.talla); this maps it to the label the
+// customer expects. PARTIAL LIST — extend as new size codes appear. Any code not
+// found here falls back to printing the code itself, so a size is never blank.
+const SIZE_LABELS = {
+  "130": "xxxs",
+  "132": "xxs",
+  "134": "xs",
+  "136": "(S)",
+  "138": "(M)",
+  "140": "L",
+  "142": "XL",
+  "144": "XXL",
+  "004": "I-XS",
+  "006": "S",
+  "008": "M",
+  "010": "L",
 };
-const numOrNull = (v) => {
-  if (v == null || v === "") return null;
-  const n = Number(String(v).replace(/,/g, "").replace(/[^0-9.\-]/g, ""));
-  return Number.isFinite(n) ? n : null;
-};
-// Accepts YYYY-MM-DD, DD/MM/YYYY (Mexico), ISO timestamps and Excel serial days.
-const dateOrNull = (v) => {
-  if (v == null || v === "") return null;
-  if (typeof v === "number" && v > 20000 && v < 80000) {
-    const d = new Date(Date.UTC(1899, 11, 30) + v * 86400000);
-    return d.toISOString().slice(0, 10);
-  }
-  const s = String(v).trim();
-  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
-  m = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
-  if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+const sizeLabelOf = (code) => {
+  const k = String(code ?? "").trim();
+  return SIZE_LABELS[k] ?? k;
 };
 
-function normalizeRoll(obj) {
-  const out = {};
-  for (const k of FIELD_KEYS) out[k] = null;
-  if (!obj || typeof obj !== "object") return out;
-  for (const [k, v] of Object.entries(obj)) {
-    const f = ALIAS.get(normKey(k));
-    if (!f || out[f.key] != null) continue;
-    if (v != null && typeof v === "object") continue;
-    out[f.key] = f.type === "number" ? numOrNull(v) : f.type === "date" ? dateOrNull(v) : str(v);
+// BoxRegistry rule agreed with the team: for cliente C&A it is "NCA", blank otherwise.
+// Detection is by customer name containing "C&A" (case-insensitive).
+const boxRegistryFor = (customerName) =>
+  String(customerName ?? "").toUpperCase().includes("C&A") ? "NCA" : null;
+
+// ---------------------------------------------------------------------------
+// Escaneo de tickets (intake por escáner)
+// ---------------------------------------------------------------------------
+// El líder de línea imprime tickets cuyo QR trae TODA la información de ese
+// tanto de piezas. En el almacén, el operador escanea cada ticket físico y el
+// sistema registra lo que trae + la hora de escaneo. `parseTicketScan` acepta el
+// texto crudo que suelta el escáner (o la cámara) y lo normaliza.
+//
+// Formato principal (QR JSON, generado en LineLeaderPage.generateTickets):
+//   {"tn":"T-55-AB-3","wo":"WO-1234","style":"DAMCHA01","talla":"138",
+//    "label":"M","color":"NEG","po":"po-1","qty":50,"runId":55,"seq":3,
+//    "date":"2026-08-18"}
+// Formato alterno (QR de la etiqueta ZPL):
+//   WO:WO-1234|RUN:55|T:138|CLR:NEG|PO:po-1|Q:50|S:3/12
+const _s = (v) => { const t = String(v ?? "").trim(); return t.length ? t : null; };
+const _dateOrNull = (v) => {
+  const t = String(v ?? "").trim();
+  return /^\d{4}-\d{2}-\d{2}/.test(t) ? t.slice(0, 10) : null;
+};
+
+// Base32 (RFC 4648, sin relleno). Los QR nuevos vienen como "FGW1"+base32(JSON):
+// solo letras A-Z y dígitos 2-7, idénticos en cualquier distribución de teclado,
+// para que un lector configurado en otro idioma no corrompa el contenido.
+const _B32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function base32Decode(s) {
+  const map = {};
+  for (let i = 0; i < _B32_ALPHABET.length; i++) map[_B32_ALPHABET[i]] = i;
+  let bits = 0, value = 0;
+  const out = [];
+  for (const ch of String(s).toUpperCase()) {
+    if (!(ch in map)) continue;              // ignora cualquier caracter fuera del alfabeto
+    value = (value << 5) | map[ch];
+    bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
   }
-  return out;
+  return Buffer.from(out).toString("utf8");
 }
 
-// Dedup key for a roll: supplier code + roll number.
-const rollKeyOf = (r) => `${String(r.supplier_code || r.supplier || "").trim().toUpperCase()}|${String(r.roll_no || "").trim().toUpperCase()}`;
-
-// Find the first array of objects inside whatever Skytex returns.
-function extractArray(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (!payload || typeof payload !== "object") return [];
-  for (const k of ["data", "rolls", "items", "results", "records", "rows", "value"]) {
-    if (Array.isArray(payload[k])) return payload[k];
-    if (payload[k] && typeof payload[k] === "object") {
-      const inner = extractArray(payload[k]);
-      if (inner.length) return inner;
-    }
-  }
-  for (const v of Object.values(payload)) if (Array.isArray(v) && v.length && typeof v[0] === "object") return v;
-  return [];
+// Normaliza el objeto del ticket (venga de JSON directo o de Base32).
+function _normalizeTicketObj(o, rawText) {
+  const runId = o.runId ?? o.run ?? null;
+  const seq = o.seq ?? null;
+  const ticketNo = _s(o.tn ?? o.ticketNo ?? o.ticket_no) ||
+    (runId != null && seq != null ? `T-${runId}-${seq}` : null);
+  return {
+    ticket_no: ticketNo,
+    work_order_no: _s(o.wo ?? o.workOrderNo ?? o.work_order_no),
+    customer_po: _s(o.po ?? o.customerPo ?? o.customer_po),
+    style: _s(o.style),
+    size_code: _s(o.talla ?? o.size ?? o.size_code),
+    size_label: _s(o.label ?? o.size_label) || sizeLabelOf(o.talla ?? o.size),
+    color: _s(o.color),
+    pieces: Math.max(0, Math.round(Number(o.qty ?? o.pieces) || 0)),
+    production_date: _dateOrNull(o.date ?? o.production_date),
+    run_id: runId != null ? (Number(runId) || null) : null,
+    seq: seq != null ? (Number(seq) || null) : null,
+    raw: rawText,
+  };
 }
 
-async function fetchSkytex(po) {
-  const base = process.env.SKYTEX_API_URL;
-  if (!base) {
-    const e = new Error("La conexión con Skytex no está configurada (SKYTEX_API_URL). Mientras tanto, cargue el JSON de prueba.");
-    e.status = 503;
-    throw e;
-  }
-  const url = new URL(base);
-  if (po) url.searchParams.set(process.env.SKYTEX_PO_PARAM || "po", po);
-  const headers = { Accept: "application/json" };
-  if (process.env.SKYTEX_API_TOKEN) headers.Authorization = `Bearer ${process.env.SKYTEX_API_TOKEN}`;
-  if (process.env.SKYTEX_API_KEY) headers[process.env.SKYTEX_API_KEY_HEADER || "x-api-key"] = process.env.SKYTEX_API_KEY;
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20000);
+// Intento de rescate: tickets viejos con QR JSON leídos por un escáner con
+// distribución de teclado distinta llegan con signos cambiados (: -> Ñ, " -> [).
+// Revertimos esos cambios comunes y reintentamos. Solo se usa como último recurso
+// y solo si el resultado se parece a un ticket (trae wo/qty/talla).
+function _repairMangledJson(text) {
+  let s = String(text)
+    .replace(/[Ññ]/g, ":")
+    .replace(/[\[\]]/g, '"');
+  if (!s.trim().startsWith("{")) s = "{" + s.replace(/^[^{]*\{?/, "");
+  if (!s.trim().endsWith("}")) s = s.replace(/\}?[^}]*$/, "") + "}";
   try {
-    const r = await fetch(url, { headers, signal: ctrl.signal });
-    const text = await r.text();
-    if (!r.ok) {
-      const e = new Error(`Skytex respondió ${r.status}: ${text.slice(0, 200)}`);
-      e.status = 502;
-      throw e;
-    }
-    try { return JSON.parse(text); } catch {
-      const e = new Error("Skytex no devolvió un JSON válido.");
-      e.status = 502;
-      throw e;
-    }
-  } catch (err) {
-    if (err.name === "AbortError") {
-      const e = new Error("Skytex no respondió en 20 segundos.");
-      e.status = 504;
-      throw e;
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
+    const o = JSON.parse(s);
+    if (o && (o.wo || o.qty != null || o.talla)) return o;
+  } catch { /* no se pudo rescatar */ }
+  return null;
 }
 
-// Text from the roll's QR: JSON, "key:value|key:value", "a|b|c" or the plain roll number.
-function parseRollScan(raw) {
+function parseTicketScan(raw) {
   const text = String(raw ?? "").trim();
   if (!text) return null;
+
+  // 0) QR nuevo compacto, a prueba de teclado: "FGW2" + Base32(posicional "|").
+  //    Orden fijo: tn, wo, talla, color, po, qty, date, runId, seq.
+  if (/^FGW2[A-Z2-7]/i.test(text)) {
+    try {
+      const dec = base32Decode(text.slice(4));
+      const a = dec.split("|");
+      const o = {
+        tn: a[0], wo: a[1], talla: a[2], color: a[3], po: a[4],
+        qty: a[5], date: a[6], runId: a[7], seq: a[8],
+      };
+      return _normalizeTicketObj(o, text);
+    } catch { /* sigue a los demás formatos */ }
+  }
+
+  // 0b) QR anterior a prueba de teclado: "FGW1" + Base32(JSON).
+  if (/^FGW1[A-Z2-7]/i.test(text)) {
+    try {
+      const json = base32Decode(text.slice(4));
+      const o = JSON.parse(json);
+      return _normalizeTicketObj(o, text);
+    } catch { /* sigue a los demás formatos */ }
+  }
+
+  // 1) QR JSON directo (lo que devuelve la cámara, o tickets previos).
   if (text.startsWith("{")) {
     try {
-      const n = normalizeRoll(JSON.parse(text));
-      if (n.roll_no) return { roll_no: n.roll_no, supplier_code: n.supplier_code, raw: text };
-    } catch { /* not JSON */ }
+      return _normalizeTicketObj(JSON.parse(text), text);
+    } catch { /* no era JSON válido, seguimos al formato de tubería */ }
   }
-  if (text.includes(":") && text.includes("|")) {
-    const obj = {};
+
+  // 2) Formato de tubería de la etiqueta ZPL antigua (no trae estilo/fecha/número).
+  if (/(^|\|)\s*(WO|RUN|T|Q)\s*:/i.test(text)) {
+    const map = {};
     for (const part of text.split("|")) {
       const i = part.indexOf(":");
-      if (i > 0) obj[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+      if (i > 0) map[part.slice(0, i).trim().toUpperCase()] = part.slice(i + 1).trim();
     }
-    const n = normalizeRoll(obj);
-    if (n.roll_no) return { roll_no: n.roll_no, supplier_code: n.supplier_code, raw: text };
+    const clean = (v) => (v && v !== "-" ? v : null);
+    const runId = map.RUN ? (Number(map.RUN) || null) : null;
+    const seq = map.S ? (Number(String(map.S).split("/")[0]) || null) : null;
+    return {
+      ticket_no: runId != null && seq != null ? `T-${runId}-${seq}` : null,
+      work_order_no: clean(map.WO),
+      customer_po: clean(map.PO),
+      style: null,
+      size_code: clean(map.T),
+      size_label: sizeLabelOf(map.T),
+      color: clean(map.CLR),
+      pieces: Math.max(0, Math.round(Number(map.Q) || 0)),
+      production_date: null,
+      run_id: runId,
+      seq,
+      raw: text,
+    };
   }
-  return { roll_no: text, supplier_code: null, raw: text };
+
+  // 3) Último recurso: JSON viejo corrompido por el teclado (: -> Ñ, " -> [).
+  const repaired = _repairMangledJson(text);
+  if (repaired) return _normalizeTicketObj(repaired, text);
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
-// Schema
+// Desglose de capturas (cuándo entró cada tanto de piezas)
 // ---------------------------------------------------------------------------
+// El acumulado por talla sale de sumar ticket_prints. Para que el operador vea
+// CÓMO se llegó a ese número (p. ej. 50 el lunes + 50 el viernes) necesitamos
+// las capturas sin agrupar por completo. Las columnas exactas de ticket_prints /
+// line_runs han ido cambiando, así que en vez de asumirlas las consultamos una
+// vez y armamos el SELECT con las que existan; si falta alguna, esa parte del
+// desglose simplemente sale vacía en lugar de tronar la consulta.
+const _colCache = new Map();
+async function columnsOf(client, table) {
+  if (_colCache.has(table)) return _colCache.get(table);
+  let cols = new Map();   // nombre -> data_type
+  try {
+    const { rows } = await client.query(
+      `SELECT column_name, data_type
+         FROM information_schema.columns
+        WHERE table_name = $1
+          AND table_schema = ANY (current_schemas(false))
+        ORDER BY ordinal_position`,
+      [table]
+    );
+    cols = new Map(rows.map((r) => [r.column_name, r.data_type]));
+  } catch (e) {
+    console.warn(`columnsOf(${table}): ${e.message}`);
+  }
+  _colCache.set(table, cols);
+  return cols;
+}
+
+// Primera columna de fecha/hora utilizable de una tabla: se prefieren los
+// nombres conocidos y, si ninguno está, CUALQUIER columna timestamp. Así el
+// desglose funciona aunque la columna se llame distinto de lo esperado.
+const TIME_NAME_PREFERENCE = [
+  "printed_at", "created_at", "printed_on", "registered_at", "inserted_at",
+  "fecha_hora", "fecha", "timestamp", "ts", "updated_at",
+];
+function timeColumnOf(cols) {
+  const isTime = (n) => /^timestamp/.test(String(cols.get(n) ?? ""));
+  for (const n of TIME_NAME_PREFERENCE) if (cols.has(n) && isTime(n)) return n;
+  for (const n of cols.keys()) if (isTime(n)) return n;
+  return null;
+}
+
+// Siguiente folio consecutivo para un prefijo (p. ej. "SKM" -> "SKM0001",
+// "SKM0002"…). Incremento atómico en ticket_folio_counters, así dos escaneos a
+// la vez nunca reciben el mismo número. Se siembra el contador desde el mayor
+// folio ya existente la primera vez, para no chocar con datos previos.
+async function nextFolio(client, prefix) {
+  const p = String(prefix || "TKT").toUpperCase();
+  const seedRes = await client.query(
+    `SELECT COALESCE(MAX((substring(folio from '^' || $1 || '([0-9]+)'))::int), 0) AS maxseq
+       FROM scanned_tickets WHERE folio LIKE $2`,
+    [p, `${p}%`]
+  );
+  const seed = Number(seedRes.rows[0]?.maxseq) || 0;
+
+  const up = await client.query(
+    `INSERT INTO ticket_folio_counters (prefix, last_no)
+       VALUES ($1, GREATEST($2, 0) + 1)
+     ON CONFLICT (prefix) DO UPDATE
+       SET last_no = GREATEST(ticket_folio_counters.last_no, $2) + 1
+     RETURNING last_no`,
+    [p, seed]
+  );
+  const n = Number(up.rows[0].last_no) || 1;
+  return `${p}${String(n).padStart(4, "0")}`;
+}
+
+// Número de línea de producción, ya sea en la corrida o en el propio ticket.
+const LINE_NAME_PREFERENCE = ["line_no", "line_number", "linea", "line", "no_linea"];
+function lineColumnOf(cols) {
+  return LINE_NAME_PREFERENCE.find((n) => cols.has(n)) || null;
+}
+
+// Capturas individuales de tickets de una orden, hasta la fecha de corte.
+// Un renglón = un momento de captura (una impresión de tickets): su fecha, hora
+// exacta, línea y piezas. Sumar los renglones de una talla da su acumulado.
+//
+// Se agrupa por la HORA EXACTA, no por día ni por minuto: dos capturas del mismo
+// día (p. ej. 50 a las 21:50 y 50 a las 22:43) tienen que verse por separado,
+// que es justo lo que el operador necesita saber. Si la tabla no tuviera columna
+// de tiempo, se cae a un renglón por registro (tp.id) para no fusionar capturas.
+async function ticketEntriesFor(client, workOrderId, asOfDate) {
+  const tp = await columnsOf(client, "ticket_prints");
+  const lr = await columnsOf(client, "line_runs");
+
+  const tpTime = timeColumnOf(tp);
+  const lrTime = timeColumnOf(lr);
+  const tsExpr = tpTime ? `tp."${tpTime}"` : (lrTime ? `lr."${lrTime}"` : "NULL::timestamptz");
+
+  // Día de producción: el mismo eje que usa el resto del sistema (run_date).
+  const dayExpr = lr.has("run_date") ? "lr.run_date" : `(${tsExpr})::date`;
+
+  const lineCol = lineColumnOf(lr);
+  const tpLineCol = lineColumnOf(tp);
+  const lineExpr = lineCol ? `lr."${lineCol}"` : (tpLineCol ? `tp."${tpLineCol}"` : "NULL::int");
+
+  // Sin columna de tiempo, cada registro es su propia captura.
+  const grainExpr = (tpTime || lrTime) ? tsExpr : "tp.id";
+
+  const { rows } = await client.query(
+    `SELECT tp.talla                          AS size_code,
+            COALESCE(tp.color, '')            AS color,
+            COALESCE(tp.estilo, '')           AS estilo,
+            tp.customer_po,
+            to_char(${dayExpr}, 'YYYY-MM-DD') AS day,
+            ${lineExpr}                       AS line_no,
+            MIN(${tsExpr})                    AS at,
+            SUM(tp.quantity)::numeric         AS qty,
+            COUNT(*)::int                     AS tickets
+       FROM ticket_prints tp
+       JOIN line_runs lr ON lr.id = tp.run_id
+      WHERE tp.work_order_id = $1
+        AND ($2::date IS NULL OR ${dayExpr} <= $2::date)
+      GROUP BY tp.talla, COALESCE(tp.color, ''), COALESCE(tp.estilo, ''), tp.customer_po,
+               ${dayExpr}, ${lineExpr}, ${grainExpr}
+      ORDER BY 5 ASC, 7 ASC NULLS FIRST
+      LIMIT 2000`,
+    [workOrderId, asOfDate]
+  );
+
+  // Se devuelve también QUÉ columnas se usaron: si el desglose sale raro, la
+  // respuesta del endpoint dice de dónde salió la hora y la línea.
+  return { rows, meta: { timeColumn: tpTime ? `ticket_prints.${tpTime}` : (lrTime ? `line_runs.${lrTime}` : null),
+                         lineColumn: lineCol ? `line_runs.${lineCol}` : (tpLineCol ? `ticket_prints.${tpLineCol}` : null) } };
+}
+
+// Split an integer `total` across `weights` proportionally, returning whole
+// numbers that sum EXACTLY to `total` (largest-remainder / Hamilton method).
+// Used to spread the order-level producido across size×color lines by ordered qty.
+function allocateProportional(total, weights) {
+  const n = weights.length;
+  if (n === 0) return [];
+  const T = Math.max(0, Math.round(Number(total) || 0));
+  const w = weights.map((x) => Math.max(0, Number(x) || 0));
+  const sum = w.reduce((s, x) => s + x, 0);
+
+  // No ordered basis to split on -> fall back to an even split.
+  const shares = sum > 0 ? w.map((x) => (x / sum) * T) : w.map(() => T / n);
+
+  const parts = shares.map(Math.floor);
+  let left = T - parts.reduce((s, x) => s + x, 0);
+
+  // Hand the leftover units to the largest fractional remainders, one each.
+  const order = shares
+    .map((s, i) => ({ i, frac: s - Math.floor(s) }))
+    .sort((a, b) => b.frac - a.frac);
+  for (let k = 0; k < order.length && left > 0; k++, left--) parts[order[k].i]++;
+
+  return parts;
+}
+
+// Build the box rows for a list straight from its work order's size×color lines.
+// One box per work_order_lines row, every field pre-filled from the DB so the
+// operator only has to export. Inserts the rows and returns them.
+//
+// `moFilter` (optional): when given, only the lines whose PO cliente (line
+// customer_po, or the order MO if the line has none) equals it are used — this
+// is how one order is split into one list per PO cliente. If nothing matches
+// (e.g. a legacy list whose mo is a combined value), it falls back to all lines.
+//
+// `opts.asOfDate` (optional, 'YYYY-MM-DD'): cut-off production day. When given,
+// each box's pieces are the ACUMULADO por talla up to and including that day
+// (tickets whose run's run_date <= asOfDate). This is how the operator sees "lo
+// que llevan las líneas a esta fecha". When omitted, all tickets to date count
+// and (for orders without any tickets) we fall back to the proportional split.
+//
+// NOTE: caller runs inside its own transaction; this only issues queries.
+async function generateBoxesFromOrder(client, list, moFilter, opts = {}) {
+  if (!list.work_order_id) return [];
+
+  // Cut-off day for the accumulated per-size production (null = all time).
+  const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(String(opts.asOfDate ?? "").trim())
+    ? String(opts.asOfDate).trim()
+    : (/^\d{4}-\d{2}-\d{2}/.test(String(list.as_of_date ?? "")) // fall back to the list's stored day
+        ? String(list.as_of_date).slice(0, 10)
+        : null);
+
+  const woRes = await client.query(
+    `SELECT work_order_no AS po, customer_po AS mo FROM work_orders WHERE id = $1`,
+    [list.work_order_id]
+  );
+  if (woRes.rows.length === 0) return [];
+  const header = woRes.rows[0];
+
+  const linesRes = await client.query(
+    `SELECT talla        AS size_code,
+            color        AS color_name,
+            estilo       AS style,
+            customer_po  AS mo,
+            fabric_code,
+            quantity
+       FROM work_order_lines
+      WHERE work_order_id = $1
+      ORDER BY color, talla`,
+    [list.work_order_id]
+  );
+
+  const po = header.po || list.po || null;
+  const boxRegistry = boxRegistryFor(list.customer_name);
+
+  // Each line's effective PO cliente: its own customer_po, else the order MO.
+  const headerMo = String(header.mo ?? "").trim();
+  const effMo = (l) => { const m = String(l.mo ?? "").trim(); return m || headerMo; };
+
+  // ── Piezas por talla: lo REALMENTE producido, desde el registro de tickets ──
+  // Cada vez que la línea imprime tickets de lo que terminó, queda un renglón en
+  // ticket_prints con su talla + color + PO cliente + estilo y las piezas de ese
+  // ticket (POST /api/lineleader/confirm-tickets/:runId). Esa es la producción
+  // real POR TALLA, así que la usamos directo en lugar de repartir un total de la
+  // orden según lo ordenado. Si una orden todavía no tiene tickets registrados
+  // (órdenes viejas), caemos al reparto proporcional de siempre para no romper
+  // nada.
+  const nz = (v) => String(v ?? "").trim();
+  const fullKey  = (t, c, po, e) => `${nz(t)}\u0000${nz(c)}\u0000${nz(po)}\u0000${nz(e)}`;
+  const looseKey = (t, c, po)    => `${nz(t)}\u0000${nz(c)}\u0000${nz(po)}`;
+
+  const ticketsFull  = new Map();  // talla|color|PO|estilo -> piezas
+  const ticketsLoose = new Map();  // talla|color|PO        -> piezas (todas las estilos)
+  let ticketsTotal = 0;
+  try {
+    // Acumulado por talla hasta el día seleccionado: se filtra por el run_date de
+    // la corrida (mismo eje "día" que usa el resto del sistema), no por la hora en
+    // que se imprimió, para que cuadre con lo que reporta el líder de línea.
+    const tRes = await client.query(
+      `SELECT tp.talla,
+              COALESCE(tp.color, '')       AS color,
+              COALESCE(tp.customer_po, '') AS customer_po,
+              COALESCE(tp.estilo, '')      AS estilo,
+              SUM(tp.quantity)::numeric    AS produced
+         FROM ticket_prints tp
+         JOIN line_runs lr ON lr.id = tp.run_id
+        WHERE tp.work_order_id = $1
+          AND ($2::date IS NULL OR lr.run_date <= $2::date)
+        GROUP BY tp.talla, COALESCE(tp.color,''), COALESCE(tp.customer_po,''), COALESCE(tp.estilo,'')`,
+      [list.work_order_id, asOfDate]
+    );
+    for (const r of tRes.rows) {
+      const q = Number(r.produced) || 0;
+      if (q <= 0) continue;
+      ticketsTotal += q;
+      ticketsFull.set(fullKey(r.talla, r.color, r.customer_po, r.estilo), q);
+      const lk = looseKey(r.talla, r.color, r.customer_po);
+      ticketsLoose.set(lk, (ticketsLoose.get(lk) || 0) + q);
+    }
+  } catch (e) {
+    // ticket_prints ausente/inaccesible → nos quedamos con el reparto proporcional.
+    console.warn("generateBoxesFromOrder: ticket_prints no disponible:", e.message);
+  }
+
+  // Piezas producidas para una línea (talla×color×estilo×PO cliente) desde tickets.
+  // Preferimos el match exacto con estilo; si el estilo no cuadra, caemos al match
+  // por talla+color+PO. El PO cliente de la línea puede venir en la propia línea o
+  // heredarse del encabezado, así que probamos ambos, y también el caso sin PO.
+  const producedFromTickets = (l) => {
+    const t = l.size_code, c = l.color_name, e = l.style;
+    const poRaw = nz(l.mo), poEff = effMo(l);
+    for (const k of [fullKey(t, c, poRaw, e), fullKey(t, c, poEff, e), fullKey(t, c, "", e)])
+      if (ticketsFull.has(k)) return ticketsFull.get(k);
+    for (const k of [looseKey(t, c, poRaw), looseKey(t, c, poEff), looseKey(t, c, "")])
+      if (ticketsLoose.has(k)) return ticketsLoose.get(k);
+    return 0;
+  };
+
+  let rows;
+  if (ticketsTotal > 0 || asOfDate) {
+    // Fuente de verdad por talla: los tickets impresos por la línea, acumulados a
+    // la fecha. Una talla sin ticket queda en 0 (aún no se ha producido esa talla
+    // a esa fecha), no en un estimado. Cuando se pidió una fecha NO caemos al
+    // reparto proporcional: ese total es de todo el tiempo y no conoce la fecha.
+    rows = linesRes.rows.map((l) => ({ ...l, _alloc: producedFromTickets(l) }));
+  } else {
+    // Sin fecha y sin tickets registrados (órdenes previas a la captura por
+    // ticket): reparto proporcional del producido de la orden por lo ordenado —
+    // comportamiento anterior. Se hace sobre TODAS las líneas primero para que, al
+    // acotar a un PO cliente, cada quien reciba solo su parte y el total cuadre.
+    const producedTotal = await workOrders.producedQuantityFor(client, list.work_order_id);
+    const allocation = allocateProportional(
+      producedTotal,
+      linesRes.rows.map((l) => Number(l.quantity) || 0)
+    );
+    rows = linesRes.rows.map((l, i) => ({ ...l, _alloc: allocation[i] }));
+  }
+
+  // Scope to one PO cliente when asked (fall back to all lines if none match).
+  if (moFilter != null && String(moFilter).trim() !== "") {
+    const want = String(moFilter).trim();
+    const scoped = rows.filter((l) => effMo(l) === want);
+    if (scoped.length > 0) rows = scoped;
+  }
+
+  const inserted = [];
+  for (const l of rows) {
+    const { rows: ins } = await client.query(
+      `INSERT INTO pre_packing_boxes
+         (list_id, box_qrcode, encasement_qrcode, mo, po, style, fabric_code, sex,
+          size_code, color_name, color_code, quantity, box_code, box_registry,
+          gross_weight, net_weight, customer_code, customer_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+       RETURNING *`,
+      [
+        list.id,
+        null,                                   // box_qrcode — ticket is the PO on export
+        null,                                   // encasement_qrcode (system field)
+        effMo(l) || list.mo || null,
+        po,
+        l.style || null,                        // "label" = estilo -> Estyle column
+        l.fabric_code || null,
+        null,                                   // sex -> Genero 0 on export
+        l.size_code || null,
+        l.color_name || null,
+        colorCodeOf(l.color_name, l.size_code) || null,
+        l._alloc,                               // piezas reales por talla (tickets); reparto proporcional solo si no hay tickets
+        DEFAULT_BOX_CODE,
+        boxRegistry,
+        0,
+        0,
+        list.customer_code || null,
+        list.customer_name || null,
+      ]
+    );
+    inserted.push(ins[0]);
+  }
+  return inserted;
+}
+
+// Distinct PO cliente (MO) values across a work order's lines. A line with no
+// customer_po falls back to the order-level MO. Drives the "one list per PO
+// cliente" split at create time. Returned sorted for stable list numbering.
+async function distinctLineMos(client, workOrderId, headerMo) {
+  const { rows } = await client.query(
+    `SELECT DISTINCT COALESCE(NULLIF(TRIM(customer_po), ''), $2) AS mo
+       FROM work_order_lines
+      WHERE work_order_id = $1`,
+    [workOrderId, String(headerMo ?? "").trim()]
+  );
+  return rows
+    .map((r) => String(r.mo ?? "").trim())
+    .filter((m) => m.length > 0)
+    .sort((a, b) => a.localeCompare(b));
+}
+
 async function initSchema({ pool, setSchema }) {
   const client = await pool.connect();
   try {
     await setSchema(client);
 
+    // Header: one pre-packing list, tied to a client and (optionally) a work order.
     await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_containers(
+      CREATE TABLE IF NOT EXISTS pre_packing_lists(
         id BIGSERIAL PRIMARY KEY,
-        code VARCHAR(40) UNIQUE NOT NULL,
-        name VARCHAR(120),
+        list_no VARCHAR(20) UNIQUE,
+        customer_id BIGINT REFERENCES customers(id) ON DELETE SET NULL,
+        customer_code VARCHAR(20),
+        customer_name VARCHAR(150),
+        work_order_id BIGINT REFERENCES work_orders(id) ON DELETE SET NULL,
+        po VARCHAR(60),
+        mo VARCHAR(60),
+        status VARCHAR(20) NOT NULL DEFAULT 'draft',
         notes TEXT,
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_locations(
-        id BIGSERIAL PRIMARY KEY,
-        container_id BIGINT NOT NULL REFERENCES fabric_containers(id) ON DELETE CASCADE,
-        code VARCHAR(40) NOT NULL,
-        capacity INT,
-        sort_order INT NOT NULL DEFAULT 0,
+        created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        UNIQUE (container_id, code)
-      );
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_rolls(
-        id BIGSERIAL PRIMARY KEY,
-        skytex_key VARCHAR(200) UNIQUE NOT NULL,
-        po_number VARCHAR(80),
-        supplier VARCHAR(150),
-        supplier_code VARCHAR(60),
-        roll_no VARCHAR(80) NOT NULL,
-        yards NUMERIC(12,2),
-        meters NUMERIC(12,2),
-        color VARCHAR(80),
-        lot VARCHAR(80),
-        width VARCHAR(40),
-        width_unit VARCHAR(20),
-        weight VARCHAR(40),
-        composition TEXT,
-        month_buy VARCHAR(40),
-        fabric_item_number VARCHAR(80),
-        fabric_name VARCHAR(200),
-        fabric_type VARCHAR(80),
-        customer VARCHAR(150),
-        arrival_date DATE,
-        size VARCHAR(40),
-        item_sku_code VARCHAR(120),
-        purchase_term VARCHAR(80),
-        import_ref VARCHAR(120),
-        remarks TEXT,
-        raw JSONB,
-        status VARCHAR(20) NOT NULL DEFAULT 'requested',
-        container_id BIGINT REFERENCES fabric_containers(id) ON DELETE SET NULL,
-        location_id BIGINT REFERENCES fabric_locations(id) ON DELETE SET NULL,
-        inspection_result VARCHAR(20),
-        requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        location_set_at TIMESTAMPTZ,
-        received_at TIMESTAMPTZ,
-        received_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        out_at TIMESTAMPTZ,
-        out_reason TEXT,
-        out_reference VARCHAR(120),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CONSTRAINT chk_fabric_roll_status CHECK (status IN
-          ('requested','assigned','in_stock','at_inspection','returned','cancelled'))
+        confirmed_at TIMESTAMPTZ,
+        CONSTRAINT chk_pp_status CHECK (status IN ('draft','confirmed','cancelled'))
       );
     `);
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_status ON fabric_rolls(status);");
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_roll_no ON fabric_rolls(UPPER(roll_no));");
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_po ON fabric_rolls(po_number);");
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_location ON fabric_rolls(location_id);");
-    // source = 'skytex' (requested from Skytex) or 'scan' (scanned on arrival
-    // without a request; linked to Skytex data later when it is requested).
-    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'skytex';");
-    // Optional: the exact text of a position's QR label when it is not just its code.
-    await client.query("ALTER TABLE fabric_locations ADD COLUMN IF NOT EXISTS qr_code VARCHAR(120);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_pp_lists_customer ON pre_packing_lists(customer_id);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_pp_lists_status ON pre_packing_lists(status);");
+    // Día de corte de la lista: las piezas por talla son el acumulado de la
+    // producción de las líneas hasta este día (null = todo el tiempo).
+    await client.query("ALTER TABLE pre_packing_lists ADD COLUMN IF NOT EXISTS as_of_date DATE;");
 
-    // Yard layout:
-    //   fabric_containers → the DIVISIONS of the yard (A, B, C, D, E). The table
-    //                       keeps its old name so existing data and FKs still work.
-    //   fabric_locations  → the SPOTS of each division (A01…A30).
-    //   fabric_boxes      → the physical CONTAINERS (F01…F80), see below.
-    // fabric_locations.box_code is only read once, to migrate the first version
-    // (container code stored on the spot) into fabric_boxes.
-    await client.query("ALTER TABLE fabric_locations ADD COLUMN IF NOT EXISTS box_code VARCHAR(40);");
-    await client.query("DROP INDEX IF EXISTS uq_fabric_locations_box;");
-
+    // One row = one box.
     await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_roll_movements(
+      CREATE TABLE IF NOT EXISTS pre_packing_boxes(
         id BIGSERIAL PRIMARY KEY,
-        roll_id BIGINT NOT NULL REFERENCES fabric_rolls(id) ON DELETE CASCADE,
-        type VARCHAR(30) NOT NULL,
-        from_location_id BIGINT REFERENCES fabric_locations(id) ON DELETE SET NULL,
-        to_location_id BIGINT REFERENCES fabric_locations(id) ON DELETE SET NULL,
-        reference VARCHAR(120),
-        reason TEXT,
-        user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_moves_type_date ON fabric_roll_movements(type, created_at);");
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_moves_roll ON fabric_roll_movements(roll_id);");
-    // Container on the from/to spot at the time of the move (containers can be moved later).
-    await client.query("ALTER TABLE fabric_roll_movements ADD COLUMN IF NOT EXISTS from_box_code VARCHAR(40);");
-    await client.query("ALTER TABLE fabric_roll_movements ADD COLUMN IF NOT EXISTS to_box_code VARCHAR(40);");
-
-    // Containers F01…F80. A container is parked on at most one spot and a spot
-    // holds at most one container (unique location_id). location_id = NULL means
-    // the container was moved and its new spot has not been scanned yet; it keeps
-    // its rolls. capacity = rolls the container holds (NULL = no limit).
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_boxes(
-        id BIGSERIAL PRIMARY KEY,
-        code VARCHAR(40) NOT NULL,
-        location_id BIGINT REFERENCES fabric_locations(id) ON DELETE SET NULL,
-        capacity INT,
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        placed_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS uq_fabric_boxes_code ON fabric_boxes(UPPER(code));");
-    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS uq_fabric_boxes_location ON fabric_boxes(location_id) WHERE location_id IS NOT NULL;");
-    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS box_id BIGINT REFERENCES fabric_boxes(id) ON DELETE SET NULL;");
-    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_box ON fabric_rolls(box_id);");
-    // Migration from the first version (container code stored on the spot).
-    await client.query(`
-      INSERT INTO fabric_boxes (code, location_id, capacity, placed_at)
-      SELECT UPPER(l.box_code), l.id, l.capacity, now() FROM fabric_locations l
-       WHERE l.box_code IS NOT NULL
-      ON CONFLICT DO NOTHING;
-    `);
-    await client.query(`
-      UPDATE fabric_rolls r SET box_id = b.id
-        FROM fabric_boxes b
-       WHERE r.box_id IS NULL AND r.location_id = b.location_id
-         AND r.status IN ('assigned','in_stock','at_inspection');
-    `);
-    await client.query("UPDATE fabric_locations SET box_code = NULL WHERE box_code IS NOT NULL;");
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_inspection_requests(
-        id BIGSERIAL PRIMARY KEY,
-        request_no VARCHAR(20) UNIQUE,
-        status VARCHAR(20) NOT NULL DEFAULT 'open',
-        notes TEXT,
-        requested_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        requested_by_name VARCHAR(120),
+        list_id BIGINT NOT NULL REFERENCES pre_packing_lists(id) ON DELETE CASCADE,
+        box_qrcode VARCHAR(120),
+        encasement_qrcode VARCHAR(120),
+        mo VARCHAR(60),
+        po VARCHAR(60),
+        style VARCHAR(60),
+        fabric_code VARCHAR(60),
+        sex VARCHAR(10),
+        size_code VARCHAR(20),
+        color_name VARCHAR(60),
+        color_code VARCHAR(20),
+        quantity NUMERIC(12,2) NOT NULL DEFAULT 0,
+        box_code VARCHAR(60) DEFAULT '${DEFAULT_BOX_CODE}',
+        box_registry VARCHAR(60),
+        gross_weight NUMERIC(12,3) NOT NULL DEFAULT 0,
+        net_weight NUMERIC(12,3) NOT NULL DEFAULT 0,
+        customer_code VARCHAR(20),
+        customer_name VARCHAR(150),
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        sent_at TIMESTAMPTZ,
-        CONSTRAINT chk_fabric_insp_status CHECK (status IN ('open','partial','sent','cancelled'))
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_pp_box_qty CHECK (quantity >= 0)
       );
     `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_pp_boxes_list ON pre_packing_boxes(list_id);");
+
+    // Aggregated finished-goods stock. sku_key is maintained by the app so the
+    // confirm step can upsert with a plain ON CONFLICT.
     await client.query(`
-      CREATE TABLE IF NOT EXISTS fabric_inspection_request_items(
-        request_id BIGINT NOT NULL REFERENCES fabric_inspection_requests(id) ON DELETE CASCADE,
-        roll_id BIGINT NOT NULL REFERENCES fabric_rolls(id) ON DELETE CASCADE,
-        sent_at TIMESTAMPTZ,
-        PRIMARY KEY (request_id, roll_id)
+      CREATE TABLE IF NOT EXISTS finished_inventory(
+        id BIGSERIAL PRIMARY KEY,
+        sku_key TEXT UNIQUE NOT NULL,
+        customer_id BIGINT REFERENCES customers(id) ON DELETE SET NULL,
+        customer_code VARCHAR(20),
+        customer_name VARCHAR(150),
+        po VARCHAR(60),
+        mo VARCHAR(60),
+        style VARCHAR(60),
+        fabric_code VARCHAR(60),
+        sex VARCHAR(10),
+        size_code VARCHAR(20),
+        color_name VARCHAR(60),
+        color_code VARCHAR(20),
+        quantity NUMERIC(14,2) NOT NULL DEFAULT 0,
+        box_count INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
 
-    console.log("✅ fabric-warehouse tables ready in prod_db_schema");
+    // Audit trail of every stock movement (one row per confirmed box).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS finished_inventory_movements(
+        id BIGSERIAL PRIMARY KEY,
+        inventory_id BIGINT REFERENCES finished_inventory(id) ON DELETE SET NULL,
+        list_id BIGINT REFERENCES pre_packing_lists(id) ON DELETE SET NULL,
+        box_id BIGINT,
+        direction VARCHAR(6) NOT NULL DEFAULT 'in',
+        quantity NUMERIC(14,2) NOT NULL,
+        created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_fim_dir CHECK (direction IN ('in','out','adjust'))
+      );
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_fim_list ON finished_inventory_movements(list_id);");
+
+    // Tickets escaneados en el almacén de producto terminado. Un renglón = un
+    // ticket físico escaneado. ticket_no es único para poder ignorar re-escaneos
+    // del mismo ticket (idempotente). scanned_at es la HORA DE ESCANEO (servidor).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS scanned_tickets(
+        id BIGSERIAL PRIMARY KEY,
+        ticket_no VARCHAR(80) UNIQUE,
+        work_order_no VARCHAR(60),
+        customer_po VARCHAR(60),
+        style VARCHAR(60),
+        size_code VARCHAR(20),
+        size_label VARCHAR(30),
+        color VARCHAR(60),
+        pieces NUMERIC(12,2) NOT NULL DEFAULT 0,
+        production_date DATE,
+        run_id BIGINT,
+        seq INT,
+        raw TEXT,
+        scanned_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        scanned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_scan_pieces CHECK (pieces >= 0)
+      );
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_scan_wo ON scanned_tickets(work_order_no);");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_scan_at ON scanned_tickets(scanned_at DESC);");
+
+    // Folio de recepción (consecutivo tipo SKM0001, SKM0002…) + cliente. El folio
+    // se asigna al escanear; el cliente se resuelve desde la orden de trabajo.
+    // ADD COLUMN IF NOT EXISTS para actualizar bases ya creadas sin perder datos.
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS folio VARCHAR(30);");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS customer_id BIGINT;");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS customer_code VARCHAR(20);");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS customer_name VARCHAR(150);");
+    await client.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_folio ON scanned_tickets(folio) WHERE folio IS NOT NULL;");
+
+    // Entrada a inventario ("check-in"): al escanear, el ticket queda PENDIENTE.
+    // Cuando el operador confirma la entrada, se suman sus piezas a
+    // finished_inventory y aquí se marca checked_in_at + inventory_id para no
+    // contarlo dos veces. Un ticket sin checked_in_at está pendiente de entrada.
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS checked_in_by BIGINT;");
+    await client.query("ALTER TABLE scanned_tickets ADD COLUMN IF NOT EXISTS inventory_id BIGINT;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_scan_checkedin ON scanned_tickets(checked_in_at);");
+    // Traza del movimiento hacia el ticket que lo originó (además de list_id/box_id).
+    await client.query("ALTER TABLE finished_inventory_movements ADD COLUMN IF NOT EXISTS ticket_id BIGINT;");
+
+    // Estilo: el QR compacto (FGW2) no lo trae, así que se toma de la orden de
+    // trabajo (igual que el pre-empaque: estilo, o style_code si falta). Rellenamos
+    // los tickets ya escaneados que quedaron sin estilo.
+    try {
+      await client.query(`
+        UPDATE scanned_tickets st
+           SET style = COALESCE(wo.estilo, wo.style_code)
+          FROM work_orders wo
+         WHERE (st.style IS NULL OR st.style = '')
+           AND wo.work_order_no = st.work_order_no
+           AND COALESCE(wo.estilo, wo.style_code) IS NOT NULL`);
+    } catch (e) {
+      console.warn("⚠️ finished-warehouse: no se pudo rellenar el estilo de los tickets:", e.message);
+    }
+
+    // Contador de folios por prefijo (p. ej. 'SKM'), incremento atómico para que
+    // dos escaneos simultáneos nunca tomen el mismo número.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ticket_folio_counters(
+        prefix VARCHAR(20) PRIMARY KEY,
+        last_no INT NOT NULL DEFAULT 0
+      );
+    `);
+
+    console.log("✅ finished-warehouse tables ready in prod_db_schema");
   } finally {
     client.release();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------------
-function registerFabricWarehouse(app, deps) {
-  const { authenticateToken, pool, setSchema } = deps;
-  const BASE = "/api/fabric-warehouse";
+// Ingresa un ticket (ya bloqueado con FOR UPDATE y aún pendiente) al inventario:
+// suma sus piezas a finished_inventory, registra el movimiento y lo marca.
+// Lo usan el check-in individual y el masivo; la transacción la abre quien llama.
+async function checkInTicket(client, t, userId) {
+  const qty = Number(t.pieces) || 0;
 
-  // Tables are created on first use (CREATE TABLE IF NOT EXISTS), so the module
-  // works even when the server does not run migrations at startup (Lambda).
-  // Runs once per process; retried on the next request if it fails.
-  let schemaReady = null;
-  const ensureSchema = () => {
-    if (!schemaReady) {
-      schemaReady = initSchema({ pool, setSchema }).catch((e) => { schemaReady = null; throw e; });
-    }
-    return schemaReady;
+  // SKU del ticket, consistente con el que arma el pre-empaque.
+  //   po = No. de orden (work_order_no)   ·   mo = PO del cliente (customer_po)
+  const box = {
+    customer_code: t.customer_code || null,
+    po: t.work_order_no || null,
+    style: t.style || null,
+    color_code: colorCodeOf(t.color, t.size_code),
+    size_code: t.size_code || null,
+    sex: null,
+    fabric_code: null,
   };
+  const sku_key = skuKeyOf(box);
 
+  // Los tickets ingresan piezas sueltas (aún sin encajar): box_count no cambia.
+  const invRes = await client.query(
+    `INSERT INTO finished_inventory
+       (sku_key, customer_id, customer_code, customer_name, po, mo, style, fabric_code,
+        sex, size_code, color_name, color_code, quantity, box_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0)
+     ON CONFLICT (sku_key) DO UPDATE SET
+       quantity   = finished_inventory.quantity + EXCLUDED.quantity,
+       updated_at = now()
+     RETURNING id`,
+    [
+      sku_key, t.customer_id, t.customer_code, t.customer_name,
+      t.work_order_no, t.customer_po, t.style, null,
+      null, t.size_code, t.color, colorCodeOf(t.color, t.size_code), qty,
+    ]
+  );
+  const inventoryId = invRes.rows[0].id;
+
+  await client.query(
+    `INSERT INTO finished_inventory_movements (inventory_id, list_id, box_id, ticket_id, direction, quantity, created_by)
+     VALUES ($1, NULL, NULL, $2, 'in', $3, $4)`,
+    [inventoryId, t.id, qty, userId]
+  );
+
+  const upd = await client.query(
+    `UPDATE scanned_tickets
+        SET checked_in_at = now(), checked_in_by = $2, inventory_id = $3
+      WHERE id = $1
+      RETURNING *`,
+    [t.id, userId, inventoryId]
+  );
+
+  return { ticket: upd.rows[0], inventoryId, qty };
+}
+
+function registerFinishedWarehouse(app, deps) {
+  const { authenticateToken, pool, setSchema } = deps;
+
+  // Small helper to run a handler with a schema-scoped client.
   const withClient = (handler) => async (req, res) => {
-    try {
-      await ensureSchema();
-    } catch (err) {
-      console.error("❌ fabric-warehouse schema:", err.message);
-      return res.status(500).json({ success: false, error: `No se pudieron crear las tablas del almacén de tela: ${err.message}` });
-    }
     const client = await pool.connect();
     try {
       await setSchema(client);
       await handler(req, res, client);
     } catch (err) {
       try { await client.query("ROLLBACK"); } catch {}
-      console.error("❌ fabric-warehouse:", err.message);
-      if (!res.headersSent) res.status(err.status || 500).json({ success: false, error: err.message });
+      console.error("❌ finished-warehouse:", err.message);
+      if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
     } finally {
       client.release();
     }
   };
 
-  const fail = (res, status, error, extra = {}) => res.status(status).json({ success: false, error, ...extra });
-  const idList = (v) =>
-    Array.isArray(v) ? [...new Set(v.map((n) => parseInt(n, 10)).filter((n) => Number.isInteger(n) && n > 0))] : [];
-
-  // Container codes are saved with each movement (containers move later).
-  // fromBox defaults to the container on the from-spot; toBox to the roll's
-  // current container (movements are logged after the roll is updated).
-  const logMove = (client, { rollId, type, from = null, to = null, reference = null, reason = null, userId = null, fromBox = null, toBox = null }) =>
-    client.query(
-      `INSERT INTO fabric_roll_movements (roll_id, type, from_location_id, to_location_id, reference, reason, user_id,
-                                          from_box_code, to_box_code)
-       VALUES ($1::bigint, $2, $3::bigint, $4::bigint, $5, $6, $7,
-               COALESCE($8::text, (SELECT code FROM fabric_boxes WHERE location_id = $3::bigint)),
-               COALESCE($9::text, CASE WHEN $4::bigint IS NOT NULL THEN
-                 (SELECT b.code FROM fabric_rolls r JOIN fabric_boxes b ON b.id = r.box_id WHERE r.id = $1::bigint) END))`,
-      [rollId, type, from, to, reference, reason, userId, fromBox, toBox]
-    );
-
-  // "f1", "F-01", "f 01" → "F01"
-  const normBox = (v) => {
-    const t = String(v ?? "").trim().toUpperCase().replace(/[\s-]+/g, "");
-    if (!t) return null;
-    const m = /^([A-Z]+)(\d+)$/.exec(t);
-    return m ? `${m[1]}${m[2].padStart(2, "0")}` : t;
-  };
-
-  // Shared SELECT for a roll with its container, location and days in stock.
-  const ROLL_SELECT = `
-    SELECT r.*,
-           to_char(r.arrival_date, 'YYYY-MM-DD') AS arrival_date,
-           c.code AS container_code, c.name AS container_name,   -- division (A–E)
-           c.code AS division_code,
-           l.code AS location_code,                              -- spot (A01)
-           b.code AS box_code,                                   -- container (F01)
-           CASE WHEN r.received_at IS NOT NULL
-                THEN FLOOR(EXTRACT(EPOCH FROM (COALESCE(r.out_at, now()) - r.received_at)) / 86400)::int
-           END AS days_in_stock,
-           (SELECT ir.request_no
-              FROM fabric_inspection_request_items it
-              JOIN fabric_inspection_requests ir ON ir.id = it.request_id
-             WHERE it.roll_id = r.id AND ir.status IN ('open','partial')
-             ORDER BY ir.id DESC LIMIT 1) AS open_inspection_request
-      FROM fabric_rolls r
-      LEFT JOIN fabric_containers c ON c.id = r.container_id
-      LEFT JOIN fabric_locations  l ON l.id = r.location_id
-      LEFT JOIN fabric_boxes      b ON b.id = r.box_id`;
-
-  // Marks Skytex rows that Skyrina already requested.
-  async function withRequestStatus(client, rows) {
-    const keys = rows.map(rollKeyOf);
-    const { rows: found } = await client.query(
-      `SELECT skytex_key, status, id FROM fabric_rolls WHERE skytex_key = ANY($1::text[])`,
-      [keys]
-    );
-    const byKey = new Map(found.map((r) => [r.skytex_key, r]));
-    return rows.map((r) => {
-      const hit = byKey.get(rollKeyOf(r));
-      return { ...r, _key: rollKeyOf(r), local_status: hit ? hit.status : null, local_id: hit ? hit.id : null };
-    });
-  }
-
-  function filterRows(rows, query) {
-    const active = FIELD_KEYS.filter((k) => str(query[k]));
-    if (!active.length) return rows;
-    return rows.filter((r) =>
-      active.every((k) => String(r[k] ?? "").toLowerCase().includes(String(query[k]).trim().toLowerCase()))
-    );
-  }
-
   // ======================================================================
-  //  SKYTEX
+  //  LOOKUPS (populate the Pre-empaque form)
   // ======================================================================
 
-  app.get(`${BASE}/fields`, authenticateToken, (req, res) => {
-    res.json({ success: true, fields: FIELDS.map(({ key, label, type }) => ({ key, label, type: type || "text" })), agingDays: AGING_DAYS });
-  });
-
-  // Live pull. Any of the 23 field keys can be passed as a filter (contains match).
-  app.get(`${BASE}/skytex/rolls`, authenticateToken, withClient(async (req, res, client) => {
-    const payload = await fetchSkytex(str(req.query.po_number));
-    const source = extractArray(payload);
-    const rows = source.map((o) => ({ ...normalizeRoll(o), _raw: o })).filter((r) => r.roll_no);
-    const filtered = filterRows(rows, req.query);
-    res.json({ success: true, source: "skytex", total: rows.length, rolls: await withRequestStatus(client, filtered) });
+  // Clients for the "select client" dropdown.
+  app.get("/api/finished-warehouse/clients", authenticateToken, withClient(async (req, res, client) => {
+    const { rows } = await client.query(
+      `SELECT id, code, name, market_type FROM customers ORDER BY name ASC`
+    );
+    res.json({ success: true, clients: rows });
   }));
 
-  // Test JSON (pasted or uploaded) through the same mapper. Body: { data, filters? }
-  app.post(`${BASE}/skytex/preview`, authenticateToken, withClient(async (req, res, client) => {
-    let data = req.body?.data;
-    if (typeof data === "string") {
-      try { data = JSON.parse(data); } catch { return fail(res, 400, "El texto no es un JSON válido."); }
-    }
-    const source = extractArray(data);
-    if (!source.length) return fail(res, 400, "No se encontró una lista de rollos en el JSON.");
-    const rows = source.map((o) => ({ ...normalizeRoll(o), _raw: o }));
-    const missing = rows.filter((r) => !r.roll_no).length;
-    const valid = rows.filter((r) => r.roll_no);
-    const unmapped = [...new Set(source.flatMap((o) => Object.keys(o || {})).filter((k) => !ALIAS.has(normKey(k))))];
-    res.json({
-      success: true,
-      source: "file",
-      total: valid.length,
-      skippedWithoutRoll: missing,
-      unmappedKeys: unmapped,
-      rolls: await withRequestStatus(client, filterRows(valid, req.body?.filters || {})),
-    });
-  }));
-
-  // Request the selected rolls. Body: { rolls: [normalized rows (+ _raw)] }
-  app.post(`${BASE}/requests`, authenticateToken, withClient(async (req, res, client) => {
-    const input = Array.isArray(req.body?.rolls) ? req.body.rolls : [];
-    if (!input.length) return fail(res, 400, "Seleccione al menos un rollo.");
-    if (input.length > 2000) return fail(res, 400, "Máximo 2000 rollos por solicitud.");
-
-    await client.query("BEGIN");
-    const created = [];
-    const duplicates = [];
-    const linked = [];
-    for (const item of input) {
-      const r = normalizeRoll(item);
-      if (!r.roll_no) continue;
-      const key = rollKeyOf(r);
-
-      // Already scanned on arrival without a request → fill in its Skytex data.
-      const scanned = await client.query(
-        `SELECT id FROM fabric_rolls WHERE source = 'scan' AND UPPER(roll_no) = UPPER($1) LIMIT 1`, [r.roll_no]
-      );
-      if (scanned.rows.length) {
-        const sets = FIELD_KEYS.map((k, i) => `${k} = COALESCE($${i + 3}, ${k})`).join(", ");
-        await client.query(
-          `UPDATE fabric_rolls SET skytex_key = $2, ${sets}, source = 'skytex',
-                  raw = $${FIELD_KEYS.length + 3}, updated_at = now()
-            WHERE id = $1`,
-          [scanned.rows[0].id, key, ...FIELD_KEYS.map((k) => r[k]), JSON.stringify(item._raw ?? item)]
-        );
-        linked.push(r.roll_no);
-        continue;
-      }
-
-      const cols = ["skytex_key", ...FIELD_KEYS, "raw", "requested_by"];
-      const vals = [key, ...FIELD_KEYS.map((k) => r[k]), JSON.stringify(item._raw ?? item), req.user?.id ?? null];
-      const ins = await client.query(
-        `INSERT INTO fabric_rolls (${cols.join(",")})
-         VALUES (${cols.map((_, i) => `$${i + 1}`).join(",")})
-         ON CONFLICT (skytex_key) DO NOTHING
-         RETURNING id, roll_no`,
-        vals
-      );
-      if (ins.rows.length) {
-        created.push(ins.rows[0]);
-        await logMove(client, { rollId: ins.rows[0].id, type: "requested", reference: r.po_number, userId: req.user?.id });
-      } else {
-        // A cancelled request can be requested again.
-        const again = await client.query(
-          `UPDATE fabric_rolls
-              SET status = 'requested', container_id = NULL, location_id = NULL, box_id = NULL, location_set_at = NULL,
-                  requested_by = $2, requested_at = now(), updated_at = now()
-            WHERE skytex_key = $1 AND status = 'cancelled'
-            RETURNING id, roll_no`,
-          [key, req.user?.id ?? null]
-        );
-        if (again.rows.length) {
-          created.push(again.rows[0]);
-          await logMove(client, { rollId: again.rows[0].id, type: "requested", reference: r.po_number, userId: req.user?.id });
-        } else {
-          duplicates.push(r.roll_no);
-        }
-      }
-    }
-    await client.query("COMMIT");
-    res.json({ success: true, created: created.length, duplicates, linked });
-  }));
-
-  // ======================================================================
-  //  ROLLS
-  // ======================================================================
-
-  // GET /rolls?status=in_stock,assigned&q=&containerId=&locationId=&minDays=&inspection=rejected
-  app.get(`${BASE}/rolls`, authenticateToken, withClient(async (req, res, client) => {
+  // Work orders (POs) — optionally filtered by client — with the fields we
+  // auto-fill from. po = work_order_no, mo = customer_po.
+  app.get("/api/finished-warehouse/work-orders", authenticateToken, withClient(async (req, res, client) => {
+    const { customerId } = req.query;
     const params = [];
-    const where = [];
-    const statuses = String(req.query.status || "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (statuses.length) { params.push(statuses); where.push(`r.status = ANY($${params.length}::text[])`); }
-    if (req.query.containerId) { params.push(req.query.containerId); where.push(`r.container_id = $${params.length}`); }
-    if (req.query.locationId) { params.push(req.query.locationId); where.push(`r.location_id = $${params.length}`); }
-    if (req.query.box) {
-      params.push(normBox(req.query.box));
-      where.push(`UPPER(b.code) = $${params.length}`);
-    }
-    if (req.query.inspection) { params.push(req.query.inspection); where.push(`r.inspection_result = $${params.length}`); }
-    if (req.query.minDays) {
-      params.push(Number(req.query.minDays) || 0);
-      where.push(`r.received_at IS NOT NULL AND r.received_at <= now() - ($${params.length} || ' days')::interval`);
-    }
-    if (str(req.query.q)) {
-      params.push(`%${String(req.query.q).trim()}%`);
-      const p = `$${params.length}`;
-      where.push(`(r.roll_no ILIKE ${p} OR r.po_number ILIKE ${p} OR r.supplier ILIKE ${p} OR r.color ILIKE ${p}
-                   OR r.lot ILIKE ${p} OR r.fabric_name ILIKE ${p} OR r.customer ILIKE ${p} OR r.item_sku_code ILIKE ${p}
-                   OR b.code ILIKE ${p} OR l.code ILIKE ${p})`);
-    }
-    const limit = Math.min(5000, Math.max(1, parseInt(req.query.limit, 10) || 1500));
+    let where = "WHERE wo.status <> 'cancelled'";
+    if (customerId) { params.push(customerId); where += ` AND wo.customer_id = $${params.length}`; }
     const { rows } = await client.query(
-      `${ROLL_SELECT} ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-       ORDER BY r.updated_at DESC, r.id DESC LIMIT ${limit}`,
+      `SELECT wo.id,
+              wo.work_order_no                     AS po,
+              wo.customer_po                       AS mo,
+              COALESCE(wo.estilo, wo.style_code)   AS style,
+              wo.fabric_code,
+              wo.color                             AS color_name,
+              wo.customer_id,
+              wo.customer_name,
+              c.code                               AS customer_code
+         FROM work_orders wo
+         LEFT JOIN customers c ON c.id = wo.customer_id
+         ${where}
+         ORDER BY wo.created_at DESC
+         LIMIT 500`,
       params
     );
-    res.json({ success: true, rolls: rows, agingDays: AGING_DAYS });
+    res.json({ success: true, workOrders: rows });
   }));
 
-  app.get(`${BASE}/rolls/:id/history`, authenticateToken, withClient(async (req, res, client) => {
-    const { rows } = await client.query(
-      `SELECT m.*,
-              NULLIF(concat_ws(' · ', m.from_box_code, lf.code), '') AS from_location,
-              NULLIF(concat_ws(' · ', m.to_box_code, lt.code), '') AS to_location,
-              u.full_name AS user_name
-         FROM fabric_roll_movements m
-         LEFT JOIN fabric_locations lf ON lf.id = m.from_location_id
-         LEFT JOIN fabric_locations lt ON lt.id = m.to_location_id
-         LEFT JOIN users u ON u.id = m.user_id
-        WHERE m.roll_id = $1 ORDER BY m.created_at DESC, m.id DESC`,
-      [req.params.id]
+  // Everything needed to pre-fill the box form for one work order, plus its
+  // size×color lines so the operator can pick a row instead of retyping.
+  app.get("/api/finished-warehouse/autofill/:workOrderId", authenticateToken, withClient(async (req, res, client) => {
+    const woId = parseInt(req.params.workOrderId, 10);
+    const woRes = await client.query(
+      `SELECT wo.id,
+              wo.work_order_no                     AS po,
+              wo.customer_po                       AS mo,
+              COALESCE(wo.estilo, wo.style_code)   AS style,
+              wo.fabric_code,
+              wo.color                             AS color_name,
+              wo.customer_id,
+              wo.customer_name,
+              c.code                               AS customer_code
+         FROM work_orders wo
+         LEFT JOIN customers c ON c.id = wo.customer_id
+        WHERE wo.id = $1`,
+      [woId]
     );
-    res.json({ success: true, history: rows });
-  }));
-
-  // Cancel requests that have not arrived yet. Body: { ids }
-  app.post(`${BASE}/rolls/cancel`, authenticateToken, withClient(async (req, res, client) => {
-    const ids = idList(req.body?.ids);
-    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
-    await client.query("BEGIN");
-    const { rows } = await client.query(
-      `UPDATE fabric_rolls SET status = 'cancelled', updated_at = now()
-        WHERE id = ANY($1::bigint[]) AND status IN ('requested','assigned')
-        RETURNING id, location_id`,
-      [ids]
-    );
-    for (const r of rows) await logMove(client, { rollId: r.id, type: "cancelled", from: r.location_id, userId: req.user?.id });
-    await client.query("COMMIT");
-    res.json({ success: true, cancelled: rows.length, skipped: ids.length - rows.length });
-  }));
-
-  // ======================================================================
-  //  CONTAINERS (F01…F80) — shared helpers
-  // ======================================================================
-  // A container (fabric_boxes) is parked on at most one spot and a spot holds
-  // at most one container. Rolls belong to the container (fabric_rolls.box_id);
-  // fabric_rolls.location_id / container_id are kept equal to the container's
-  // current spot / division so filters and reports keep working.
-
-  const BOX_SELECT = `
-    SELECT b.id, b.code, b.location_id, b.placed_at,
-           COALESCE(b.capacity, l.capacity) AS capacity,
-           l.code AS location_code, l.container_id, c.code AS division_code, c.code AS container_code,
-           (SELECT COUNT(*)::int FROM fabric_rolls r WHERE r.box_id = b.id AND r.status = 'in_stock') AS stored,
-           (SELECT COUNT(*)::int FROM fabric_rolls r WHERE r.box_id = b.id AND r.status = 'assigned') AS reserved,
-           (SELECT COALESCE(SUM(r.yards),0) FROM fabric_rolls r WHERE r.box_id = b.id AND r.status = 'in_stock') AS yards
-      FROM fabric_boxes b
-      LEFT JOIN fabric_locations  l ON l.id = b.location_id
-      LEFT JOIN fabric_containers c ON c.id = l.container_id`;
-
-  const boxInfo = async (client, id) =>
-    id ? (await client.query(`${BOX_SELECT} WHERE b.id = $1`, [id])).rows[0] || null : null;
-
-  // Is there room for these rolls in the container? (excludeIds = the rolls being placed)
-  async function roomInBox(client, boxId, excludeIds = [], adding = 1) {
-    const { rows } = await client.query(
-      `SELECT b.id, b.code, COALESCE(b.capacity, l.capacity) AS capacity, b.location_id,
-              l.code AS location_code, l.container_id,
-              (SELECT COUNT(*)::int FROM fabric_rolls r
-                WHERE r.box_id = b.id AND r.status IN ('assigned','in_stock')
-                  AND NOT (r.id = ANY($2::bigint[]))) AS used
-         FROM fabric_boxes b LEFT JOIN fabric_locations l ON l.id = b.location_id
-        WHERE b.id = $1 AND b.is_active`,
-      [boxId, excludeIds]
-    );
-    const B = rows[0];
-    if (!B) return { error: "Contenedor no encontrado.", status: 404, code: "no_box" };
-    if (!B.location_id) {
-      return { error: `${B.code} no tiene lugar registrado. Escanee el lugar donde está y después ${B.code}.`, status: 409, code: "box_unplaced", B };
+    if (woRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Orden de trabajo no encontrada" });
     }
-    if (B.capacity != null && B.used + adding > B.capacity) {
-      const free = Math.max(0, B.capacity - B.used);
+    const header = woRes.rows[0];
+
+    const linesRes = await client.query(
+      `SELECT l.talla        AS size_code,
+              l.color        AS color_name,
+              l.estilo       AS style,
+              l.customer_po  AS mo,
+              l.fabric_code,
+              l.quantity
+         FROM work_order_lines l
+        WHERE l.work_order_id = $1
+        ORDER BY l.color, l.talla`,
+      [woId]
+    );
+
+    res.json({ success: true, header, lines: linesRes.rows });
+  }));
+
+  // Line-leader INPUT for one work order: what each production line has reported
+  // as finished (packing/terminado ops), plus ordered vs produced totals. Lets
+  // the Almacén PT operator see "qué entró de cada línea" and judge WHEN a work
+  // order has enough finished to build its pre-packing list. Read-only.
+  app.get("/api/finished-warehouse/work-orders/:workOrderId/line-production", authenticateToken, withClient(async (req, res, client) => {
+    const woId = parseInt(req.params.workOrderId, 10);
+    const woRes = await client.query(
+      `SELECT id, work_order_no AS po, customer_po AS mo FROM work_orders WHERE id = $1`, [woId]
+    );
+    if (woRes.rows.length === 0) return res.status(404).json({ success: false, error: "Orden de trabajo no encontrada" });
+
+    // Ordered = sum of the order's size×color lines. Produced = order-level total
+    // from the same packing-operation logic the planner uses (single source).
+    const ordRes = await client.query(
+      `SELECT COALESCE(SUM(quantity), 0) AS ordered FROM work_order_lines WHERE work_order_id = $1`, [woId]
+    );
+    const orderedTotal = Number(ordRes.rows[0].ordered) || 0;
+
+    const lines = await workOrders.producedByLineFor(client, woId);   // [{ line_no, finished, last_reported_at }]
+    const producedTotal = await workOrders.producedQuantityFor(client, woId);
+
+    res.json({ success: true, workOrder: woRes.rows[0], orderedTotal, producedTotal, lines });
+  }));
+
+  // DASHBOARD feed: work orders that have line production, most recently active
+  // first, each with ordered/produced totals, the per-line breakdown, and any
+  // pre-packing lists already started. This is what the "Entrada de líneas" view
+  // reads so the operator can spot which orders are ready to pre-empaque.
+  app.get("/api/finished-warehouse/line-input", authenticateToken, withClient(async (req, res, client) => {
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 60));
+
+    // Candidate orders: any with production runs, not cancelled, newest activity first.
+    const woRes = await client.query(
+      `SELECT wo.id,
+              wo.work_order_no                   AS po,
+              wo.customer_po                     AS mo,
+              COALESCE(wo.estilo, wo.style_code) AS style,
+              wo.customer_id,
+              wo.customer_name,
+              c.code                             AS customer_code,
+              MAX(lr.updated_at)                 AS last_activity
+         FROM work_orders wo
+         JOIN line_runs lr ON lr.work_order_id = wo.id
+         LEFT JOIN customers c ON c.id = wo.customer_id
+        WHERE wo.status <> 'cancelled'
+        GROUP BY wo.id, c.code
+        ORDER BY MAX(lr.updated_at) DESC NULLS LAST
+        LIMIT $1`,
+      [limit]
+    );
+    const orders = woRes.rows;
+    if (orders.length === 0) return res.json({ success: true, orders: [] });
+    const ids = orders.map((o) => o.id);
+
+    // Ordered totals, existing lists, and per-line production — one query each.
+    const ordRes = await client.query(
+      `SELECT work_order_id, COALESCE(SUM(quantity), 0) AS ordered
+         FROM work_order_lines WHERE work_order_id = ANY($1) GROUP BY work_order_id`, [ids]
+    );
+    const orderedBy = new Map(ordRes.rows.map((r) => [Number(r.work_order_id), Number(r.ordered) || 0]));
+
+    const listRes = await client.query(
+      `SELECT work_order_id, list_no, status FROM pre_packing_lists
+        WHERE work_order_id = ANY($1) ORDER BY id ASC`, [ids]
+    );
+    const listsBy = new Map();
+    for (const r of listRes.rows) {
+      const key = Number(r.work_order_id);
+      const arr = listsBy.get(key) || [];
+      arr.push({ list_no: r.list_no, status: r.status });
+      listsBy.set(key, arr);
+    }
+
+    const lineMap = await workOrders.producedByLineForMany(client, ids);
+
+    const result = orders.map((o) => {
+      const lines = lineMap.get(Number(o.id)) || [];
+      const producedTotal = lines.reduce((s, l) => s + (Number(l.finished) || 0), 0);
       return {
-        error: free ? `${B.code} solo tiene espacio para ${free} rollo(s).` : `${B.code} está lleno (${B.used}/${B.capacity} rollos). Escanee otro contenedor.`,
-        status: 409, code: "location_full", B,
+        id: o.id,
+        po: o.po,
+        mo: o.mo,
+        style: o.style,
+        customer_id: o.customer_id,
+        customer_name: o.customer_name,
+        customer_code: o.customer_code,
+        orderedTotal: orderedBy.get(Number(o.id)) || 0,
+        producedTotal,
+        lastActivity: o.last_activity,
+        lines,
+        lists: listsBy.get(Number(o.id)) || [],
       };
-    }
-    return { B };
-  }
-
-  // Old clients send a spot (locationId); new ones send the container (boxId).
-  async function boxIdFrom(client, body) {
-    const boxId = parseInt(body?.boxId, 10);
-    if (boxId) return boxId;
-    const locationId = parseInt(body?.locationId, 10);
-    if (!locationId) return null;
-    const r = await client.query(`SELECT id FROM fabric_boxes WHERE location_id = $1 AND is_active`, [locationId]);
-    return r.rows[0]?.id || null;
-  }
-
-  // Reserve (requested/assigned) or relocate (in_stock) rolls into a container.
-  // Runs its own transaction. Throws { status } errors.
-  async function assignRolls(client, { ids, boxId, userId }) {
-    const room = await roomInBox(client, boxId, ids, ids.length);
-    if (room.error) throw Object.assign(new Error(room.error), { status: room.status, code: room.code });
-    const B = room.B;
-    await client.query("BEGIN");
-    const { rows } = await client.query(
-      `UPDATE fabric_rolls r
-          SET box_id = $2, location_id = $3, container_id = $4,
-              status = CASE WHEN r.status = 'requested' THEN 'assigned' ELSE r.status END,
-              location_set_at = now(), updated_at = now()
-         FROM (SELECT id, location_id AS old_loc, box_id AS old_box, status AS old_status
-                 FROM fabric_rolls WHERE id = ANY($1::bigint[]) FOR UPDATE) prev
-        WHERE r.id = prev.id AND prev.old_status IN ('requested','assigned','in_stock')
-        RETURNING r.id, prev.old_loc, prev.old_status,
-                  (SELECT code FROM fabric_boxes WHERE id = prev.old_box) AS old_box_code`,
-      [ids, B.id, B.location_id, B.container_id]
-    );
-    for (const r of rows) {
-      await logMove(client, {
-        rollId: r.id,
-        type: r.old_status === "in_stock" ? "relocated" : "location_set",
-        from: r.old_loc, to: B.location_id, fromBox: r.old_box_code, toBox: B.code, userId,
-      });
-    }
-    await client.query("COMMIT");
-    return { updated: rows.length, skipped: ids.length - rows.length, B };
-  }
-
-  // Set (or change) the container of rolls. Body: { ids, boxId } (or legacy { ids, locationId })
-  // requested/assigned rolls get reserved there; in_stock rolls are relocated.
-  app.post(`${BASE}/rolls/assign-location`, authenticateToken, withClient(async (req, res, client) => {
-    const ids = idList(req.body?.ids);
-    const boxId = await boxIdFrom(client, req.body);
-    if (!ids.length || !boxId) return fail(res, 400, "Seleccione rollos y un contenedor.");
-    const r = await assignRolls(client, { ids, boxId, userId: req.user?.id });
-    res.json({
-      success: true, updated: r.updated, skipped: r.skipped,
-      box: await boxInfo(client, boxId),
-      location: { id: r.B.location_id, code: r.B.location_code, box_id: r.B.id, box_code: r.B.code },
     });
+
+    res.json({ success: true, orders: result });
   }));
 
   // ======================================================================
-  //  SCANNING: Lugar (A01) → Contenedor (F33) → Rollos
+  //  ESCANEO DE TICKETS (intake por escáner en el almacén)
   // ======================================================================
 
-  // Spot label → spot id. Accepts "A01", "a-01", division+code or a custom qr_code.
-  async function resolveLocation(client, text, norm) {
-    const { rows } = await client.query(
-      `SELECT l.id
-         FROM fabric_locations l
-         JOIN fabric_containers c ON c.id = l.container_id AND c.is_active
-        WHERE UPPER(l.qr_code) = UPPER($1)
-           OR regexp_replace(UPPER(l.code), '[^A-Z0-9]', '', 'g') = $2
-           OR regexp_replace(UPPER(c.code || l.code), '[^A-Z0-9]', '', 'g') = $2
-        ORDER BY (UPPER(l.qr_code) = UPPER($1)) DESC NULLS LAST, l.id
-        LIMIT 1`,
-      [text, norm]
-    );
-    return rows[0]?.id || null;
-  }
+  // Un ticket escaneado -> un renglón. El body puede traer:
+  //   { raw: "<texto tal cual salió del escáner>" }   (recomendado)
+  // o los campos ya decodificados por el cliente. El servidor decodifica el QR
+  // (JSON o formato de tubería ZPL), y guarda el ticket con la HORA DE ESCANEO.
+  // Es idempotente por ticket_no: re-escanear el mismo ticket NO duplica; regresa
+  // { duplicate: true } con el registro original.
+  app.post("/api/finished-warehouse/scan", authenticateToken, withClient(async (req, res, client) => {
+    const body = req.body || {};
 
-  async function locationInfo(client, id) {
-    const { rows } = await client.query(
-      `SELECT l.id, l.code, l.container_id, c.code AS container_code, c.code AS division_code, c.name AS container_name,
-              b.id AS box_id, b.code AS box_code, COALESCE(b.capacity, l.capacity) AS capacity,
-              (SELECT COUNT(*)::int FROM fabric_rolls r WHERE r.location_id = l.id AND r.status = 'in_stock') AS stored,
-              (SELECT COUNT(*)::int FROM fabric_rolls r WHERE r.location_id = l.id AND r.status = 'assigned') AS reserved,
-              (SELECT COALESCE(SUM(r.yards),0) FROM fabric_rolls r WHERE r.location_id = l.id AND r.status = 'in_stock') AS yards
-         FROM fabric_locations l
-         JOIN fabric_containers c ON c.id = l.container_id
-         LEFT JOIN fabric_boxes b ON b.location_id = l.id AND b.is_active
-        WHERE l.id = $1`,
-      [id]
-    );
-    return rows[0] || null;
-  }
+    // Aceptamos el texto crudo (lo normal) o un objeto ya parseado por el front.
+    const parsed = body.raw != null
+      ? parseTicketScan(body.raw)
+      : parseTicketScan(JSON.stringify(body));
 
-  // What is this code? → { kind: "box", box } | { kind: "location", location }
-  //                     | { kind: "unknown_box", code } (only when expect = "box")
-  //                     | null (treat it as a roll barcode)
-  async function classifyCode(client, raw, expect) {
-    const text = String(raw ?? "").trim();
-    if (!text || text.length > 40 || text.startsWith("{") || text.includes("|")) return null;
-    const norm = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
-    if (!norm || /^\d{6,}$/.test(norm)) return null; // long numbers are roll barcodes
-    const code = normBox(text);
-    const b = await client.query(
-      `SELECT id FROM fabric_boxes
-        WHERE is_active AND (UPPER(code) = $1 OR regexp_replace(UPPER(code), '[^A-Z0-9]', '', 'g') = $2)
-        LIMIT 1`,
-      [code, norm]
-    );
-    if (b.rows.length) return { kind: "box", box: await boxInfo(client, b.rows[0].id) };
-    const loc = await resolveLocation(client, text, norm);
-    if (loc) return { kind: "location", location: await locationInfo(client, loc) };
-    if (expect === "box" && /^[A-Z]{1,4}\d{1,4}$/.test(code)) return { kind: "unknown_box", code };
-    return null;
-  }
-
-  // Finds the roll behind a scanned barcode. → { scan, rows } | { error }
-  async function findScannedRoll(client, raw, statusSql = `r.status <> 'cancelled'`) {
-    const scan = parseRollScan(raw);
-    if (!scan) return { error: "No se pudo leer el código del rollo.", status: 400 };
-    const params = [scan.roll_no.toUpperCase()];
-    let extra = "";
-    if (scan.supplier_code) { params.push(scan.supplier_code.toUpperCase()); extra = ` AND (UPPER(r.supplier_code) = $2 OR r.source = 'scan')`; }
-    const found = await client.query(
-      `${ROLL_SELECT} WHERE UPPER(r.roll_no) = $1${extra} AND ${statusSql} ORDER BY r.id DESC`,
-      params
-    );
-    return { scan, rows: found.rows };
-  }
-
-  // Receive one scanned roll into the active container. Returns { status, body }.
-  async function receiveRoll(client, { raw, boxId, allowUnrequested, userId }) {
-    const f = await findScannedRoll(client, raw);
-    if (f.error) return { status: f.status, body: { success: false, error: f.error } };
-    const { scan } = f;
-    if (!boxId) {
-      return { status: 409, body: { success: false, code: "no_box", error: "Escanee primero el lugar (A01) y después el contenedor (F01)." } };
+    if (!parsed || (!parsed.work_order_no && !parsed.ticket_no)) {
+      return res.status(400).json({ success: false, error: "No se pudo leer el ticket. Verifique el código QR." });
     }
 
-    // Not requested from Skytex: register it right here if allowed.
-    if (!f.rows.length) {
-      if (!allowUnrequested) {
-        return { status: 404, body: { success: false, code: "not_requested", rollNo: scan.roll_no,
-          error: `El rollo ${scan.roll_no} no fue solicitado a Skytex.` } };
+    // Número impreso en el QR (T-…): sirve como llave para NO duplicar re-escaneos.
+    // Si el código no lo trae (formatos viejos), derivamos uno estable del contenido.
+    if (!parsed.ticket_no) {
+      const basis = [parsed.work_order_no, parsed.size_code, parsed.color, parsed.customer_po, parsed.run_id, parsed.seq]
+        .map((x) => String(x ?? "")).join("|");
+      let h = 0;
+      for (let i = 0; i < basis.length; i++) h = (h * 31 + basis.charCodeAt(i)) >>> 0;
+      parsed.ticket_no = `SCAN-${h.toString(36).toUpperCase()}`;
+    }
+
+    // ── Re-escaneo: si el mismo ticket ya se escaneó, devolvemos el original
+    //    (con su folio y cliente) y NO consumimos un folio nuevo. ────────────
+    const existing = await client.query(`SELECT * FROM scanned_tickets WHERE ticket_no = $1`, [parsed.ticket_no]);
+    if (existing.rows.length > 0) {
+      return res.json({ success: true, duplicate: true, ticket: existing.rows[0] });
+    }
+
+    // ── Cliente: se resuelve desde la orden de trabajo (wo = work_order_no). ──
+    // El estilo también sale de la orden cuando el QR no lo trae.
+    let customer = { id: null, code: null, name: null };
+    if (parsed.work_order_no) {
+      const cRes = await client.query(
+        `SELECT wo.customer_id, wo.customer_name, c.code AS customer_code,
+                COALESCE(wo.estilo, wo.style_code) AS style
+           FROM work_orders wo
+           LEFT JOIN customers c ON c.id = wo.customer_id
+          WHERE wo.work_order_no = $1
+          LIMIT 1`,
+        [parsed.work_order_no]
+      );
+      if (cRes.rows.length) {
+        customer = { id: cRes.rows[0].customer_id, code: cRes.rows[0].customer_code, name: cRes.rows[0].customer_name };
+        if (!parsed.style && cRes.rows[0].style) parsed.style = cRes.rows[0].style;
       }
-      const room = await roomInBox(client, boxId);
-      if (room.error) return { status: room.status, body: { success: false, code: room.code, error: room.error } };
-      await client.query("BEGIN");
-      const ins = await client.query(
-        `INSERT INTO fabric_rolls (skytex_key, roll_no, supplier_code, raw, status, source, box_id, container_id, location_id,
-                                   received_at, received_by, requested_by, location_set_at)
-         VALUES ($1, $2, $3, $4, 'in_stock', 'scan', $5, $6, $7, now(), $8, $8, now())
-         ON CONFLICT (skytex_key) DO UPDATE
-           SET status = 'in_stock', box_id = EXCLUDED.box_id, container_id = EXCLUDED.container_id,
-               location_id = EXCLUDED.location_id, received_at = now(), received_by = EXCLUDED.received_by, updated_at = now()
-         RETURNING id`,
-        [`SCAN|${scan.roll_no.toUpperCase()}`, scan.roll_no, scan.supplier_code, JSON.stringify({ scanned: scan.raw }),
-         room.B.id, room.B.container_id, room.B.location_id, userId ?? null]
-      );
-      await logMove(client, { rollId: ins.rows[0].id, type: "received", to: room.B.location_id, toBox: room.B.code, reason: "Sin solicitud a Skytex", userId });
-      await client.query("COMMIT");
-      const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [ins.rows[0].id]);
-      return { status: 200, body: { success: true, duplicate: false, unrequested: true, roll: fresh.rows[0] } };
     }
 
-    const pending = f.rows.filter((r) => ["requested", "assigned"].includes(r.status));
-    if (!pending.length) {
-      const r = f.rows[0];
-      const where = r.box_code ? ` en ${r.box_code}${r.location_code ? ` (${r.location_code})` : ""}` : r.location_code ? ` en ${r.location_code}` : "";
-      return { status: 200, body: { success: true, duplicate: true, roll: r,
-        message: r.status === "in_stock" ? `Este rollo ya está guardado${where}.` : `El rollo ya está en estado «${r.status}».` } };
-    }
-    if (pending.length > 1) {
-      return { status: 409, body: { success: false, error: `Hay ${pending.length} rollos ${scan.roll_no} de distintos proveedores. Escanee el código completo.` } };
-    }
-    const roll = pending[0];
-    const room = await roomInBox(client, boxId, [roll.id]);
-    if (room.error) return { status: room.status, body: { success: false, code: room.code, error: room.error } };
+    // ── Folio consecutivo (SKM0001, SKM0002…). El prefijo sale de las letras
+    //    iniciales del No. de orden (SKM0001-… → "SKM"); si no hay, usamos "TKT".
+    const folioPrefix = (String(parsed.work_order_no ?? "").match(/^[A-Za-z]+/)?.[0] || "TKT").toUpperCase();
+    const folio = await nextFolio(client, folioPrefix);
 
-    await client.query("BEGIN");
-    await client.query(
-      `UPDATE fabric_rolls
-          SET status = 'in_stock', box_id = $2, location_id = $3, container_id = $4,
-              received_at = now(), received_by = $5, updated_at = now()
-        WHERE id = $1`,
-      [roll.id, room.B.id, room.B.location_id, room.B.container_id, userId ?? null]
+    const ins = await client.query(
+      `INSERT INTO scanned_tickets
+         (folio, ticket_no, work_order_no, customer_id, customer_code, customer_name,
+          customer_po, style, size_code, size_label, color, pieces, production_date,
+          run_id, seq, raw, scanned_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       ON CONFLICT (ticket_no) DO NOTHING
+       RETURNING *`,
+      [
+        folio, parsed.ticket_no, parsed.work_order_no, customer.id, customer.code, customer.name,
+        parsed.customer_po, parsed.style, parsed.size_code, parsed.size_label, parsed.color,
+        parsed.pieces, parsed.production_date, parsed.run_id, parsed.seq, parsed.raw, req.user?.id ?? null,
+      ]
     );
-    const moved = !!(roll.box_id && String(roll.box_id) !== String(room.B.id));
-    await logMove(client, {
-      rollId: roll.id, type: "received",
-      from: moved ? roll.location_id : null, fromBox: moved ? roll.box_code : null,
-      to: room.B.location_id, toBox: room.B.code, reference: roll.po_number, userId,
-    });
-    await client.query("COMMIT");
-    const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [roll.id]);
-    return { status: 200, body: { success: true, duplicate: false, roll: fresh.rows[0], movedFromAssigned: moved, reservedIn: moved ? roll.box_code : null } };
-  }
 
-  // Reserve one scanned (requested) roll in the active container.
-  async function reserveRoll(client, { raw, boxId, userId }) {
-    const f = await findScannedRoll(client, raw);
-    if (f.error) return { status: f.status, body: { success: false, error: f.error } };
-    if (!boxId) {
-      return { status: 409, body: { success: false, code: "no_box", error: "Escanee primero el lugar (A01) y después el contenedor (F01)." } };
+    if (ins.rows.length > 0) {
+      return res.json({ success: true, duplicate: false, ticket: ins.rows[0] });
     }
-    if (!f.rows.length) {
-      return { status: 404, body: { success: false, code: "not_requested", rollNo: f.scan.roll_no,
-        error: `El rollo ${f.scan.roll_no} no ha sido solicitado a Skytex.` } };
-    }
-    const pending = f.rows.filter((r) => ["requested", "assigned"].includes(r.status));
-    if (!pending.length) {
-      const r = f.rows[0];
-      return { status: 200, body: { success: true, duplicate: true, roll: r,
-        message: r.status === "in_stock"
-          ? `${r.roll_no} ya llegó y está guardado en ${r.box_code || r.location_code || "—"}.`
-          : `El rollo ya está en estado «${r.status}».` } };
-    }
-    if (pending.length > 1) {
-      return { status: 409, body: { success: false, error: `Hay ${pending.length} rollos ${f.scan.roll_no} de distintos proveedores. Escanee el código completo.` } };
-    }
-    const roll = pending[0];
-    if (roll.status === "assigned" && String(roll.box_id) === String(boxId)) {
-      return { status: 200, body: { success: true, duplicate: true, roll, message: `${roll.roll_no} ya está reservado en ${roll.box_code}.` } };
-    }
-    const r = await assignRolls(client, { ids: [roll.id], boxId, userId });
-    if (!r.updated) return { status: 409, body: { success: false, error: "El rollo cambió de estado. Actualice e intente de nuevo." } };
-    const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [roll.id]);
-    return { status: 200, body: { success: true, duplicate: false, roll: fresh.rows[0], changedFrom: roll.status === "assigned" ? roll.box_code : null } };
-  }
 
-  // One endpoint for every label the PDA reads.
-  //   Body: { raw, boxId?, expect?, allowUnrequested? }
-  //   • spot label (A01)      → { kind: "location", location }
-  //   • container label (F33) → { kind: "box", box }   (unknown code + expect "box" → { kind: "unknown_box", code })
-  //   • roll barcode          → roll received into boxId → { kind: "roll", roll, box }
-  // /reserve-scan is the same, but a roll is RESERVED in boxId (before arrival).
-  const scanHandler = (mode) => withClient(async (req, res, client) => {
-    const raw = str(req.body?.raw);
-    if (!raw) return fail(res, 400, "Código vacío.");
-    const hit = await classifyCode(client, raw, req.body?.expect);
-    if (hit) return res.json({ success: true, ...hit });
-    const boxId = await boxIdFrom(client, req.body);
-    const r = mode === "reserve"
-      ? await reserveRoll(client, { raw, boxId, userId: req.user?.id })
-      : await receiveRoll(client, { raw, boxId, allowUnrequested: req.body?.allowUnrequested === true, userId: req.user?.id });
-    if (r.body.success && r.body.roll?.box_id) r.body.box = await boxInfo(client, r.body.roll.box_id);
-    res.status(r.status).json({ kind: "roll", ...r.body });
-  });
-  app.post(`${BASE}/scan`, authenticateToken, scanHandler("receive"));
-  app.post(`${BASE}/reserve-scan`, authenticateToken, scanHandler("reserve"));
-
-  // Roll-only receive (kept for compatibility). Body: { raw, boxId | locationId, allowUnrequested? }
-  app.post(`${BASE}/scan-in`, authenticateToken, withClient(async (req, res, client) => {
-    const r = await receiveRoll(client, {
-      raw: req.body?.raw,
-      boxId: await boxIdFrom(client, req.body),
-      allowUnrequested: req.body?.allowUnrequested === true,
-      userId: req.user?.id,
-    });
-    res.status(r.status).json(r.body);
+    // Carrera rarísima (dos escaneos idénticos a la vez): devolvemos el que ganó.
+    const prev = await client.query(`SELECT * FROM scanned_tickets WHERE ticket_no = $1`, [parsed.ticket_no]);
+    return res.json({ success: true, duplicate: true, ticket: prev.rows[0] || null });
   }));
 
-  // Rolls in one container (newest first) + its counters.
-  app.get(`${BASE}/boxes/:id/rolls`, authenticateToken, withClient(async (req, res, client) => {
-    const info = await boxInfo(client, req.params.id);
-    if (!info) return fail(res, 404, "Contenedor no encontrado.");
+  // Lista de tickets escaneados (más reciente primero) + totales. Filtros
+  // opcionales: q (texto), workOrder (No. de orden), po, date (YYYY-MM-DD).
+  app.get("/api/finished-warehouse/scanned-tickets", authenticateToken, withClient(async (req, res, client) => {
+    const { q, workOrder, po, date } = req.query;
+    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 300));
+    const params = [];
+    let where = "WHERE 1=1";
+    if (workOrder) { params.push(workOrder); where += ` AND work_order_no = $${params.length}`; }
+    if (po)        { params.push(po);        where += ` AND customer_po = $${params.length}`; }
+    if (date && /^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+      params.push(date); where += ` AND scanned_at::date = $${params.length}::date`;
+    }
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND (ticket_no ILIKE $${params.length} OR work_order_no ILIKE $${params.length}
+                   OR customer_po ILIKE $${params.length} OR color ILIKE $${params.length}
+                   OR style ILIKE $${params.length})`;
+    }
+    params.push(limit);
     const { rows } = await client.query(
-      `${ROLL_SELECT} WHERE r.box_id = $1 AND r.status IN ('in_stock','assigned')
-       ORDER BY (r.status = 'in_stock') DESC, COALESCE(r.received_at, r.location_set_at) DESC NULLS LAST, r.id DESC`,
-      [req.params.id]
+      `SELECT * FROM scanned_tickets ${where} ORDER BY scanned_at DESC LIMIT $${params.length}`, params
     );
-    res.json({ success: true, box: info, rolls: rows });
+    const totals = rows.reduce(
+      (t, r) => {
+        t.tickets += 1;
+        t.pieces += Number(r.pieces) || 0;
+        if (r.checked_in_at) { t.checkedIn += 1; }
+        else { t.pending += 1; t.pendingPieces += Number(r.pieces) || 0; }
+        return t;
+      },
+      { tickets: 0, pieces: 0, pending: 0, pendingPieces: 0, checkedIn: 0 }
+    );
+    res.json({ success: true, tickets: rows, totals });
   }));
 
-  // Rolls stored on one spot (kept for compatibility).
-  app.get(`${BASE}/locations/:id/rolls`, authenticateToken, withClient(async (req, res, client) => {
-    const info = await locationInfo(client, req.params.id);
-    if (!info) return fail(res, 404, "Ubicación no encontrada.");
-    const { rows } = await client.query(
-      `${ROLL_SELECT} WHERE r.location_id = $1 AND r.status IN ('in_stock','assigned')
-       ORDER BY (r.status = 'in_stock') DESC, r.received_at DESC NULLS LAST, r.id DESC`,
-      [req.params.id]
-    );
-    res.json({ success: true, location: info, rolls: rows });
-  }));
-
-  // Undo a receipt scanned by mistake (only while still in stock).
-  app.post(`${BASE}/rolls/:id/undo-receive`, authenticateToken, withClient(async (req, res, client) => {
-    await client.query("BEGIN");
-    const { rows } = await client.query(
-      `UPDATE fabric_rolls SET status = 'assigned', received_at = NULL, received_by = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'in_stock' RETURNING id, location_id`,
-      [req.params.id]
-    );
-    if (!rows.length) { await client.query("ROLLBACK"); return fail(res, 409, "Solo se puede deshacer un rollo que sigue en inventario."); }
-    await logMove(client, { rollId: rows[0].id, type: "receive_undone", from: rows[0].location_id, userId: req.user?.id });
-    await client.query("COMMIT");
+  // Deshacer un escaneo (p. ej. un ticket escaneado por error).
+  app.delete("/api/finished-warehouse/scanned-tickets/:id", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const del = await client.query(`DELETE FROM scanned_tickets WHERE id = $1 RETURNING id, checked_in_at`, [id]);
+    if (del.rows.length === 0) return res.status(404).json({ success: false, error: "Ticket no encontrado" });
     res.json({ success: true });
   }));
 
-  // Resolve a scanned code to a roll (used by the inspection send screen).
-  app.post(`${BASE}/lookup`, authenticateToken, withClient(async (req, res, client) => {
-    const scan = parseRollScan(req.body?.raw);
-    if (!scan) return fail(res, 400, "No se pudo leer el código.");
-    const params = [scan.roll_no.toUpperCase()];
-    let extra = "";
-    if (scan.supplier_code) { params.push(scan.supplier_code.toUpperCase()); extra = ` AND UPPER(r.supplier_code) = $2`; }
+  // ── Check-in masivo: ingresar varios tickets pendientes de una vez. ───────
+  // Body: { ids: [1, 2, 3…] } (los tickets visibles con los filtros del front).
+  // Todo en una transacción: o entran todos o ninguno. Los que ya estaban
+  // ingresados se saltan sin volver a sumar.
+  app.post("/api/finished-warehouse/scanned-tickets/check-in-bulk", authenticateToken, withClient(async (req, res, client) => {
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((x) => parseInt(x, 10)).filter(Number.isInteger))];
+    if (ids.length === 0) return res.status(400).json({ success: false, error: "No hay tickets para ingresar" });
+    if (ids.length > 2000) return res.status(400).json({ success: false, error: "Demasiados tickets en una sola operación (máx. 2000)" });
+
+    await client.query("BEGIN");
+    const tRes = await client.query(
+      `SELECT * FROM scanned_tickets WHERE id = ANY($1) AND checked_in_at IS NULL ORDER BY id FOR UPDATE`, [ids]
+    );
+    const userId = req.user?.id ?? null;
+    const tickets = [];
+    let pieces = 0;
+    for (const t of tRes.rows) {
+      const r = await checkInTicket(client, t, userId);
+      tickets.push(r.ticket);
+      pieces += r.qty;
+    }
+    await client.query("COMMIT");
+    res.json({ success: true, checkedIn: tickets.length, skipped: ids.length - tickets.length, piecesAdded: pieces, tickets });
+  }));
+
+  // ── Check-in: mover un ticket escaneado al inventario. ───────────────────
+  // Suma las piezas del ticket a finished_inventory (por SKU), registra el
+  // movimiento y marca el ticket como ingresado. Idempotente: si el ticket ya
+  // entró, se devuelve tal cual sin volver a sumar.
+  app.post("/api/finished-warehouse/scanned-tickets/:id/check-in", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: "Ticket inválido" });
+
+    await client.query("BEGIN");
+
+    const tRes = await client.query(`SELECT * FROM scanned_tickets WHERE id = $1 FOR UPDATE`, [id]);
+    if (tRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Ticket no encontrado" });
+    }
+    const t = tRes.rows[0];
+
+    // Ya ingresado: no se vuelve a contar.
+    if (t.checked_in_at) {
+      await client.query("ROLLBACK");
+      return res.json({ success: true, alreadyCheckedIn: true, ticket: t });
+    }
+
+    const { ticket, inventoryId, qty } = await checkInTicket(client, t, req.user?.id ?? null);
+
+    await client.query("COMMIT");
+    res.json({ success: true, ticket, inventoryId, piecesAdded: qty });
+  }));
+
+  // ── Deshacer check-in: regresar un ticket a "pendiente". ─────────────────
+  // Resta las piezas del ticket del inventario, registra el movimiento de salida
+  // y limpia checked_in_at/inventory_id. Idempotente: si el ticket ya está
+  // pendiente, no hace nada.
+  app.post("/api/finished-warehouse/scanned-tickets/:id/undo-check-in", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: "Ticket inválido" });
+
+    await client.query("BEGIN");
+
+    const tRes = await client.query(`SELECT * FROM scanned_tickets WHERE id = $1 FOR UPDATE`, [id]);
+    if (tRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "Ticket no encontrado" });
+    }
+    const t = tRes.rows[0];
+
+    // Ya está pendiente: nada que deshacer.
+    if (!t.checked_in_at) {
+      await client.query("ROLLBACK");
+      return res.json({ success: true, alreadyPending: true, ticket: t });
+    }
+
+    const qty = Number(t.pieces) || 0;
+
+    // Fila de inventario: la guardada al ingresar, o por SKU si faltara.
+    let inventoryId = t.inventory_id || null;
+    if (!inventoryId) {
+      const sku_key = skuKeyOf({
+        customer_code: t.customer_code || null,
+        po: t.work_order_no || null,
+        style: t.style || null,
+        color_code: colorCodeOf(t.color, t.size_code),
+        size_code: t.size_code || null,
+        sex: null,
+        fabric_code: null,
+      });
+      const invLookup = await client.query(`SELECT id FROM finished_inventory WHERE sku_key = $1`, [sku_key]);
+      inventoryId = invLookup.rows[0]?.id || null;
+    }
+
+    if (inventoryId) {
+      await client.query(
+        `UPDATE finished_inventory
+            SET quantity = GREATEST(0, quantity - $2), updated_at = now()
+          WHERE id = $1`,
+        [inventoryId, qty]
+      );
+      await client.query(
+        `INSERT INTO finished_inventory_movements (inventory_id, list_id, box_id, ticket_id, direction, quantity, created_by)
+         VALUES ($1, NULL, NULL, $2, 'out', $3, $4)`,
+        [inventoryId, t.id, qty, req.user?.id ?? null]
+      );
+    }
+
+    const upd = await client.query(
+      `UPDATE scanned_tickets
+          SET checked_in_at = NULL, checked_in_by = NULL, inventory_id = NULL
+        WHERE id = $1
+        RETURNING *`,
+      [t.id]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success: true, ticket: upd.rows[0], piecesRemoved: qty });
+  }));
+
+  // ======================================================================
+  //  PRE-PACKING LISTS
+  // ======================================================================
+
+  // List index with box_count + total_qty.
+  app.get("/api/pre-packing-lists", authenticateToken, withClient(async (req, res, client) => {
+    const { status, customerId, q } = req.query;
+    const params = [];
+    let where = "WHERE 1=1";
+    if (status)     { params.push(status);     where += ` AND l.status = $${params.length}`; }
+    if (customerId) { params.push(customerId); where += ` AND l.customer_id = $${params.length}`; }
+    if (q)          { params.push(`%${q}%`);   where += ` AND (l.list_no ILIKE $${params.length} OR l.po ILIKE $${params.length} OR l.mo ILIKE $${params.length} OR l.customer_name ILIKE $${params.length})`; }
+
     const { rows } = await client.query(
-      `${ROLL_SELECT} WHERE UPPER(r.roll_no) = $1${extra} AND r.status <> 'cancelled' ORDER BY r.id DESC`,
+      `SELECT l.*,
+              COALESCE(b.box_count, 0)  AS box_count,
+              COALESCE(b.total_qty, 0)  AS total_qty
+         FROM pre_packing_lists l
+         LEFT JOIN (
+           SELECT list_id, COUNT(*) AS box_count, SUM(quantity) AS total_qty
+             FROM pre_packing_boxes GROUP BY list_id
+         ) b ON b.list_id = l.id
+         ${where}
+         ORDER BY l.created_at DESC
+         LIMIT 500`,
       params
     );
-    if (!rows.length) return fail(res, 404, `No existe el rollo ${scan.roll_no}.`);
-    res.json({ success: true, rolls: rows });
+    res.json({ success: true, lists: rows });
   }));
 
-  // ======================================================================
-  //  CONTAINERS + LOCATIONS
-  // ======================================================================
-
-  app.get(`${BASE}/containers`, authenticateToken, withClient(async (req, res, client) => {
-    const { rows } = await client.query(`
-      SELECT c.*,
-             COALESCE((
-               SELECT json_agg(json_build_object(
-                        'id', l.id, 'code', l.code, 'capacity', COALESCE(b.capacity, l.capacity),
-                        'box_id', b.id, 'box_code', b.code,
-                        'reserved', (SELECT COUNT(*) FROM fabric_rolls r WHERE r.location_id = l.id AND r.status = 'assigned'),
-                        'stored',   (SELECT COUNT(*) FROM fabric_rolls r WHERE r.location_id = l.id AND r.status = 'in_stock'),
-                        'yards',    (SELECT COALESCE(SUM(r.yards),0) FROM fabric_rolls r WHERE r.location_id = l.id AND r.status = 'in_stock'))
-                      ORDER BY l.sort_order, l.code)
-                 FROM fabric_locations l
-                 LEFT JOIN fabric_boxes b ON b.location_id = l.id AND b.is_active
-                WHERE l.container_id = c.id
-             ), '[]'::json) AS locations
-        FROM fabric_containers c
-       WHERE c.is_active = TRUE
-       ORDER BY c.code`);
-    // Containers that are not on any spot right now (moved, waiting to be scanned).
-    const unplaced = await client.query(`${BOX_SELECT} WHERE b.is_active AND b.location_id IS NULL ORDER BY b.code`);
-    res.json({ success: true, containers: rows, unplacedBoxes: unplaced.rows });
-  }));
-
-  // Body: { code, name?, notes?, locations?: ["A-01", ...] | count?, prefix?, capacity? }
-  app.post(`${BASE}/containers`, authenticateToken, withClient(async (req, res, client) => {
-    const code = str(req.body?.code);
-    if (!code) return fail(res, 400, "Escriba el código del contenedor.");
-    await client.query("BEGIN");
-    const ins = await client.query(
-      `INSERT INTO fabric_containers (code, name, notes) VALUES ($1,$2,$3)
-       ON CONFLICT (code) DO UPDATE SET is_active = TRUE, name = COALESCE(EXCLUDED.name, fabric_containers.name)
-       RETURNING *`,
-      [code.toUpperCase(), str(req.body?.name), str(req.body?.notes)]
+  // One list with its boxes.
+  app.get("/api/pre-packing-lists/:id", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const listRes = await client.query(`SELECT * FROM pre_packing_lists WHERE id = $1`, [id]);
+    if (listRes.rows.length === 0) return res.status(404).json({ success: false, error: "Lista no encontrada" });
+    const boxesRes = await client.query(
+      `SELECT * FROM pre_packing_boxes WHERE list_id = $1 ORDER BY id ASC`, [id]
     );
-    const added = await addLocations(client, ins.rows[0].id, req.body || {});
-    await client.query("COMMIT");
-    res.json({ success: true, container: ins.rows[0], locationsAdded: added });
+    res.json({ success: true, list: listRes.rows[0], boxes: boxesRes.rows });
   }));
 
-  app.post(`${BASE}/containers/:id/locations`, authenticateToken, withClient(async (req, res, client) => {
-    await client.query("BEGIN");
-    const added = await addLocations(client, req.params.id, req.body || {});
-    await client.query("COMMIT");
-    res.json({ success: true, locationsAdded: added });
-  }));
-
-  async function addLocations(client, containerId, body) {
-    let codes = Array.isArray(body.locations) ? body.locations.map(str).filter(Boolean) : [];
-    const count = Math.min(500, parseInt(body.count, 10) || 0);
-    if (!codes.length && count > 0) {
-      const cont = (await client.query(`SELECT code FROM fabric_containers WHERE id = $1`, [containerId])).rows[0];
-      const prefix = str(body.prefix) || cont?.code || "P";
-      const sep = body.separator != null ? String(body.separator) : "";
-      const start = (await client.query(
-        `SELECT COUNT(*)::int AS n FROM fabric_locations WHERE container_id = $1`, [containerId]
-      )).rows[0].n;
-      codes = Array.from({ length: count }, (_, i) => `${prefix}${sep}${String(start + i + 1).padStart(2, "0")}`);
+  // Progreso POR TALLA para una lista, a una fecha de corte.
+  //   GET /api/pre-packing-lists/:id/size-progress?date=YYYY-MM-DD
+  // Para cada talla (× color × estilo) de la orden, scoped al PO cliente de la
+  // lista, regresa:
+  //   ordered   = total de esa talla en la orden ("cuánto hay que alcanzar")
+  //   produced  = ACUMULADO por talla hasta la fecha (tickets de la línea)
+  //   remaining = ordered - produced (lo que falta para llegar)
+  // Más `availableDays`: los días con producción por talla, para poblar el
+  // selector de fecha. Read-only; no toca cajas.
+  app.get("/api/pre-packing-lists/:id/size-progress", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const listRes = await client.query(
+      `SELECT id, work_order_id, mo, as_of_date FROM pre_packing_lists WHERE id = $1`, [id]
+    );
+    if (listRes.rows.length === 0) return res.status(404).json({ success: false, error: "Lista no encontrada" });
+    const list = listRes.rows[0];
+    if (!list.work_order_id) {
+      return res.json({ success: true, date: null, mo: list.mo, availableDays: [], sizes: [], totals: { ordered: 0, produced: 0, remaining: 0 } });
     }
-    const capacity = parseInt(body.capacity, 10) || null;
-    let added = 0;
-    for (const [i, c] of codes.entries()) {
-      const r = await client.query(
-        `INSERT INTO fabric_locations (container_id, code, capacity, sort_order)
-         VALUES ($1, $2, $3, (SELECT COALESCE(MAX(sort_order),0) + 1 + $4 FROM fabric_locations WHERE container_id = $1))
-         ON CONFLICT (container_id, code) DO NOTHING`,
-        [containerId, c.toUpperCase(), capacity, i]
+
+    // Fecha efectiva: query > la guardada en la lista > null (todo el tiempo).
+    const rawDate = String(req.query.date ?? "").trim();
+    const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+      ? rawDate
+      : (list.as_of_date ? String(list.as_of_date).slice(0, 10) : null);
+
+    const woRes = await client.query(`SELECT customer_po AS mo FROM work_orders WHERE id = $1`, [list.work_order_id]);
+    const headerMo = String(woRes.rows[0]?.mo ?? "").trim();
+    const effMo = (po) => { const m = String(po ?? "").trim(); return m || headerMo; };
+    const nz = (v) => String(v ?? "").trim();
+    // OJO con "estilo": NO es el mismo campo en los dos lados.
+    //   work_order_lines.estilo = estilo CLIENTE (6 caracteres, p. ej. 030800)
+    //   ticket_prints.estilo    = viene de line_runs.style, que es el código de
+    //                             estilo tipo+modelo+correlativo (p. ej. DAMCHA01)
+    // Compararlos como texto nunca cuadra y partía cada talla en dos renglones
+    // (uno con la meta y otro con lo producido). El cruce real es por
+    // talla × color × PO cliente; cada código se conserva solo para mostrarse.
+    const key = (t, c, mo) => `${nz(t)}\u0000${nz(c)}\u0000${nz(mo)}`;
+
+    // Ordenado por talla×color×estilo×PO cliente.
+    const ordRes = await client.query(
+      `SELECT talla AS size_code, COALESCE(color,'') AS color, COALESCE(estilo,'') AS estilo,
+              customer_po, SUM(quantity)::numeric AS ordered
+         FROM work_order_lines
+        WHERE work_order_id = $1
+        GROUP BY talla, COALESCE(color,''), COALESCE(estilo,''), customer_po`,
+      [list.work_order_id]
+    );
+
+    // Producido acumulado a la fecha (por run_date de la corrida).
+    let prodRows = [];
+    try {
+      const prodRes = await client.query(
+        `SELECT tp.talla AS size_code, COALESCE(tp.color,'') AS color, COALESCE(tp.estilo,'') AS estilo,
+                tp.customer_po, SUM(tp.quantity)::numeric AS produced
+           FROM ticket_prints tp
+           JOIN line_runs lr ON lr.id = tp.run_id
+          WHERE tp.work_order_id = $1
+            AND ($2::date IS NULL OR lr.run_date <= $2::date)
+          GROUP BY tp.talla, COALESCE(tp.color,''), COALESCE(tp.estilo,''), tp.customer_po`,
+        [list.work_order_id, asOfDate]
       );
-      added += r.rowCount;
+      prodRows = prodRes.rows;
+    } catch (e) {
+      console.warn("size-progress: ticket_prints no disponible:", e.message);
     }
-    return added;
-  }
 
-  app.delete(`${BASE}/locations/:id`, authenticateToken, withClient(async (req, res, client) => {
-    const used = await client.query(
-      `SELECT COUNT(*)::int AS n FROM fabric_rolls WHERE location_id = $1 AND status IN ('assigned','in_stock','at_inspection')`,
-      [req.params.id]
-    );
-    if (used.rows[0].n > 0) return fail(res, 409, "La ubicación tiene rollos. Muévalos primero.");
-    const box = await client.query(
-      `SELECT l.code, b.code AS box_code FROM fabric_locations l JOIN fabric_boxes b ON b.location_id = l.id WHERE l.id = $1`,
-      [req.params.id]
-    );
-    if (box.rows[0]?.box_code) {
-      return fail(res, 409, `En ${box.rows[0].code} está el contenedor ${box.rows[0].box_code}. Quítelo o muévalo primero.`);
+    // Capturas individuales (día · línea · hora → piezas), para explicar el
+    // acumulado de cada talla. Mismo filtro de fecha que el agregado de arriba.
+    let entryRows = [];
+    let entriesMeta = null;
+    try {
+      const e = await ticketEntriesFor(client, list.work_order_id, asOfDate);
+      entryRows = e.rows;
+      entriesMeta = e.meta;
+    } catch (e) {
+      console.warn("size-progress: desglose de capturas no disponible:", e.message);
     }
-    await client.query(`DELETE FROM fabric_locations WHERE id = $1`, [req.params.id]);
-    res.json({ success: true });
-  }));
+    const entriesBy = new Map();
+    for (const r of entryRows) {
+      const k = key(r.size_code, r.color, effMo(r.customer_po));
+      const arr = entriesBy.get(k) || [];
+      arr.push({
+        day: r.day,
+        at: r.at,
+        // line_runs.line_no es TEXT en este esquema (puede ser "1" o "A1"), así
+        // que se pasa tal cual en vez de convertirlo a número.
+        line_no: r.line_no == null ? null : (String(r.line_no).trim() || null),
+        qty: Math.round(Number(r.qty) || 0),
+        tickets: Number(r.tickets) || 0,
+      });
+      entriesBy.set(k, arr);
+    }
 
-  // ---- Containers (F01…F80) on the spots (A01…E30) ------------------------
-  // GET /boxes → every active container, placed or not.
-  app.get(`${BASE}/boxes`, authenticateToken, withClient(async (req, res, client) => {
-    const { rows } = await client.query(`${BOX_SELECT} WHERE b.is_active ORDER BY b.code`);
-    res.json({ success: true, boxes: rows });
-  }));
+    // Merge ordenado + producido por talla×color×estilo×PO cliente efectivo.
+    const map = new Map();
+    const bump = (r, field, val) => {
+      const mo = effMo(r.customer_po);
+      const k = key(r.size_code, r.color, mo);
+      let row = map.get(k);
+      if (!row) { row = { size_code: r.size_code, color: r.color, estilo: "", style_code: "", mo, ordered: 0, produced: 0 }; map.set(k, row); }
+      // El estilo cliente lo pone la orden; el código tipo+modelo+correlativo, el ticket.
+      if (field === "ordered" && !row.estilo) row.estilo = nz(r.estilo);
+      if (field === "produced" && !row.style_code) row.style_code = nz(r.estilo);
+      row[field] += Number(val) || 0;
+    };
+    for (const r of ordRes.rows) bump(r, "ordered", r.ordered);
+    for (const r of prodRows)    bump(r, "produced", r.produced);
 
-  // Body: { pairs: [{ locationId, boxCode }], allowMove = true, displace = false }
-  //   • new container code            → created and placed on the spot
-  //   • container on another spot     → it MOVES here with all its rolls (needs allowMove)
-  //   • spot already has a container  → error, or with displace the old one stays
-  //                                     "sin lugar" (keeps its rolls) until it is scanned
-  //                                     on its new spot
-  //   • empty boxCode                 → the container is taken off the spot (keeps its rolls)
-  // All pairs run in one transaction: any error undoes the whole batch.
-  app.post(`${BASE}/boxes/place`, authenticateToken, withClient(async (req, res, client) => {
-    const pairs = Array.isArray(req.body?.pairs) ? req.body.pairs : [];
-    if (!pairs.length) return fail(res, 400, "No hay contenedores que colocar.");
-    if (pairs.length > 500) return fail(res, 400, "Máximo 500 contenedores por operación.");
-    const allowMove = req.body?.allowMove !== false;
-    const displace = req.body?.displace === true;
-    const userId = req.user?.id;
-    const stop = (status, msg) => Object.assign(new Error(msg), { status });
-    const ACTIVE = `('assigned','in_stock','at_inspection')`;
+    // Scope al PO cliente de la lista (si tiene uno).
+    const wantMo = nz(list.mo);
+    let sizes = [...map.values()];
+    if (wantMo) {
+      const scoped = sizes.filter((s) => nz(s.mo) === wantMo);
+      if (scoped.length > 0) sizes = scoped;
+    }
 
-    // Take a container off its spot; its rolls stay in it, without a spot.
-    const unplace = async (box, spot) => {
-      await client.query(`UPDATE fabric_boxes SET location_id = NULL, placed_at = now() WHERE id = $1`, [box.id]);
-      const r = await client.query(
-        `UPDATE fabric_rolls SET location_id = NULL, container_id = NULL, updated_at = now()
-          WHERE box_id = $1 AND status IN ${ACTIVE} RETURNING id`, [box.id]
+    sizes = sizes
+      .map((s) => {
+        // Capturas de esta talla, en orden cronológico, con el acumulado que
+        // llevaba después de cada una: así se lee "50 el lunes → 100 el viernes".
+        const raw = (entriesBy.get(key(s.size_code, s.color, s.mo)) || [])
+          .slice()
+          .sort((a, b) =>
+            String(a.day).localeCompare(String(b.day)) ||
+            String(a.at ?? "").localeCompare(String(b.at ?? ""))
+          );
+        let running = 0;
+        const entries = raw.map((e) => { running += e.qty; return { ...e, running }; });
+
+        return {
+          size_code: s.size_code,
+          size_label: sizeLabelOf(s.size_code),
+          color: s.color,
+          estilo: s.estilo,           // estilo cliente (work_order_lines)
+          style_code: s.style_code,   // tipo+modelo+correlativo (line_runs.style)
+          mo: s.mo,
+          ordered: Math.round(s.ordered),
+          produced: Math.round(s.produced),
+          remaining: Math.max(0, Math.round(s.ordered) - Math.round(s.produced)),
+          entries,
+        };
+      })
+      .sort((a, b) => String(a.color).localeCompare(String(b.color)) || String(a.size_code).localeCompare(String(b.size_code)));
+
+    const totals = sizes.reduce(
+      (t, s) => { t.ordered += s.ordered; t.produced += s.produced; t.remaining += s.remaining; return t; },
+      { ordered: 0, produced: 0, remaining: 0 }
+    );
+
+    // Días con producción por talla (para el selector de fecha).
+    let availableDays = [];
+    try {
+      const daysRes = await client.query(
+        `SELECT DISTINCT to_char(lr.run_date, 'YYYY-MM-DD') AS day
+           FROM ticket_prints tp
+           JOIN line_runs lr ON lr.id = tp.run_id
+          WHERE tp.work_order_id = $1 AND lr.run_date IS NOT NULL
+          ORDER BY day DESC`,
+        [list.work_order_id]
       );
-      for (const x of r.rows) await logMove(client, { rollId: x.id, type: "box_moved", from: spot.id, fromBox: box.code, toBox: box.code, userId });
+      availableDays = daysRes.rows.map((r) => r.day);
+    } catch { /* sin tickets todavía */ }
+
+    res.json({ success: true, date: asOfDate, mo: list.mo, availableDays, sizes, totals, entriesMeta });
+  }));
+
+  // (Re)build a draft list's boxes from its work order. Clears existing boxes
+  // and regenerates one per size×color line — used to seed older lists or to
+  // refresh after the order's lines changed.
+  app.post("/api/pre-packing-lists/:id/generate-boxes", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    await client.query("BEGIN");
+    const listRes = await client.query(`SELECT * FROM pre_packing_lists WHERE id = $1 FOR UPDATE`, [id]);
+    if (listRes.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "Lista no encontrada" }); }
+    const list = listRes.rows[0];
+    if (list.status !== "draft") { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista ya fue confirmada" }); }
+    if (!list.work_order_id) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista no tiene una orden asociada" }); }
+
+    // Optional cut-off day: when sent, remember it on the list and regenerate the
+    // accumulated per-size production up to that day. When absent, keep whatever
+    // day the list already had.
+    const rawDate = String(req.body?.asOfDate ?? req.body?.date ?? "").trim();
+    let asOfDate = list.as_of_date ? String(list.as_of_date).slice(0, 10) : null;
+    if (rawDate !== "") {
+      asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : null; // "" clears back to all-time
+      await client.query(`UPDATE pre_packing_lists SET as_of_date = $2, updated_at = now() WHERE id = $1`, [id, asOfDate]);
+      list.as_of_date = asOfDate;
+    }
+
+    await client.query(`DELETE FROM pre_packing_boxes WHERE list_id = $1`, [id]);
+    const boxes = await generateBoxesFromOrder(client, list, list.mo, { asOfDate });
+    await client.query("COMMIT");
+    res.json({ success: true, boxes, boxesGenerated: boxes.length, asOfDate });
+  }));
+
+  // Export a list's boxes as CSV (opens in Excel). One row per box.
+  app.get("/api/pre-packing-lists/:id/export", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const listRes = await client.query(`SELECT * FROM pre_packing_lists WHERE id = $1`, [id]);
+    if (listRes.rows.length === 0) return res.status(404).json({ success: false, error: "Lista no encontrada" });
+    const list = listRes.rows[0];
+    const boxesRes = await client.query(`SELECT * FROM pre_packing_boxes WHERE list_id = $1 ORDER BY id ASC`, [id]);
+
+    // Exact packing template: header label, value, and cell kind ("num" for
+    // numeric cells). Constants per the agreed format: Genero=0, BoxType="no",
+    // and BoxNo / GrossWeight / NetWeight / Material box barcode left blank.
+    const columns = [
+      ["ticket",               (b) => b.po],          // ticket = PO number
+      ["Orden Produccion",     (b) => b.mo],
+      ["PO",                   (b) => b.po],
+      ["Estyle",               (b) => b.style],
+      ["Genero",               () => 0, "num"],
+      ["Codigo Fabric",        (b) => b.fabric_code],
+      ["Size",                 (b) => sizeLabelOf(b.size_code)],
+      ["Color",                (b) => b.color_name],
+      ["Codigo De Color",      (b) => b.color_code],
+      ["Piezas",               (b) => b.quantity, "num"],
+      ["BoxType",              () => "no"],
+      ["BoxNo",                () => ""],
+      ["BoxRegistry",          (b) => b.box_registry],
+      ["GrossWeight",          () => ""],
+      ["NetWeight",            () => ""],
+      ["CustomerCode",         (b) => b.customer_code],
+      ["CustomerName",         (b) => b.customer_name],
+      ["Material box barcode", () => ""],
+    ];
+
+    const cellVal = (col, b) => {
+      const v = col[1](b);
+      if (col[2] === "num") return Number(v) || 0;
+      return v === null || v === undefined ? "" : v;
     };
 
+    const format = String(req.query.format || "xlsx").toLowerCase();
+    const base = list.list_no || `pre-empaque-${list.id}`;
+    const headerRow = columns.map((c) => c[0]);
+
+    // CSV needs no dependency.
+    if (format === "csv") {
+      const esc = (v) => {
+        const s = v === null || v === undefined ? "" : String(v);
+        return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      const body = boxesRes.rows.map((b) => columns.map((c) => esc(cellVal(c, b))).join(","));
+      const csv = "\uFEFF" + [headerRow.join(","), ...body].join("\r\n");   // BOM so Excel reads UTF-8
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${base}.csv"`);
+      return res.send(csv);
+    }
+
+    // Excel (.xlsx / .xls) via SheetJS.
+    if (!XLSX) {
+      return res.status(501).json({
+        success: false,
+        error: "Exportación Excel no disponible: ejecute 'npm install xlsx' en el servidor, o exporte en formato CSV.",
+      });
+    }
+
+    const aoa = [headerRow, ...boxesRes.rows.map((b) => columns.map((c) => cellVal(c, b)))];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = headerRow.map((h) => ({ wch: Math.max(10, h.length + 2) }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Pre-empaque");
+
+    const bookType = format === "xls" ? "xls" : "xlsx";
+    const buf = XLSX.write(wb, { type: "buffer", bookType });
+    const mime = bookType === "xls"
+      ? "application/vnd.ms-excel"
+      : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Disposition", `attachment; filename="${base}.${bookType}"`);
+    return res.send(buf);
+  }));
+
+  // Create a list. Snapshots client + PO/MO from the chosen work order.
+  app.post("/api/pre-packing-lists", authenticateToken, withClient(async (req, res, client) => {
+    const { customerId, workOrderId, notes } = req.body;
+    if (!customerId) return res.status(400).json({ success: false, error: "Seleccione un cliente" });
+
+    // Día de la lista (acumulado por talla hasta este día). Formato 'YYYY-MM-DD';
+    // cualquier otra cosa => null (todo el tiempo).
+    const rawDate = String(req.body.asOfDate ?? req.body.date ?? "").trim();
+    const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : null;
+
     await client.query("BEGIN");
-    const done = [];
-    const touched = [];
-    for (const p of pairs) {
-      const locId = parseInt(p?.locationId, 10);
-      const code = normBox(p?.boxCode);
-      if (code && code.length > 40) throw stop(400, `Código de contenedor demasiado largo: ${code}.`);
-      const spot = (await client.query(
-        `SELECT id, code, container_id, capacity FROM fabric_locations WHERE id = $1 FOR UPDATE`, [locId]
-      )).rows[0];
-      if (!spot) throw stop(404, "Lugar no encontrado.");
-      const here = (await client.query(
-        `SELECT id, code FROM fabric_boxes WHERE location_id = $1 FOR UPDATE`, [spot.id]
-      )).rows[0];
 
-      if (!code) {
-        if (!here) continue;
-        await unplace(here, spot);
-        done.push({ action: "removed", box: here.code, from: spot.code });
-        continue;
-      }
-      if (here && here.code.toUpperCase() === code) { touched.push(here.id); continue; }
-      if (here) {
-        if (!displace) throw stop(409, `En ${spot.code} está el contenedor ${here.code}. Quítelo o muévalo primero.`);
-        await unplace(here, spot);
-        done.push({ action: "displaced", box: here.code, from: spot.code });
-      }
+    const cRes = await client.query(`SELECT id, code, name FROM customers WHERE id = $1`, [customerId]);
+    if (cRes.rows.length === 0) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "Cliente no válido" }); }
+    const cust = cRes.rows[0];
 
-      let box = (await client.query(
-        `SELECT b.id, b.code, b.location_id, b.is_active, l.code AS location_code
-           FROM fabric_boxes b LEFT JOIN fabric_locations l ON l.id = b.location_id
-          WHERE UPPER(b.code) = $1 FOR UPDATE OF b`, [code]
-      )).rows[0];
-      if (box && box.location_id && !allowMove) throw stop(409, `${code} ya está en ${box.location_code}.`);
+    let woId = null, po = null, headerMo = null;
+    if (workOrderId) {
+      const wRes = await client.query(`SELECT id, work_order_no, customer_po FROM work_orders WHERE id = $1`, [workOrderId]);
+      if (wRes.rows.length) { woId = wRes.rows[0].id; po = wRes.rows[0].work_order_no; headerMo = wRes.rows[0].customer_po; }
+    }
 
-      if (!box) {
-        box = (await client.query(
-          `INSERT INTO fabric_boxes (code, location_id, capacity, placed_at) VALUES ($1, $2, $3, now()) RETURNING id, code`,
-          [code, spot.id, spot.capacity]
-        )).rows[0];
-        done.push({ action: "placed", box: code, to: spot.code });
-      } else {
-        const fromId = box.location_id;
-        await client.query(`UPDATE fabric_boxes SET location_id = $2, is_active = TRUE, placed_at = now() WHERE id = $1`, [box.id, spot.id]);
-        const moved = await client.query(
-          `UPDATE fabric_rolls SET location_id = $2, container_id = $3, updated_at = now()
-            WHERE box_id = $1 AND status IN ${ACTIVE} RETURNING id`,
-          [box.id, spot.id, spot.container_id]
-        );
-        for (const x of moved.rows) {
-          await logMove(client, { rollId: x.id, type: "box_moved", from: fromId, to: spot.id, fromBox: code, toBox: code, userId });
-        }
-        done.push({ action: fromId ? "moved" : "placed", box: code, from: box.location_code || null, to: spot.code, rolls: moved.rowCount });
-      }
-      // Rolls registered on this spot before it had a container go into it.
-      await client.query(
-        `UPDATE fabric_rolls SET box_id = $1, updated_at = now()
-          WHERE location_id = $2 AND box_id IS NULL AND status IN ${ACTIVE}`,
-        [box.id, spot.id]
+    // One order can carry several PO cliente (customer_po) across its lines. When
+    // it does, create ONE pre-packing list per PO cliente, each seeded only with
+    // that PO cliente's size×color lines (e.g. PP-000010 → 23456, PP-000011 → po-1234).
+    let mos = [];
+    if (woId) mos = await distinctLineMos(client, woId, headerMo);
+    if (mos.length === 0) mos = [headerMo ? String(headerMo).trim() : null]; // no order / no per-line PO cliente
+
+    const created = [];
+    for (const mo of mos) {
+      const insRes = await client.query(
+        `INSERT INTO pre_packing_lists
+           (customer_id, customer_code, customer_name, work_order_id, po, mo, notes, as_of_date, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         RETURNING *`,
+        [cust.id, cust.code, cust.name, woId, po, mo, notes || null, asOfDate, req.user?.id ?? null]
       );
-      touched.push(box.id);
-    }
-    await client.query("COMMIT");
-    const boxes = [];
-    for (const id of touched) boxes.push(await boxInfo(client, id));
-    res.json({ success: true, done, boxes });
-  }));
-
-  app.delete(`${BASE}/containers/:id`, authenticateToken, withClient(async (req, res, client) => {
-    const used = await client.query(
-      `SELECT COUNT(*)::int AS n FROM fabric_rolls WHERE container_id = $1 AND status IN ('assigned','in_stock','at_inspection')`,
-      [req.params.id]
-    );
-    if (used.rows[0].n > 0) return fail(res, 409, "Los contenedores de la división tienen rollos. Muévalos primero.");
-    await client.query(
-      `UPDATE fabric_boxes SET location_id = NULL WHERE location_id IN (SELECT id FROM fabric_locations WHERE container_id = $1)`,
-      [req.params.id]
-    );
-    await client.query(`UPDATE fabric_containers SET is_active = FALSE WHERE id = $1`, [req.params.id]);
-    res.json({ success: true });
-  }));
-
-  // ======================================================================
-  //  FABRIC INSPECTION
-  // ======================================================================
-
-  app.get(`${BASE}/inspection-requests`, authenticateToken, withClient(async (req, res, client) => {
-    const statuses = String(req.query.status || "open,partial").split(",").map((s) => s.trim()).filter(Boolean);
-    const { rows } = await client.query(
-      `SELECT ir.*,
-              COALESCE((
-                SELECT json_agg(json_build_object(
-                         'id', r.id, 'roll_no', r.roll_no, 'po_number', r.po_number, 'supplier', r.supplier,
-                         'fabric_name', r.fabric_name, 'color', r.color, 'lot', r.lot, 'yards', r.yards,
-                         'meters', r.meters, 'status', r.status, 'sent_at', it.sent_at,
-                         'container_code', c.code, 'location_code', l.code, 'box_code', b.code)
-                       ORDER BY b.code, l.code, r.roll_no)
-                  FROM fabric_inspection_request_items it
-                  JOIN fabric_rolls r ON r.id = it.roll_id
-                  LEFT JOIN fabric_containers c ON c.id = r.container_id
-                  LEFT JOIN fabric_locations l ON l.id = r.location_id
-                  LEFT JOIN fabric_boxes b ON b.id = r.box_id
-                 WHERE it.request_id = ir.id
-              ), '[]'::json) AS rolls
-         FROM fabric_inspection_requests ir
-        WHERE ir.status = ANY($1::text[])
-        ORDER BY ir.created_at DESC
-        LIMIT 200`,
-      [statuses]
-    );
-    res.json({ success: true, requests: rows });
-  }));
-
-  // Inspection team asks for rolls. Body: { rollIds, notes }
-  app.post(`${BASE}/inspection-requests`, authenticateToken, withClient(async (req, res, client) => {
-    const ids = idList(req.body?.rollIds);
-    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
-    const check = await client.query(
-      `SELECT r.id, r.roll_no, r.status,
-              EXISTS (SELECT 1 FROM fabric_inspection_request_items it
-                        JOIN fabric_inspection_requests ir ON ir.id = it.request_id
-                       WHERE it.roll_id = r.id AND it.sent_at IS NULL AND ir.status IN ('open','partial')) AS busy
-         FROM fabric_rolls r WHERE r.id = ANY($1::bigint[])`,
-      [ids]
-    );
-    const bad = check.rows.filter((r) => r.status !== "in_stock" || r.busy);
-    if (bad.length) {
-      return fail(res, 409, `Estos rollos no están disponibles: ${bad.map((r) => r.roll_no).join(", ")}`);
-    }
-    await client.query("BEGIN");
-    const ins = await client.query(
-      `INSERT INTO fabric_inspection_requests (notes, requested_by, requested_by_name)
-       VALUES ($1,$2,$3) RETURNING id`,
-      [str(req.body?.notes), req.user?.id ?? null, req.user?.full_name || req.user?.username || null]
-    );
-    const id = ins.rows[0].id;
-    await client.query(
-      `UPDATE fabric_inspection_requests SET request_no = 'INS-' || LPAD(id::text, 5, '0') WHERE id = $1`, [id]
-    );
-    for (const rollId of ids) {
-      await client.query(`INSERT INTO fabric_inspection_request_items (request_id, roll_id) VALUES ($1,$2)`, [id, rollId]);
-    }
-    await client.query("COMMIT");
-    const { rows } = await client.query(`SELECT * FROM fabric_inspection_requests WHERE id = $1`, [id]);
-    res.json({ success: true, request: rows[0] });
-  }));
-
-  // Warehouse sends the rolls. Body: { rollIds? }  (default: every unsent roll)
-  app.post(`${BASE}/inspection-requests/:id/send`, authenticateToken, withClient(async (req, res, client) => {
-    const reqId = parseInt(req.params.id, 10);
-    const head = await client.query(`SELECT * FROM fabric_inspection_requests WHERE id = $1`, [reqId]);
-    if (!head.rows.length) return fail(res, 404, "Solicitud no encontrada.");
-    if (!["open", "partial"].includes(head.rows[0].status)) return fail(res, 409, "La solicitud ya fue cerrada.");
-
-    const wanted = idList(req.body?.rollIds);
-    await client.query("BEGIN");
-    const items = await client.query(
-      `SELECT it.roll_id, r.location_id, r.status
-         FROM fabric_inspection_request_items it JOIN fabric_rolls r ON r.id = it.roll_id
-        WHERE it.request_id = $1 AND it.sent_at IS NULL
-          ${wanted.length ? "AND it.roll_id = ANY($2::bigint[])" : ""}
-        FOR UPDATE OF r`,
-      wanted.length ? [reqId, wanted] : [reqId]
-    );
-    let sent = 0;
-    const skipped = [];
-    for (const it of items.rows) {
-      if (it.status !== "in_stock") { skipped.push(it.roll_id); continue; }
-      await client.query(
-        `UPDATE fabric_rolls SET status = 'at_inspection', out_at = now(), updated_at = now() WHERE id = $1`, [it.roll_id]
+      const listRow = insRes.rows[0];
+      const upd = await client.query(
+        `UPDATE pre_packing_lists SET list_no = $2 WHERE id = $1 RETURNING *`,
+        [listRow.id, `PP-${String(listRow.id).padStart(6, "0")}`]
       );
-      await client.query(
-        `UPDATE fabric_inspection_request_items SET sent_at = now() WHERE request_id = $1 AND roll_id = $2`, [reqId, it.roll_id]
-      );
-      await logMove(client, { rollId: it.roll_id, type: "inspection_out", from: it.location_id, reference: head.rows[0].request_no, userId: req.user?.id });
-      sent++;
+      // Auto-fill this list from the order, scoped to its PO cliente, acumulado a la fecha.
+      const boxes = await generateBoxesFromOrder(client, upd.rows[0], mo, { asOfDate });
+      created.push({ list: upd.rows[0], boxesGenerated: boxes.length });
     }
-    const left = await client.query(
-      `SELECT COUNT(*)::int AS n FROM fabric_inspection_request_items WHERE request_id = $1 AND sent_at IS NULL`, [reqId]
-    );
-    const status = left.rows[0].n === 0 ? "sent" : sent > 0 || head.rows[0].status === "partial" ? "partial" : "open";
-    await client.query(
-      `UPDATE fabric_inspection_requests
-          SET status = $2::varchar, sent_at = CASE WHEN $2::varchar = 'sent' THEN now() ELSE sent_at END
-        WHERE id = $1`,
-      [reqId, status]
-    );
+
     await client.query("COMMIT");
-    res.json({ success: true, sent, skipped, status });
-  }));
-
-  app.post(`${BASE}/inspection-requests/:id/cancel`, authenticateToken, withClient(async (req, res, client) => {
-    const { rowCount } = await client.query(
-      `UPDATE fabric_inspection_requests SET status = 'cancelled' WHERE id = $1 AND status = 'open'`, [req.params.id]
-    );
-    if (!rowCount) return fail(res, 409, "Solo se puede cancelar una solicitud que no se ha enviado.");
-    res.json({ success: true });
-  }));
-
-  // Rolls come back from inspection. Body: { ids, result: 'approved'|'rejected', boxId? }
-  // Without boxId each roll goes back to its own container (wherever it is now).
-  app.post(`${BASE}/rolls/return-from-inspection`, authenticateToken, withClient(async (req, res, client) => {
-    const ids = idList(req.body?.ids);
-    const result = ["approved", "rejected"].includes(req.body?.result) ? req.body.result : null;
-    if (!ids.length || !result) return fail(res, 400, "Seleccione rollos y el resultado de la inspección.");
-    const boxId = await boxIdFrom(client, req.body);
-    if (boxId) {
-      const room = await roomInBox(client, boxId, ids, ids.length);
-      if (room.error) return fail(res, room.status, room.error);
-    } else if (req.body?.locationId) {
-      return fail(res, 409, "En ese lugar no hay contenedor.");
-    }
-    await client.query("BEGIN");
-    const { rows } = await client.query(
-      `UPDATE fabric_rolls r
-          SET status = 'in_stock', inspection_result = $2, out_at = NULL,
-              box_id = COALESCE($3::bigint, r.box_id),
-              location_id = COALESCE(nb.location_id, r.location_id),
-              container_id = COALESCE(nl.container_id, r.container_id),
-              updated_at = now()
-         FROM fabric_rolls r0
-         LEFT JOIN fabric_boxes nb ON nb.id = COALESCE($3::bigint, r0.box_id)
-         LEFT JOIN fabric_locations nl ON nl.id = nb.location_id
-        WHERE r.id = r0.id AND r.id = ANY($1::bigint[]) AND r.status = 'at_inspection'
-        RETURNING r.id, r.location_id`,
-      [ids, result, boxId]
-    );
-    for (const r of rows) {
-      await logMove(client, { rollId: r.id, type: "inspection_back", to: r.location_id, reason: result, userId: req.user?.id });
-    }
-    await client.query("COMMIT");
-    res.json({ success: true, updated: rows.length, skipped: ids.length - rows.length });
-  }));
-
-  // ======================================================================
-  //  RETURN TO SUPPLIER
-  // ======================================================================
-
-  // Body: { ids, reason, reference }
-  app.post(`${BASE}/rolls/return-to-supplier`, authenticateToken, withClient(async (req, res, client) => {
-    const ids = idList(req.body?.ids);
-    const reason = str(req.body?.reason);
-    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
-    if (!reason) return fail(res, 400, "Escriba el motivo de la devolución.");
-    const reference = str(req.body?.reference);
-    await client.query("BEGIN");
-    const { rows } = await client.query(
-      `UPDATE fabric_rolls
-          SET status = 'returned', out_at = now(), out_reason = $2, out_reference = $3, updated_at = now()
-        WHERE id = ANY($1::bigint[]) AND status IN ('in_stock','at_inspection')
-        RETURNING id, location_id`,
-      [ids, reason, reference]
-    );
-    for (const r of rows) {
-      await logMove(client, { rollId: r.id, type: "supplier_return", from: r.location_id, reference, reason, userId: req.user?.id });
-    }
-    await client.query("COMMIT");
-    res.json({ success: true, returned: rows.length, skipped: ids.length - rows.length });
-  }));
-
-  // ======================================================================
-  //  REPORTS + DASHBOARD
-  // ======================================================================
-
-  const MOVE_COLS = `
-    m.id AS movement_id, m.type, m.reference, m.reason, m.created_at AS moved_at,
-    u.full_name AS user_name,
-    COALESCE(lt.code, lf.code) AS location_code,
-    COALESCE(ct.code, cf.code) AS container_code,
-    COALESCE(m.to_box_code, m.from_box_code) AS box_code,
-    r.id AS roll_id, r.roll_no, r.po_number, r.supplier, r.supplier_code, r.yards, r.meters,
-    r.color, r.lot, r.width, r.width_unit, r.weight, r.composition, r.fabric_item_number,
-    r.fabric_name, r.fabric_type, r.customer, r.item_sku_code, r.status, r.inspection_result,
-    to_char(r.arrival_date, 'YYYY-MM-DD') AS arrival_date`;
-  const MOVE_JOINS = `
-    FROM fabric_roll_movements m
-    JOIN fabric_rolls r ON r.id = m.roll_id
-    LEFT JOIN fabric_locations lt ON lt.id = m.to_location_id
-    LEFT JOIN fabric_containers ct ON ct.id = lt.container_id
-    LEFT JOIN fabric_locations lf ON lf.id = m.from_location_id
-    LEFT JOIN fabric_containers cf ON cf.id = lf.container_id
-    LEFT JOIN users u ON u.id = m.user_id`;
-
-  const dateRange = (req) => {
-    const today = new Date().toISOString().slice(0, 10);
-    const ok = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || "");
-    const from = ok(req.query.from) ? req.query.from : today;
-    const to = ok(req.query.to) ? req.query.to : from;
-    return { from, to };
-  };
-
-  // Inbound: rolls received and stored, grouped by container in the summary.
-  app.get(`${BASE}/reports/inbound`, authenticateToken, withClient(async (req, res, client) => {
-    const { from, to } = dateRange(req);
-    const { rows } = await client.query(
-      `SELECT ${MOVE_COLS} ${MOVE_JOINS}
-        WHERE m.type = 'received' AND m.created_at::date BETWEEN $1 AND $2
-          AND NOT EXISTS (SELECT 1 FROM fabric_roll_movements u2
-                           WHERE u2.roll_id = m.roll_id AND u2.type = 'receive_undone' AND u2.created_at > m.created_at)
-        ORDER BY m.created_at DESC`,
-      [from, to]
-    );
-    // byContainer = per division (A–E); byBox = per container (F01…).
-    const byContainer = {};
-    const byBox = {};
-    for (const r of rows) {
-      const k = r.container_code || "—";
-      byContainer[k] = byContainer[k] || { container_code: k, rolls: 0, yards: 0, meters: 0 };
-      byContainer[k].rolls++;
-      byContainer[k].yards += Number(r.yards) || 0;
-      byContainer[k].meters += Number(r.meters) || 0;
-      const b = r.box_code || "Sin contenedor";
-      byBox[b] = byBox[b] || { box_code: b, location_code: r.location_code, rolls: 0, yards: 0, meters: 0 };
-      byBox[b].rolls++;
-      byBox[b].yards += Number(r.yards) || 0;
-      byBox[b].meters += Number(r.meters) || 0;
-    }
-    res.json({
-      success: true, from, to, rows,
-      totals: {
-        rolls: rows.length,
-        yards: rows.reduce((s, r) => s + (Number(r.yards) || 0), 0),
-        meters: rows.reduce((s, r) => s + (Number(r.meters) || 0), 0),
-      },
-      byContainer: Object.values(byContainer),
-      byBox: Object.values(byBox).sort((a, b) => b.rolls - a.rolls),
-    });
-  }));
-
-  // Outbound: sent to inspection and returned to supplier. ?type=inspection_out|supplier_return
-  app.get(`${BASE}/reports/outbound`, authenticateToken, withClient(async (req, res, client) => {
-    const { from, to } = dateRange(req);
-    const types = ["inspection_out", "supplier_return"].includes(req.query.type) ? [req.query.type] : ["inspection_out", "supplier_return"];
-    const { rows } = await client.query(
-      `SELECT ${MOVE_COLS} ${MOVE_JOINS}
-        WHERE m.type = ANY($3::text[]) AND m.created_at::date BETWEEN $1 AND $2
-        ORDER BY m.created_at DESC`,
-      [from, to, types]
-    );
-    const byType = {};
-    for (const r of rows) {
-      byType[r.type] = byType[r.type] || { type: r.type, rolls: 0, yards: 0, meters: 0 };
-      byType[r.type].rolls++;
-      byType[r.type].yards += Number(r.yards) || 0;
-      byType[r.type].meters += Number(r.meters) || 0;
-    }
-    res.json({
-      success: true, from, to, rows,
-      totals: {
-        rolls: rows.length,
-        yards: rows.reduce((s, r) => s + (Number(r.yards) || 0), 0),
-        meters: rows.reduce((s, r) => s + (Number(r.meters) || 0), 0),
-      },
-      byType: Object.values(byType),
-    });
-  }));
-
-  app.get(`${BASE}/dashboard`, authenticateToken, withClient(async (req, res, client) => {
-    // One connection, so the queries run one after another.
-    const status = await client.query(
-      `SELECT status, COUNT(*)::int AS rolls, COALESCE(SUM(yards),0) AS yards, COALESCE(SUM(meters),0) AS meters
-         FROM fabric_rolls GROUP BY status`
-    );
-    const aging = await client.query(
-      `SELECT COUNT(*)::int AS rolls, COALESCE(SUM(yards),0) AS yards FROM fabric_rolls
-        WHERE status = 'in_stock' AND received_at <= now() - ($1 || ' days')::interval`,
-      [AGING_DAYS]
-    );
-    const insp = await client.query(
-      `SELECT COUNT(*)::int AS n FROM fabric_inspection_requests WHERE status IN ('open','partial')`
-    );
-    const today = await client.query(
-      `SELECT type, COUNT(*)::int AS n FROM fabric_roll_movements
-        WHERE created_at::date = CURRENT_DATE AND type IN ('received','inspection_out','supplier_return')
-        GROUP BY type`
-    );
-    const by = Object.fromEntries(status.rows.map((r) => [r.status, { rolls: r.rolls, yards: Number(r.yards), meters: Number(r.meters) }]));
-    const t = Object.fromEntries(today.rows.map((r) => [r.type, r.n]));
+    // `lists` is the full set; `list`/`boxesGenerated` (first list) kept for compat.
     res.json({
       success: true,
-      agingDays: AGING_DAYS,
+      lists: created,
+      count: created.length,
+      list: created[0]?.list ?? null,
+      boxesGenerated: created[0]?.boxesGenerated ?? 0,
+    });
+  }));
+
+  // Update header (only while draft).
+  app.patch("/api/pre-packing-lists/:id", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const cur = await client.query(`SELECT status FROM pre_packing_lists WHERE id = $1`, [id]);
+    if (cur.rows.length === 0) return res.status(404).json({ success: false, error: "Lista no encontrada" });
+    if (cur.rows[0].status !== "draft") return res.status(400).json({ success: false, error: "La lista ya fue confirmada" });
+
+    const { notes, workOrderId, customerId } = req.body;
+    const sets = [], params = [];
+    const add = (col, val) => { params.push(val); sets.push(`${col} = $${params.length}`); };
+    if (notes !== undefined) add("notes", notes);
+    if (customerId !== undefined) {
+      const cRes = await client.query(`SELECT id, code, name FROM customers WHERE id = $1`, [customerId]);
+      if (cRes.rows.length) { add("customer_id", cRes.rows[0].id); add("customer_code", cRes.rows[0].code); add("customer_name", cRes.rows[0].name); }
+    }
+    if (workOrderId !== undefined) {
+      const wRes = await client.query(`SELECT id, work_order_no, customer_po FROM work_orders WHERE id = $1`, [workOrderId]);
+      if (wRes.rows.length) { add("work_order_id", wRes.rows[0].id); add("po", wRes.rows[0].work_order_no); add("mo", wRes.rows[0].customer_po); }
+    }
+    if (sets.length === 0) return res.json({ success: true });
+
+    params.push(id);
+    const { rows } = await client.query(
+      `UPDATE pre_packing_lists SET ${sets.join(", ")}, updated_at = now() WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+    res.json({ success: true, list: rows[0] });
+  }));
+
+  // Delete a list (drops its boxes; only while draft).
+  app.delete("/api/pre-packing-lists/:id", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const cur = await client.query(`SELECT status FROM pre_packing_lists WHERE id = $1`, [id]);
+    if (cur.rows.length === 0) return res.status(404).json({ success: false, error: "Lista no encontrada" });
+    if (cur.rows[0].status !== "draft") return res.status(400).json({ success: false, error: "No se puede eliminar una lista confirmada" });
+    await client.query(`DELETE FROM pre_packing_lists WHERE id = $1`, [id]);
+    res.json({ success: true });
+  }));
+
+  // ======================================================================
+  //  BOXES
+  // ======================================================================
+
+  const listMustBeDraft = async (client, listId) => {
+    const r = await client.query(`SELECT id, status, customer_code, customer_name, po, mo FROM pre_packing_lists WHERE id = $1`, [listId]);
+    return r.rows[0] || null;
+  };
+
+  // Add a box. Missing fields fall back to list snapshot / defaults.
+  app.post("/api/pre-packing-lists/:id/boxes", authenticateToken, withClient(async (req, res, client) => {
+    const listId = parseInt(req.params.id, 10);
+    const list = await listMustBeDraft(client, listId);
+    if (!list) return res.status(404).json({ success: false, error: "Lista no encontrada" });
+    if (list.status !== "draft") return res.status(400).json({ success: false, error: "La lista ya fue confirmada" });
+
+    const b = req.body || {};
+    const { rows } = await client.query(
+      `INSERT INTO pre_packing_boxes
+         (list_id, box_qrcode, encasement_qrcode, mo, po, style, fabric_code, sex,
+          size_code, color_name, color_code, quantity, box_code, box_registry,
+          gross_weight, net_weight, customer_code, customer_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+       RETURNING *`,
+      [
+        listId,
+        b.box_qrcode || null,
+        b.encasement_qrcode || null,            // system field; blank is fine
+        b.mo ?? list.mo ?? null,
+        b.po ?? list.po ?? null,
+        b.style || null,
+        b.fabric_code || null,
+        b.sex || null,
+        b.size_code || null,
+        b.color_name || null,
+        b.color_code || null,
+        Number(b.quantity) || 0,
+        b.box_code || DEFAULT_BOX_CODE,
+        b.box_registry || null,
+        Number(b.gross_weight) || 0,
+        Number(b.net_weight) || 0,
+        b.customer_code ?? list.customer_code ?? null,
+        b.customer_name ?? list.customer_name ?? null,
+      ]
+    );
+    res.json({ success: true, box: rows[0] });
+  }));
+
+  // Edit a box (only while its list is draft).
+  app.patch("/api/pre-packing-boxes/:id", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const cur = await client.query(
+      `SELECT b.id, l.status FROM pre_packing_boxes b JOIN pre_packing_lists l ON l.id = b.list_id WHERE b.id = $1`, [id]
+    );
+    if (cur.rows.length === 0) return res.status(404).json({ success: false, error: "Caja no encontrada" });
+    if (cur.rows[0].status !== "draft") return res.status(400).json({ success: false, error: "La lista ya fue confirmada" });
+
+    const editable = ["box_qrcode","encasement_qrcode","mo","po","style","fabric_code","sex","size_code",
+      "color_name","color_code","quantity","box_code","box_registry","gross_weight","net_weight","customer_code","customer_name"];
+    const numeric = new Set(["quantity","gross_weight","net_weight"]);
+    const sets = [], params = [];
+    for (const col of editable) {
+      if (req.body[col] !== undefined) {
+        params.push(numeric.has(col) ? (Number(req.body[col]) || 0) : req.body[col]);
+        sets.push(`${col} = $${params.length}`);
+      }
+    }
+    if (sets.length === 0) return res.json({ success: true });
+    params.push(id);
+    const { rows } = await client.query(
+      `UPDATE pre_packing_boxes SET ${sets.join(", ")}, updated_at = now() WHERE id = $${params.length} RETURNING *`, params
+    );
+    res.json({ success: true, box: rows[0] });
+  }));
+
+  // Delete a box (only while its list is draft).
+  app.delete("/api/pre-packing-boxes/:id", authenticateToken, withClient(async (req, res, client) => {
+    const id = parseInt(req.params.id, 10);
+    const cur = await client.query(
+      `SELECT b.id, l.status FROM pre_packing_boxes b JOIN pre_packing_lists l ON l.id = b.list_id WHERE b.id = $1`, [id]
+    );
+    if (cur.rows.length === 0) return res.status(404).json({ success: false, error: "Caja no encontrada" });
+    if (cur.rows[0].status !== "draft") return res.status(400).json({ success: false, error: "La lista ya fue confirmada" });
+    await client.query(`DELETE FROM pre_packing_boxes WHERE id = $1`, [id]);
+    res.json({ success: true });
+  }));
+
+  // ======================================================================
+  //  CONFIRM  ->  push boxes into finished_inventory
+  // ======================================================================
+  app.post("/api/pre-packing-lists/:id/confirm", authenticateToken, withClient(async (req, res, client) => {
+    const listId = parseInt(req.params.id, 10);
+    await client.query("BEGIN");
+
+    const listRes = await client.query(`SELECT * FROM pre_packing_lists WHERE id = $1 FOR UPDATE`, [listId]);
+    if (listRes.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "Lista no encontrada" }); }
+    const list = listRes.rows[0];
+    if (list.status !== "draft") { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista ya fue confirmada" }); }
+
+    const boxesRes = await client.query(`SELECT * FROM pre_packing_boxes WHERE list_id = $1`, [listId]);
+    if (boxesRes.rows.length === 0) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "La lista no tiene cajas" }); }
+
+    let piecesAdded = 0;
+    for (const box of boxesRes.rows) {
+      const sku_key = skuKeyOf(box);
+      const qty = Number(box.quantity) || 0;
+
+      const invRes = await client.query(
+        `INSERT INTO finished_inventory
+           (sku_key, customer_id, customer_code, customer_name, po, mo, style, fabric_code,
+            sex, size_code, color_name, color_code, quantity, box_count)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1)
+         ON CONFLICT (sku_key) DO UPDATE SET
+           quantity  = finished_inventory.quantity + EXCLUDED.quantity,
+           box_count = finished_inventory.box_count + 1,
+           updated_at = now()
+         RETURNING id`,
+        [
+          sku_key, list.customer_id, box.customer_code || list.customer_code, box.customer_name || list.customer_name,
+          box.po, box.mo, box.style, box.fabric_code, box.sex, box.size_code,
+          box.color_name, box.color_code, qty,
+        ]
+      );
+      const inventoryId = invRes.rows[0].id;
+
+      await client.query(
+        `INSERT INTO finished_inventory_movements (inventory_id, list_id, box_id, direction, quantity, created_by)
+         VALUES ($1,$2,$3,'in',$4,$5)`,
+        [inventoryId, listId, box.id, qty, req.user?.id ?? null]
+      );
+      piecesAdded += qty;
+    }
+
+    const upd = await client.query(
+      `UPDATE pre_packing_lists SET status = 'confirmed', confirmed_at = now(), updated_at = now() WHERE id = $1 RETURNING *`,
+      [listId]
+    );
+
+    await client.query("COMMIT");
+    res.json({ success: true, list: upd.rows[0], boxes: boxesRes.rows.length, piecesAdded });
+  }));
+
+  // ======================================================================
+  //  INVENTORY  +  DASHBOARD
+  // ======================================================================
+  app.get("/api/finished-inventory", authenticateToken, withClient(async (req, res, client) => {
+    const { customerId, q } = req.query;
+    const params = [];
+    let where = "WHERE quantity <> 0";
+    if (customerId) { params.push(customerId); where += ` AND customer_id = $${params.length}`; }
+    if (q)          { params.push(`%${q}%`);   where += ` AND (style ILIKE $${params.length} OR po ILIKE $${params.length} OR color_name ILIKE $${params.length} OR customer_name ILIKE $${params.length})`; }
+    const { rows } = await client.query(
+      `SELECT * FROM finished_inventory ${where} ORDER BY customer_name, style, color_name, size_code LIMIT 1000`, params
+    );
+    const totalPieces = rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0);
+    res.json({ success: true, inventory: rows, totalPieces });
+  }));
+
+  // ======================================================================
+  //  ESTADO DE RECEPCIÓN por orden (dashboard)
+  // ======================================================================
+  //  GET /api/finished-warehouse/receiving-status?tz=America/Mexico_City
+  //  Por orden activa: asignado (merchant) vs producido (líneas) vs recibido
+  //  (tickets escaneados), fecha de entrega del merchant, ritmo de recepción
+  //  de los últimos 7 días, fecha estimada de término y estado:
+  //    done     recibido >= asignado
+  //    late     ya pasó la fecha de entrega y falta recibir
+  //    risk     al ritmo actual no termina a tiempo (o entrega en ≤ 3 días con
+  //             menos del 80 % recibido)
+  //    ok       va a tiempo
+  //    no_date  el merchant no capturó fecha de entrega
+  //  También: piezas recibidas hoy (total, por hora y por orden) y ayer.
+  app.get("/api/finished-warehouse/receiving-status", authenticateToken, withClient(async (req, res, client) => {
+    const tzRaw = String(req.query.tz || "").trim();
+    let tz = /^[A-Za-z0-9_+\-\/]{1,64}$/.test(tzRaw) ? tzRaw : "UTC";
+    try { await client.query("SELECT now() AT TIME ZONE $1", [tz]); } catch { tz = "UTC"; }
+    const PACE_DAYS = 7;
+
+    const { rows: [{ today }] } = await client.query(
+      `SELECT to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today`, [tz]
+    );
+
+    // Merchant's delivery date = "Fecha compromiso" (commitment_date, see work-orders.js).
+    // It is captured per line (work_order_lines); work_orders keeps a copy of the
+    // first line's value. The earliest line date wins (the order is late as soon
+    // as its first commitment is missed); the header copy is the fallback.
+    const deliverySql = `COALESCE(
+        (SELECT MIN(l.commitment_date) FROM work_order_lines l WHERE l.work_order_id = wo.id),
+        wo.commitment_date)`;
+
+    // Active orders: not cancelled, with something assigned, and either
+    // something received / produced, or a delivery date in the window.
+    const { rows: orders } = await client.query(
+      `WITH recv AS (
+         SELECT work_order_no,
+                SUM(pieces)::numeric AS received,
+                COUNT(*)::int AS tickets,
+                SUM(pieces) FILTER (WHERE (scanned_at AT TIME ZONE $1)::date = $2::date)::numeric AS today,
+                SUM(pieces) FILTER (WHERE (scanned_at AT TIME ZONE $1)::date >  $2::date - $3::int)::numeric AS recent,
+                MAX(scanned_at) AS last_scan
+           FROM scanned_tickets GROUP BY work_order_no
+       ),
+       asg AS (
+         SELECT work_order_id, SUM(quantity)::numeric AS assigned FROM work_order_lines GROUP BY work_order_id
+       )
+       SELECT wo.id, wo.work_order_no AS po, wo.customer_po AS mo, wo.customer_name,
+              COALESCE(wo.estilo, wo.style_code) AS style, wo.status,
+              to_char(${deliverySql}, 'YYYY-MM-DD') AS delivery_date,
+              COALESCE(asg.assigned, 0) AS assigned,
+              COALESCE(recv.received, 0) AS received,
+              COALESCE(recv.tickets, 0) AS tickets,
+              COALESCE(recv.today, 0) AS received_today,
+              COALESCE(recv.recent, 0) AS received_recent,
+              recv.last_scan
+         FROM work_orders wo
+         LEFT JOIN asg  ON asg.work_order_id = wo.id
+         LEFT JOIN recv ON recv.work_order_no = wo.work_order_no
+        WHERE COALESCE(wo.status, '') <> 'cancelled'
+          AND COALESCE(asg.assigned, 0) > 0
+          AND ( recv.work_order_no IS NOT NULL
+                OR EXISTS (SELECT 1 FROM line_runs lr WHERE lr.work_order_id = wo.id)
+                OR ${deliverySql} BETWEEN $2::date - 30 AND $2::date + 120 )
+        ORDER BY ${deliverySql} ASC NULLS LAST, wo.id DESC
+        LIMIT 400`,
+      [tz, today, PACE_DAYS]
+    );
+
+    // Produced per order (same source as the line-input view).
+    let producedBy = new Map();
+    try {
+      const lineMap = await workOrders.producedByLineForMany(client, orders.map((o) => o.id));
+      producedBy = new Map([...lineMap.entries()].map(([id, lines]) =>
+        [Number(id), lines.reduce((s, l) => s + (Number(l.finished) || 0), 0)]));
+    } catch (e) { console.warn("receiving-status produced:", e.message); }
+
+    const dayMs = 86400000;
+    const todayD = new Date(`${today}T00:00:00Z`);
+    const addDays = (n) => new Date(todayD.getTime() + n * dayMs).toISOString().slice(0, 10);
+
+    const result = orders.map((o) => {
+      const assigned = Math.round(Number(o.assigned) || 0);
+      const received = Math.round(Number(o.received) || 0);
+      const pending = Math.max(0, assigned - received);
+      const pct = assigned > 0 ? Math.min(100, Math.round((received / assigned) * 100)) : 0;
+      const pace = Math.round((Number(o.received_recent) || 0) / PACE_DAYS);   // pzas/día
+      const daysLeft = o.delivery_date ? Math.round((new Date(`${o.delivery_date}T00:00:00Z`) - todayD) / dayMs) : null;
+      const needPerDay = pending > 0 && daysLeft != null ? Math.ceil(pending / Math.max(1, daysLeft + 1)) : 0;
+      const etaDays = pending === 0 ? 0 : pace > 0 ? Math.ceil(pending / pace) : null;
+      const eta = etaDays == null ? null : addDays(etaDays);
+
+      let state;
+      if (pending === 0) state = "done";
+      else if (daysLeft == null) state = "no_date";
+      else if (daysLeft < 0) state = "late";
+      else if ((etaDays == null && daysLeft <= 7) || (etaDays != null && etaDays > daysLeft + 1) || (daysLeft <= 3 && pct < 80)) state = "risk";
+      else state = "ok";
+
+      return {
+        id: o.id, po: o.po, mo: o.mo, customer_name: o.customer_name, style: o.style, status: o.status,
+        delivery_date: o.delivery_date, days_left: daysLeft,
+        assigned, produced: producedBy.get(Number(o.id)) || 0, received, pending, pct,
+        tickets: o.tickets, received_today: Math.round(Number(o.received_today) || 0),
+        pace, need_per_day: needPerDay, eta, last_scan: o.last_scan, state,
+      };
+    });
+
+    // Today: total, per hour, yesterday for comparison.
+    const { rows: [t] } = await client.query(
+      `SELECT COALESCE(SUM(pieces) FILTER (WHERE d = $2::date), 0)::numeric AS today,
+              COUNT(*) FILTER (WHERE d = $2::date)::int AS tickets,
+              COUNT(DISTINCT work_order_no) FILTER (WHERE d = $2::date)::int AS orders,
+              COALESCE(SUM(pieces) FILTER (WHERE d = $2::date - 1), 0)::numeric AS yesterday
+         FROM (SELECT pieces, work_order_no, (scanned_at AT TIME ZONE $1)::date AS d
+                 FROM scanned_tickets
+                WHERE scanned_at > now() - interval '3 days') x`,
+      [tz, today]
+    );
+    const { rows: hours } = await client.query(
+      `SELECT EXTRACT(HOUR FROM scanned_at AT TIME ZONE $1)::int AS hour,
+              SUM(pieces)::numeric AS pieces, COUNT(*)::int AS tickets
+         FROM scanned_tickets
+        WHERE (scanned_at AT TIME ZONE $1)::date = $2::date
+        GROUP BY 1 ORDER BY 1`,
+      [tz, today]
+    );
+
+    const count = (st) => result.filter((o) => o.state === st).length;
+    res.json({
+      success: true,
+      today,
+      deliveryColumn: "work_order_lines.commitment_date",
+      summary: {
+        receivedToday: Math.round(Number(t.today) || 0),
+        ticketsToday: t.tickets,
+        ordersToday: t.orders,
+        receivedYesterday: Math.round(Number(t.yesterday) || 0),
+        late: count("late"), risk: count("risk"), ok: count("ok"), done: count("done"), noDate: count("no_date"),
+        dueThisWeek: result.filter((o) => o.state !== "done" && o.days_left != null && o.days_left >= 0 && o.days_left <= 7).length,
+      },
+      todayByHour: hours.map((h) => ({ hour: h.hour, pieces: Math.round(Number(h.pieces) || 0), tickets: h.tickets })),
+      orders: result,
+    });
+  }));
+
+  app.get("/api/finished-warehouse/dashboard", authenticateToken, withClient(async (req, res, client) => {
+    const [lists, boxes, inv, recent, pend] = await Promise.all([
+      client.query(`SELECT status, COUNT(*)::int AS n FROM pre_packing_lists GROUP BY status`),
+      client.query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(quantity),0) AS qty FROM pre_packing_boxes`),
+      client.query(`SELECT COALESCE(SUM(quantity),0) AS pieces, COUNT(*)::int AS skus, COALESCE(SUM(box_count),0)::int AS boxes FROM finished_inventory`),
+      client.query(`SELECT id, list_no, customer_name, po, mo, status, created_at FROM pre_packing_lists ORDER BY created_at DESC LIMIT 8`),
+      client.query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(pieces),0) AS pieces FROM scanned_tickets WHERE checked_in_at IS NULL`),
+    ]);
+    const byStatus = Object.fromEntries(lists.rows.map((r) => [r.status, r.n]));
+    res.json({
+      success: true,
       dashboard: {
-        byStatus: by,
-        aging: { rolls: aging.rows[0].rolls, yards: Number(aging.rows[0].yards) },
-        openInspectionRequests: insp.rows[0].n,
-        today: { received: t.received || 0, toInspection: t.inspection_out || 0, returned: t.supplier_return || 0 },
+        lists: { draft: byStatus.draft || 0, confirmed: byStatus.confirmed || 0, total: (byStatus.draft || 0) + (byStatus.confirmed || 0) },
+        prePacking: { boxes: boxes.rows[0].n, pieces: Number(boxes.rows[0].qty) || 0 },
+        inventory: { pieces: Number(inv.rows[0].pieces) || 0, skus: inv.rows[0].skus, boxes: inv.rows[0].boxes },
+        recentLists: recent.rows,
+        tickets: { pending: pend.rows[0].n, pendingPieces: Number(pend.rows[0].pieces) || 0 },
       },
     });
   }));
 }
 
-registerFabricWarehouse.initSchema = initSchema;
-registerFabricWarehouse.normalizeRoll = normalizeRoll;
-registerFabricWarehouse.parseRollScan = parseRollScan;
-registerFabricWarehouse.FIELDS = FIELDS;
-module.exports = registerFabricWarehouse;
+registerFinishedWarehouse.initSchema = initSchema;
+module.exports = registerFinishedWarehouse;

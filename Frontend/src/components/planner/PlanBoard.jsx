@@ -2,10 +2,13 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { format, addDays, differenceInDays, startOfWeek, endOfWeek, eachDayOfInterval, isSameDay, startOfMonth, endOfMonth, startOfYear, addMonths, eachWeekOfInterval, eachMonthOfInterval, getWeek } from "date-fns";
 import { es } from "date-fns/locale";
-import { ChevronLeft, ChevronRight, Package, Loader2, Check, AlertCircle, GripVertical, Search, X, Send, Lock, Unlock, CalendarDays, FileSpreadsheet, Download, Bell, MoreHorizontal, Plus, RotateCcw, Settings, Scissors, SlidersHorizontal } from "lucide-react";
+import { ChevronLeft, ChevronRight, Package, Loader2, Check, AlertCircle, GripVertical, Search, X, Send, Lock, Unlock, CalendarDays, FileSpreadsheet, Download, Bell, MoreHorizontal, Plus, RotateCcw, Settings, Scissors, SlidersHorizontal, Zap, Pencil, TrendingUp, ListChecks, ArrowRightLeft, ChevronDown } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import { colorForWO, WO_PALETTE, buildStyleColorMap } from "../../lib/workOrderColors";
 import { useDayBalances, cellKey } from "./PendingBalances";
+import UrgentChangeModal from "./UrgentChangeModal";
+// Tablero de pronóstico (mode="forecast"): alta/edición y lista de FC####.
+import { ForecastOrderModal, ForecastOrdersListModal, HoldDetailsCard, ConvertForecastModal } from "./ForecastOrders";
 import { StyleParamsFormModal, StyleStandardsListModal, normStyle, targetOfParams, lineKey, effKey, paramsForLine } from "./StyleStandards";
 // ReplanLinesModal is read from the module namespace (not a named import) so the
 // board still loads when StyleStandards.jsx doesn't export it yet; in that case
@@ -136,7 +139,14 @@ function buildBreakdownFromLines(lines, color) {
 }
 
 // Compact cell sizing — tuned so ~3 months of weekdays fit without scrolling.
-const CELL = 22;   // px — square size
+const CELL = 22;   // px — square size (tamaño "S")
+// Tamaños de casilla elegibles en la barra. h > w: las órdenes del mismo día
+// se apilan en vertical, así cada rebanada gana altura.
+const CELL_SIZES = {
+  s: { w: CELL, h: CELL, label: "S", title: "Compacto: más días en pantalla" },
+  m: { w: 30, h: 36, label: "M", title: "Mediano: se distinguen 2–3 órdenes por día" },
+  l: { w: 40, h: 52, label: "L", title: "Grande: cantidades visibles en cada orden apilada" },
+};
 const GAP = 3;     // px — gap between squares
 const LABEL = 64;  // px — line label column width (room for the late-count circle + "L12")
 // Sólo se puede enviar al supermercado el plan de las semanas 1 y 2 a partir de
@@ -244,7 +254,37 @@ export default function PlanBoard({
   // "Sem N" en la vista Semanal para bloquear / desbloquear esa semana. Una
   // semana bloqueada no se puede tocar desde el tablero del planner.
   canLockWeeks = false,
+  // mode: "plan" (default) = el Plan Board real. "forecast" = Tablero de
+  // pronóstico del cliente: misma grilla y misma mecánica de reservas que las
+  // PRE#### (arrastrar, empacar día por día, mover, seleccionar, eliminar),
+  // pero con sus propios pronósticos FC#### y sus propias tablas
+  // (forecast_orders / forecast_day_holds). Nunca toca line_assignments,
+  // pre_order_day_holds, merchant_week_plan, candados ni supermercado.
+  mode = "plan",
+  // onModeChange: si viene, el título se vuelve un selector
+  // [Plan Board | Pronóstico] para cambiar de tablero desde el encabezado.
+  onModeChange = null,
 } = {}) {
+  const isForecast = mode === "forecast";
+  // Endpoint de las reservas de línea/día de este tablero.
+  const HOLDS_API = isForecast ? "/api/forecast-holds" : "/api/pre-order-holds";
+  // Etiquetas de las fichas de reserva.
+  const PRE_TAG = isForecast ? "FC" : "PRE";
+  const PRE_LABEL = isForecast ? "PRONÓSTICO" : "PRE-ORDEN";
+  // Pronósticos del cliente (filas crudas del servidor) + modales.
+  const [forecastOrders, setForecastOrders] = useState([]);
+  const [fcForm, setFcForm] = useState(null);      // null | {} (nuevo) | fila (editar)
+  const [fcListOpen, setFcListOpen] = useState(false);
+  const [fcListKey, setFcListKey] = useState(0);   // remonta la lista para recargarla
+  const [fcConvert, setFcConvert] = useState(null); // pronóstico a convertir en SKM
+  // «Órdenes asignadas» bajo la grilla: desplegable (cerrado por defecto; se recuerda).
+  const [ordersOpen, setOrdersOpen] = useState(() => {
+    try { return localStorage.getItem("planboard.ordersOpen") === "1"; } catch { return false; }
+  });
+  const toggleOrdersOpen = () => setOrdersOpen((v) => {
+    try { localStorage.setItem("planboard.ordersOpen", v ? "0" : "1"); } catch { /* ignore */ }
+    return !v;
+  });
   const [currentDate, setCurrentDate] = useState(() => {
     // Con semanas publicadas arrancamos en la PRIMERA semana enviada, no en hoy:
     // así las vistas agregadas (semana/mes) caen en el año correcto aunque lo
@@ -270,8 +310,16 @@ export default function PlanBoard({
 
   // Con cellDetails la casilla del Diario crece para dar cabida a OT + PO +
   // cantidad. En cualquier otro caso conserva el tamaño compacto (CELL).
-  const CELL_W = cellDetails ? 104 : CELL;
-  const CELL_H = cellDetails ? 60 : CELL;
+  // Tamaño de casilla del Diario (barra: Casilla S / M / L). Más grande = se
+  // ven mejor las órdenes apiladas en un mismo día. Se recuerda por navegador.
+  const [cellSize, setCellSize] = useState(() => {
+    try { const v = localStorage.getItem("planboard.cellSize"); return CELL_SIZES[v] ? v : "m"; } catch { return "m"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("planboard.cellSize", cellSize); } catch { /* ignore */ }
+  }, [cellSize]);
+  const CELL_W = cellDetails ? 104 : CELL_SIZES[cellSize].w;
+  const CELL_H = cellDetails ? 60 : CELL_SIZES[cellSize].h;
   const [assignments, setAssignments] = useState([]);
   const [holds, setHolds] = useState([]); // PRE#### line/day holds (Plan Board reservations)
   // Fecha de entrega (target_date) que el merchant capturó en cada PRE####,
@@ -392,6 +440,13 @@ export default function PlanBoard({
   }, [reviewOnDrop]);
   const [loading, setLoading] = useState(true);
   const [selectedAssignment, setSelectedAssignment] = useState(null);
+  // Reserva tocada (FC#### / PRE####): abre su tarjeta de detalle.
+  const [selectedHold, setSelectedHold] = useState(null);
+  // ⚡ Cambio urgente (semanas bloqueadas por el CEO). urgentFor = casilla en
+  // el modal; urgentLog = Map(assignment id -> ultimo cambio) para pintar ⚡.
+  const [urgentFor, setUrgentFor] = useState(null);
+  const [urgentLog, setUrgentLog] = useState(() => new Map());
+  const [canUrgent, setCanUrgent] = useState(false);
   const [hovered, setHovered] = useState(null); // { assignment, x, y }
   // Resaltar orden: al pasar el cursor sobre un bloque se resaltan TODOS los
   // bloques de esa misma orden (en todas las líneas y días) y el resto se
@@ -568,6 +623,8 @@ export default function PlanBoard({
   const [producedResolved, setProducedResolved] = useState(false);
 
   useEffect(() => {
+    // Tablero de pronóstico: no hay producción real que mostrar.
+    if (isForecast) { setProducedByDay(new Map()); setProducedResolved(false); return undefined; }
     // Rango visible segun la vista, calculado desde primitivos (viewMode,
     // currentDate) para no re-disparar el fetch en cada render.
     let from, to;
@@ -787,7 +844,7 @@ export default function PlanBoard({
     if (n.work_order_no) setSearch(n.work_order_no);
   };
   useEffect(() => {
-    if (dataOverride || readOnly) return undefined;
+    if (dataOverride || readOnly || isForecast) return undefined;
     loadChangeNotices();
     const timer = setInterval(() => { if (document.visibilityState !== "hidden") loadChangeNotices(); }, 30000);
     const onVis = () => { if (document.visibilityState === "visible") loadChangeNotices(); };
@@ -831,7 +888,7 @@ export default function PlanBoard({
     setCutReqs(pend);
   };
   useEffect(() => {
-    if (dataOverride || readOnly) return undefined;
+    if (dataOverride || readOnly || isForecast) return undefined;
     loadCutRequests();
     const timer = setInterval(() => { if (document.visibilityState !== "hidden") loadCutRequests(); }, 60000);
     const onVis = () => { if (document.visibilityState === "visible") loadCutRequests(); };
@@ -844,7 +901,7 @@ export default function PlanBoard({
   // avisar aunque el planeador no cambie de pestaña. Con la pestaña oculta no
   // consulta (deja que la base de datos se pause).
   useEffect(() => {
-    if (dataOverride || readOnly) return undefined;
+    if (dataOverride || readOnly || isForecast) return undefined;
     const timer = setInterval(async () => {
       if (document.visibilityState === "hidden") return;
       const r = await getJSON("/api/pre-orders?status=all", { retries: 0 });
@@ -903,6 +960,75 @@ export default function PlanBoard({
     setTimeout(() => setToast(null), 4000);
   };
 
+  // Pronósticos -> la MISMA forma que usa el tablero para las PRE#### del
+  // merchant, para reutilizar bolsa, filtros, búsqueda, resaltado y entregas:
+  //   • una fila "merchantPlan" con pre_order_id por pronóstico (cantidad = la
+  //     del pronóstico; la bolsa le resta lo ya reservado),
+  //   • un "estándar" por pronóstico en styleParams, con la clave = FC#### y los
+  //     operarios / SAM / horas / eficiencia que capturó el planner. Así cada
+  //     pronóstico tiene su propia capacidad aunque dos compartan nombre de estilo.
+  const applyForecastOrders = (rows) => {
+    const all = Array.isArray(rows) ? rows : [];
+    setForecastOrders(all);
+    const active = all
+      // En el tablero: activos y parcialmente convertidos (lo convertido ya es SKM).
+      .filter((r) => r && r.id != null && (r.status === "active" || r.status === "partially_converted"))
+      .sort((a, b) =>
+        String(a.handover_date || "9999-99-99").localeCompare(String(b.handover_date || "9999-99-99")) ||
+        String(a.forecast_no).localeCompare(String(b.forecast_no)));
+    const sp = {};
+    const lp = {}; // capacidad propia por línea: "FC####|LÍNEA" (como los estándares por línea)
+    const targets = {};
+    const plan = active.map((r) => {
+      const key = normStyle(r.forecast_no);
+      (Array.isArray(r.line_params) ? r.line_params : []).forEach((x) => {
+        lp[lineKey(key, x.line_no)] = {
+          style_code: r.forecast_no,
+          line_no: x.line_no,
+          sam_minutes: Number(x.sam_minutes) || 0,
+          operators_count: Number(x.operators_count) || 0,
+          working_hours: Number(x.working_hours) || 0,
+          efficiency: Number(x.efficiency) || 1,
+          target_pcs: Number(x.target_pcs) || 0,
+          source: "forecast-line",
+        };
+      });
+      sp[key] = {
+        style_code: r.forecast_no,
+        sam_minutes: Number(r.sam_minutes) || 0,
+        operators_count: Number(r.operators_count) || 0,
+        working_hours: Number(r.working_hours) || 0,
+        efficiency: Number(r.efficiency) || 1,
+        target_pcs: Number(r.target_pcs) || 0,
+        source: "forecast",
+      };
+      if (r.handover_date) targets[r.id] = String(r.handover_date).slice(0, 10);
+      return {
+        pre_order_id: r.id,
+        work_order_id: null,
+        is_pre_order: true,
+        work_order_no: r.forecast_no,
+        customer_name: r.customer_name || "",
+        customer_po: "",
+        style_code: r.forecast_no,          // clave de capacidad
+        estilo: r.style_name || "",         // lo que se muestra
+        style_description: r.style_description || "",
+        season: r.season || "",
+        color: null,
+        // Sólo lo que sigue siendo pronóstico (lo convertido ya es SKM).
+        cantidad: Math.max(0, (Number(r.quantity) || 0) - (Number(r.converted_pieces) || 0)),
+        sam_minutes: Number(r.sam_minutes) || 0,
+        target_date: r.handover_date || null,
+        week_start: null,
+        sizes: [],
+      };
+    });
+    setStyleParams(sp);
+    setLineParams(lp);
+    setPreOrderTargets(targets);
+    setMerchantPlan(plan);
+  };
+
   const fetchData = async ({ silent = false } = {}) => {
     // Only the initial mount shows the full-page "Cargando Plan Board..."
     // gate. Post-mutation refetches pass { silent: true } so the board stays
@@ -949,6 +1075,40 @@ export default function PlanBoard({
           if (critical) failed.push(label);
         }
       });
+
+    // ---- Tablero de pronóstico: sólo líneas, festivos, pronósticos y sus
+    // reservas. Sin POs, sin asignaciones reales, sin plan del merchant.
+    if (isForecast) {
+      setAssignments([]);
+      setWorkOrders([]);
+      setLineParams({});
+      setCanEditStyles(false);
+      setPendingEff({});
+      setMerchantOk(true);
+      try {
+        await Promise.all([
+          load(HOLDS_API, (h) => { if (h.success) setHolds(h.holds || []); else throw new Error(h.error); },
+            { critical: true, label: "reservas de pronóstico" }),
+          load("/api/forecast-orders?status=all", (fo) => {
+            if (!fo?.success) throw new Error(fo?.error);
+            applyForecastOrders(fo.forecastOrders || []);
+          }, { critical: true, label: "pronósticos" }),
+          load("/api/line-runs", (lr) => { if (lr.success) setLineRuns(lr.runs || []); }, { critical: true, label: "líneas" }),
+          load("/api/planning/lines", (pl) => { if (pl?.success) setPlannerLines(pl.lines || []); }),
+          load("/api/holidays", (hol) => { if (hol?.success) setHolidays(hol.holidays || []); }),
+          // Sólo para leer el factor de equivalencia global (nunca se escribe).
+          load("/api/merchant-plan", (mp) => { if (Number(mp?.equivalence) > 0) setEquivalence(Number(mp.equivalence)); }),
+        ]);
+        if (isCurrent() && failed.length) {
+          showToast(`No se pudo cargar: ${failed.join(", ")}. Se muestra lo último conocido.`, true);
+        }
+      } catch (err) {
+        console.error("Error fetching forecast board data:", err);
+      } finally {
+        if (isCurrent()) { setLoading(false); fetchInFlightRef.current = false; }
+      }
+      return;
+    }
 
     // Todo en paralelo. La grilla usa tambien work-orders (entregas, SAM, eq) y
     // el plan del merchant (equivalencia), asi que el "Cargando..." se quita
@@ -1146,6 +1306,21 @@ export default function PlanBoard({
     return s;
   }, [merchantPlan]);
   const isPreOrder = (woId, color) => preOrderKeys.has(planKey(woId, color));
+  // Llaves separadas por id y por folio, para que un folio numérico no choque
+  // con el id de otra orden (las dos van mezcladas en preOrderKeys).
+  const { preOrderIdKeys, preOrderNoKeys } = useMemo(() => {
+    const ids = new Set();
+    const nos = new Set();
+    for (const r of merchantPlan) {
+      if (r.pre_order_id != null || !r.is_pre_order) continue;
+      if (r.work_order_id != null) ids.add(planKey(r.work_order_id, r.color));
+      if (r.work_order_no) nos.add(planKey(r.work_order_no, r.color));
+    }
+    return { preOrderIdKeys: ids, preOrderNoKeys: nos };
+  }, [merchantPlan]);
+  const isFlaggedPreOrderAssignment = (a) =>
+    (a.work_order_id != null && preOrderIdKeys.has(planKey(a.work_order_id, a.color))) ||
+    (!!a.work_order_no && preOrderNoKeys.has(planKey(a.work_order_no, a.color)));
 
   // ---- pre-órdenes del merchant (PRE####) --------------------------------
   // Filas del plan con pre_order_id: pedidos que el merchant ya comprometió
@@ -1565,7 +1740,9 @@ export default function PlanBoard({
   }, [filteredPoolJobs, filteredPreOrderJobs]);
 
   const weekLabel = (weekStart) => {
-    if (!weekStart) return { top: "Sin semana asignada", range: "" };
+    if (!weekStart) return isForecast
+      ? { top: "Pronósticos por cargar", range: "ordenados por fecha de entrega" }
+      : { top: "Sin semana asignada", range: "" };
     const s = new Date(`${weekStart}T00:00:00`);
     const e = addDays(s, 6);
     return { top: `Semana ${getWeek(s, { weekStartsOn: 1 })}`, range: `${format(s, "dd/MM")} – ${format(e, "dd/MM/yyyy")}` };
@@ -1604,7 +1781,8 @@ export default function PlanBoard({
     // de órdenes que siguen abiertas (una OT completada/cancelada ya no se
     // reasigna). Hoy y días futuros todavía pueden producirse, así que no avisan.
     const today = format(new Date(), "yyyy-MM-dd");
-    const rows = (balances.rows || []).filter((r) => {
+    // El pronóstico no tiene producción real: nunca muestra saldos.
+    const rows = (isForecast ? [] : (balances.rows || [])).filter((r) => {
       if (!(Number(r.balance) > 0)) return false;
       const d = String(r.assigned_date || "").slice(0, 10);
       if (!d || d >= today) return false;
@@ -1628,7 +1806,7 @@ export default function PlanBoard({
       pcs: rows.reduce((t, r) => t + (Number(r.balance) || 0), 0),
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [balances.rows, workOrders]);
+  }, [balances.rows, workOrders, isForecast]);
 
   const getDateRange = () => {
     // Daily view: weekdays only (no weekend work) up to ~6 months ahead. Hiding
@@ -2029,7 +2207,7 @@ export default function PlanBoard({
   // y sin caché; antes iban uno tras otro y el segundo esperaba al primero.
   // Si falla la red se conserva lo último conocido: el servidor lo hace cumplir.
   const loadWeekLocks = async ({ retries = 0 } = {}) => {
-    if (dataOverride) return; // snapshot publicado: no aplica
+    if (dataOverride || isForecast) return; // snapshot publicado / pronóstico: no aplica
     const [wk, bl] = await Promise.all([
       getJSON("/api/plan-week-locks", { retries, timeoutMs: 15000 }),
       getJSON("/api/plan-board-lock", { retries, timeoutMs: 15000 }),
@@ -2048,6 +2226,30 @@ export default function PlanBoard({
   const loadWeekLocksRef = useRef(loadWeekLocks);
   loadWeekLocksRef.current = loadWeekLocks;
 
+  // ⚡ Bitácora de cambios urgentes: marca las casillas y dice si el rol puede.
+  const loadUrgentLog = async () => {
+    if (dataOverride || isForecast) return;
+    const r = await getJSON("/api/plan-urgent-changes", { retries: 1, timeoutMs: 15000 });
+    if (!r.ok || !r.data?.success) return;
+    const m = new Map();
+    // Vienen del más nuevo al más viejo: el primero por casilla es el vigente.
+    (r.data.changes || []).forEach((c) => {
+      if (c.target_assignment_id != null && !m.has(Number(c.target_assignment_id))) m.set(Number(c.target_assignment_id), c);
+    });
+    setUrgentLog(m);
+    setCanUrgent(!!r.data.canUrgent);
+  };
+  useEffect(() => {
+    loadUrgentLog();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataOverride]);
+  const urgentOf = (a) => (a && !a.is_hold ? urgentLog.get(Number(a.id)) || null : null);
+  // Una casilla admite cambio urgente si está en semana bloqueada, es de hoy
+  // en adelante y no está terminada. El servidor lo vuelve a validar.
+  const canUrgentChange = (a) =>
+    canUrgent && !dataOverride && !readOnly && !!a && !a.is_hold && !!weekLockOf(a.assigned_date)
+    && !isLockedCell(a) && !["completed", "cancelled", "rejected"].includes(a.status);
+
   // true (y avisa) cuando el tablero está bloqueado. Se usa al inicio de cada
   // acción que cambia el tablero; el servidor y la base lo hacen cumplir igual.
   const boardLockedGuard = () => {
@@ -2058,6 +2260,7 @@ export default function PlanBoard({
   };
 
   const toggleBoardLock = async () => {
+    if (isForecast) return; // el pronóstico no tiene candado de tablero
     const next = !boardLock.locked;
     const ok = window.confirm(next
       ? "¿Bloquear el Plan Board?\n\nNadie podrá asignar, mover, insertar ni eliminar celdas hasta que se desbloquee."
@@ -2086,7 +2289,7 @@ export default function PlanBoard({
   // CEO o tablero completo). En cuanto llega, se recargan los candados para que
   // el tablero se pinte bloqueado YA, sin esperar al siguiente refresco.
   useEffect(() => {
-    if (dataOverride) return undefined;
+    if (dataOverride || isForecast) return undefined;
     const orig = window.fetch;
     const wrapped = async (...args) => {
       const res = await orig(...args);
@@ -2106,7 +2309,7 @@ export default function PlanBoard({
   // Se refresca solo: si el CEO bloquea mientras el planner tiene el tablero
   // abierto, el candado aparece en segundos (y al volver a la pestaña).
   useEffect(() => {
-    if (dataOverride) return undefined;
+    if (dataOverride || isForecast) return undefined;
     // La primera lectura va dentro de fetchData (junto con el resto del tablero).
     // Con la pestaña oculta no consulta: una pestaña olvidada abierta ya no
     // mantiene despierta la base de datos (Aurora puede pausarse).
@@ -2158,9 +2361,11 @@ export default function PlanBoard({
   //   2. POs reales marcadas como pre-orden por el merchant (is_pre_order):
   //      son line_assignments, no holds, y la vista Semanal también les pone
   //      el sello PRE (aggFor -> hasPre). Antes se escapaban del candado.
-  //   3. pre-órdenes PRE#### que el merchant planeó en esa semana y que aún
-  //      tienen piezas sin reservar (la bolsa de la semana).
-  // Con UNA sola pre-orden la semana ya no se puede bloquear.
+  //   (3. YA NO cuenta: las PRE#### que el merchant planeó en la semana pero que
+  //       siguen en la bolsa SIN reservar. No están en el tablero, así que no
+  //       hay nada que el candado vaya a congelar; antes bloqueaban semanas que
+  //       se veían limpias. Se pueden reservar en otra semana libre.)
+  // Con UNA sola pre-orden EN EL TABLERO la semana ya no se puede bloquear.
   const preOrdersByWeek = useMemo(() => {
     const m = new Map();
     const add = (wk, label) => {
@@ -2173,20 +2378,17 @@ export default function PlanBoard({
       if (!(Number(h.quantity) > 0)) continue;
       add(weekKeyOf(h.assigned_date), h.pre_order_no || `PRE${h.pre_order_id}`);
     }
-    // 2. POs marcadas como pre-orden, ya asignadas a un día
+    // 2. POs marcadas como pre-orden, ya asignadas a un día. Se compara id con id
+    //    y folio con folio: con la llave mezclada, un folio numérico ("1955")
+    //    chocaba con el id de OTRA orden y marcaba como PRE una PO normal.
     for (const a of assignments || []) {
       if (!a.assigned_date || ["cancelled", "rejected"].includes(a.status)) continue;
-      if (!(isPreOrder(a.work_order_id, a.color) || isPreOrder(a.work_order_no, a.color))) continue;
+      if (!isFlaggedPreOrderAssignment(a)) continue;
       add(weekKeyOf(a.assigned_date), a.work_order_no || `PO ${a.work_order_id}`);
-    }
-    // 3. PRE#### planeadas por el merchant en la semana, aún por reservar
-    for (const j of preOrderJobs || []) {
-      if (!j.week || !(j.remaining > 0)) continue;
-      add(weekKeyOf(j.week), j.work_order_no || `PRE${j.preOrderId}`);
     }
     return m;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [holds, assignments, preOrderKeys, preOrderJobs]);
+  }, [holds, assignments, preOrderIdKeys, preOrderNoKeys]);
   const preOrdersInWeek = (weekKey) => [...(preOrdersByWeek.get(weekKey) || [])].sort();
 
   const toggleWeekLock = async (weekKey) => {
@@ -2882,7 +3084,7 @@ export default function PlanBoard({
 
   // Estado de publicación (para marcar "ya enviada" en el selector).
   const loadPublications = async () => {
-    if (readOnly) return;
+    if (readOnly || isForecast) return;
     try {
       const res = await fetch(`${API_URL}/api/supermarket-plan/weeks`, { headers: authHeaders() });
       const data = await res.json().catch(() => null);
@@ -3003,6 +3205,9 @@ export default function PlanBoard({
   // y se persiste con debounce para no golpear el backend en cada tecla.
   const factorTimer = useRef(null);
   const persistEquivalence = async (factor) => {
+    // En el pronóstico `merchantPlan` son filas SINTÉTICAS (los FC####): guardar
+    // aquí reemplazaría el plan real del merchant. El factor queda sólo en pantalla.
+    if (isForecast) return;
     const items = (merchantPlan || []).map((r) => {
       const sam = Number(r.sam_minutes) || 0;
       const cantidad = Number(r.cantidad) || 0;
@@ -3047,6 +3252,7 @@ export default function PlanBoard({
     const f = Number(raw);
     const factor = f > 0 ? f : 10;   // igual que el merchant: valor inválido → 10
     setEquivalence(factor);          // recálculo inmediato del eq en pantalla
+    if (isForecast) return;          // pronóstico: sólo en pantalla, no se persiste
     if (!merchantOk) return;         // el plan no cargó → solo local, no se persiste
     clearTimeout(factorTimer.current);
     factorTimer.current = setTimeout(() => persistEquivalence(factor), 700);
@@ -3215,13 +3421,19 @@ export default function PlanBoard({
 
   // Line label click → the styles on that line (today by default) with their
   // planner standards, each editable.
-  const openStyleEditor = (lineNo) => setStyleList({ lineNo: String(lineNo), date: format(new Date(), "yyyy-MM-dd") });
+  const openStyleEditor = (lineNo) => (isForecast
+    ? setFcListOpen(true) // en el pronóstico la capacidad vive en cada FC####
+    : setStyleList({ lineNo: String(lineNo), date: format(new Date(), "yyyy-MM-dd") }));
 
   // Server copy of one style's standards (+ a production-history hint when the
   // planner has none): general `params`, each line's own `lineParams`, the
   // `lines` where the style is planned, and pending efficiency requests.
   // Null if the request fails.
   const fetchStyleInfo = async (key, lineNo = null) => {
+    if (isForecast) {
+      const p = styleParamsRef.current[normStyle(key)] || null;
+      return p ? { success: true, params: p, lineParams: [], lines: [] } : null;
+    }
     try {
       const qs = lineNo ? `?lineNo=${encodeURIComponent(lineNo)}` : "";
       const r = await fetch(`${API_URL}/api/planner/style-params/${encodeURIComponent(key)}${qs}`, { headers: authHeaders() });
@@ -3247,6 +3459,10 @@ export default function PlanBoard({
   // resume the drop / move that needed the standard). `lineNo` preselects that
   // line in the form's "Aplicar a" picker (null = general standard).
   const openStyleForm = async (style, { woId = null, color = null, context = "", onSaved = null, saveLabel, info, merchantSam: samHint = null, lineNo = null } = {}) => {
+    if (isForecast) {
+      showToast("En el Tablero de pronóstico la capacidad sale de cada pronóstico (operarios, SAM, horas). Edítelo desde «Pronósticos».", true);
+      return;
+    }
     const key = normStyle(style);
     if (!key) return;
     const ln = lineNo != null && String(lineNo).trim() ? String(lineNo).trim() : null;
@@ -3463,7 +3679,7 @@ export default function PlanBoard({
   // planner standards (server: /api/planning/style-capacity).
   const fetchStyleCapacity = async (lineNo, style, from, to) => {
     const qs = new URLSearchParams({ lineNo: String(lineNo), style, from, to });
-    const res = await fetch(`${API_URL}/api/planning/style-capacity?${qs}`, { headers: authHeaders() });
+    const res = await fetch(`${API_URL}${isForecast ? "/api/forecast-capacity" : "/api/planning/style-capacity"}?${qs}`, { headers: authHeaders() });
     const data = await res.json();
     if (!data.success) {
       const err = new Error(data.error || "No se pudo calcular la capacidad");
@@ -3668,7 +3884,7 @@ export default function PlanBoard({
     if (blockedByWeekLock(startDate)) return;
     let remaining = po.remaining != null ? po.remaining : (Number(po.cantidad) || 0);
     if (remaining <= 0) return showToast("Esta pre-orden no tiene piezas por reservar.", true);
-    const label = `${po.work_order_no}${po.color ? " " + po.color : ""} · PRE-ORDEN`;
+    const label = `${po.work_order_no}${po.color ? " " + po.color : ""} · ${PRE_LABEL}`;
 
     // A reservation is sized with the planner's standard for the pre-order's
     // style, same as a real PO (new style → the planner enters it first).
@@ -3684,6 +3900,49 @@ export default function PlanBoard({
         lineNo,
       });
       if (!ok) { setDraggedPO(null); setArmedPO(null); setDropTarget(null); return; }
+    }
+
+    // ── Tablero de pronóstico: TODO el reparto en el servidor, en UNA petición
+    // (una transacción, una lectura de capacidad, un insert masivo) y con un
+    // horizonte de ~6 años: un pronóstico grande cabe completo aunque corra
+    // 2026, 2027, 2028, 2029… Antes eran 180 días y una petición por día.
+    if (isForecast) {
+      setDropBusy(true);
+      try {
+        const start = format(new Date(startDate), "yyyy-MM-dd");
+        const res = await fetch(`${API_URL}${HOLDS_API}/place`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({
+            forecastOrderId: po.preOrderId,
+            lineNo,
+            startDate: start,
+            quantity: remaining,
+            color: po.color || "",
+            splitDay: !!splitDay,
+            blockedDates: holidayDatesFor(lineNo, start, 2200), // festivos de esa línea
+          }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data?.success) throw new Error(data?.error || `HTTP ${res.status}`);
+        await fetchData({ silent: true });
+        const until = data.lastDay ? ` · ${fmtDMY(data.firstDay)} → ${fmtDMY(data.lastDay)}` : "";
+        if (data.cells > 0 && !(data.unplaced > 0)) {
+          showToast(`✅ ${label}: ${Math.round(data.placed).toLocaleString()} pzas en ${data.cells} día(s) en la Línea ${lineNo}${until}.`);
+        } else if (data.cells > 0) {
+          showToast(`⚠️ ${label}: ${Math.round(data.placed).toLocaleString()} pzas en ${data.cells} día(s)${until}; faltan ${Math.round(data.unplaced).toLocaleString()} (no hay más capacidad libre en la Línea ${lineNo} hasta ${fmtDMY(data.horizonEnd)}).`, true);
+        } else {
+          showToast(`No se pudo reservar ${label}: la Línea ${lineNo} no tiene capacidad libre desde ${fmtDMY(start)}.`, true);
+        }
+      } catch (err) {
+        showToast(`Error al reservar: ${err.message}`, true);
+      } finally {
+        setDropBusy(false);
+        setDraggedPO(null);
+        setArmedPO(null);
+        setDropTarget(null);
+      }
+      return;
     }
 
     const totalToHold = remaining;
@@ -3730,7 +3989,7 @@ export default function PlanBoard({
       for (const cell of plan) {
         if (cell.qty <= 0) continue;
         if (failures >= MAX_FAILURES) break;
-        const res = await fetch(`${API_URL}/api/pre-order-holds`, {
+        const res = await fetch(`${API_URL}${HOLDS_API}`, {
           method: "POST",
           headers: authHeaders(),
           body: JSON.stringify({
@@ -3781,6 +4040,50 @@ export default function PlanBoard({
     }
   };
 
+  // Festivos de una línea en [from, from+days): el servidor los brinca al
+  // re-calcular un pronóstico con nueva capacidad.
+  const holidayDatesFor = (lineNo, from, days = 400) => {
+    const out = [];
+    let d = new Date(`${from}T00:00:00`);
+    for (let i = 0; i < days; i++, d = addDays(d, 1)) if (holidayFor(lineNo, d)) out.push(format(d, "yyyy-MM-dd"));
+    return out;
+  };
+
+  // Quita varias casillas de reserva (desde la tarjeta de detalle). Las de
+  // semanas bloqueadas por el CEO se omiten. true si se quitó algo.
+  const removeHoldCells = async (cells, label) => {
+    if (boardLockedGuard() || readOnly || dropBusy) return false;
+    const ok = (cells || []).filter((c) => c?.holdId != null && !weekLockOf(cellDateOf(c)));
+    if (!ok.length) { showToast("No hay casillas que se puedan quitar (semana bloqueada).", true); return false; }
+    const skipped = (cells || []).length - ok.length;
+    if (!window.confirm(`¿Quitar ${ok.length === 1 ? "la casilla" : `${ok.length} casillas`} de ${label}?${skipped ? `\n(${skipped} en semana bloqueada se quedan)` : ""}`)) return false;
+    setDropBusy(true);
+    let removed = 0;
+    try {
+      if (isForecast) {
+        // Pronóstico: todas en UNA petición (pueden ser cientos de días).
+        const res = await fetch(`${API_URL}${HOLDS_API}?ids=${ok.map((c) => encodeURIComponent(c.holdId)).join(",")}`, { method: "DELETE", headers: authHeaders() });
+        const data = await res.json().catch(() => null);
+        if (data?.success) removed = Number(data.deleted) || 0;
+      } else {
+        for (const c of ok) {
+          const res = await fetch(`${API_URL}${HOLDS_API}?id=${encodeURIComponent(c.holdId)}`, { method: "DELETE", headers: authHeaders() });
+          const data = await res.json().catch(() => null);
+          if (data?.success) removed++;
+        }
+      }
+      await fetchData({ silent: true });
+      if (removed === ok.length) showToast(`✅ ${removed} casilla(s) de ${label} quitada(s).`);
+      else showToast(`Se quitaron ${removed} de ${ok.length} casillas.`, true);
+      return removed > 0;
+    } catch (err) {
+      showToast(`Error: ${err.message}`, true);
+      return false;
+    } finally {
+      setDropBusy(false);
+    }
+  };
+
   // Remove a single pre-order hold cell.
   const removeHold = async (a) => {
     if (boardLockedGuard()) return;   // 🔒 tablero bloqueado
@@ -3790,7 +4093,7 @@ export default function PlanBoard({
     if (!window.confirm(`¿Quitar la reserva de ${a.work_order_no} en L${a.line_no} · ${ymd(a.assigned_date)}?`)) return;
     setDropBusy(true);
     try {
-      const res = await fetch(`${API_URL}/api/pre-order-holds?id=${encodeURIComponent(a.holdId)}`, {
+      const res = await fetch(`${API_URL}${HOLDS_API}?id=${encodeURIComponent(a.holdId)}`, {
         method: "DELETE",
         headers: authHeaders(),
       });
@@ -4478,7 +4781,7 @@ export default function PlanBoard({
       // 1) Reserve at the destination first. The holds endpoint rechecks line
       //    capacity, so if the target cell can't fit the full quantity the POST
       //    fails and we keep the original reservation (all-or-nothing move).
-      const createRes = await fetch(`${API_URL}/api/pre-order-holds`, {
+      const createRes = await fetch(`${API_URL}${HOLDS_API}`, {
         method: "POST",
         headers: authHeaders(),
         body: JSON.stringify({
@@ -4501,7 +4804,7 @@ export default function PlanBoard({
         return;
       }
       // 2) Destination reserved — release the original cell.
-      const delRes = await fetch(`${API_URL}/api/pre-order-holds?id=${encodeURIComponent(hold.holdId)}`, {
+      const delRes = await fetch(`${API_URL}${HOLDS_API}?id=${encodeURIComponent(hold.holdId)}`, {
         method: "DELETE",
         headers: authHeaders(),
       });
@@ -4668,7 +4971,7 @@ export default function PlanBoard({
     //    additive POST from merging the re-packed cells back into them.
     for (const g of groups.values()) {
       for (const hid of g.holdIds) {
-        await fetch(`${API_URL}/api/pre-order-holds?id=${encodeURIComponent(hid)}`, {
+        await fetch(`${API_URL}${HOLDS_API}?id=${encodeURIComponent(hid)}`, {
           method: "DELETE",
           headers: authHeaders(),
         }).catch(() => {});
@@ -4704,7 +5007,7 @@ export default function PlanBoard({
 
         const qty = Math.min(remaining, available);
         try {
-          const res = await fetch(`${API_URL}/api/pre-order-holds`, {
+          const res = await fetch(`${API_URL}${HOLDS_API}`, {
             method: "POST",
             headers: authHeaders(),
             body: JSON.stringify({
@@ -4909,7 +5212,7 @@ export default function PlanBoard({
         else errors.push(data.error || `HTTP ${res.status}`);
       }
       for (const h of delHolds) {
-        const res = await fetch(`${API_URL}/api/pre-order-holds?id=${encodeURIComponent(h.holdId)}`, {
+        const res = await fetch(`${API_URL}${HOLDS_API}?id=${encodeURIComponent(h.holdId)}`, {
           method: "DELETE",
           headers: authHeaders(),
         });
@@ -5078,6 +5381,154 @@ export default function PlanBoard({
         marginRight: "calc(50% - 50vw + 16px)",
       }}
     >
+      {/* Tarjeta de detalle de una reserva (FC#### / PRE####) */}
+      {selectedHold && (() => {
+        const pid = String(selectedHold.pre_order_id);
+        const cells = holdRows.filter((h) => String(h.pre_order_id) === pid);
+        if (!cells.length) return null; // ya no existe (se quitó / recargó)
+        const hold = cells.find((h) => h.holdId === selectedHold.holdId) || cells[0];
+        const mp = (merchantPlan || []).find((r) => String(r.pre_order_id) === pid);
+        let order;
+        if (isForecast) {
+          const fo = forecastOrders.find((r) => String(r.id) === pid) || {};
+          // Capacidad de ESTA línea: la propia si la tiene, si no la general.
+          const own = (fo.line_params || []).find((x) => String(x.line_no) === String(hold.line_no));
+          const cap = own || fo;
+          order = {
+            kind: "forecast",
+            no: fo.forecast_no || hold.work_order_no,
+            customer: fo.customer_name || hold.customer_name,
+            style: fo.style_name || hold.estilo,
+            description: fo.style_description,
+            season: fo.season,
+            quantity: fo.quantity != null
+              ? Math.max(0, (Number(fo.quantity) || 0) - (Number(fo.converted_pieces) || 0))
+              : Number(mp?.cantidad) || 0,
+            convertedPieces: Number(fo.converted_pieces) || 0,
+            workOrderNos: fo.work_order_nos || "",
+            delivery: fo.handover_date || hold.target_date,
+            sam: Number(cap.sam_minutes) || 0,
+            operators: Number(cap.operators_count) || 0,
+            hours: Number(cap.working_hours) || 0,
+            efficiency: Number(cap.efficiency) || 1,
+            ownLine: !!own,
+            notes: fo.notes,
+          };
+        } else {
+          const po = (preOrdersAll || []).find((r) => String(r.id) === pid) || {};
+          const sp = paramsFor(normStyle(hold.style_code || hold.estilo || ""), hold.line_no);
+          order = {
+            kind: "pre",
+            no: po.pre_order_no || hold.work_order_no,
+            customer: po.customer_name || hold.customer_name,
+            style: po.style_code || hold.style_code || hold.estilo,
+            description: po.style_description,
+            customerPo: po.customer_po,
+            quantity: Number(mp?.cantidad) || Number(po.pieces) || 0,
+            delivery: po.target_date || hold.target_date || preOrderTargets[pid],
+            sam: Number(sp?.sam_minutes) || Number(po.sam_minutes) || 0,
+            operators: Number(sp?.operators_count) || 0,
+            hours: Number(sp?.working_hours) || 0,
+            efficiency: Number(sp?.efficiency) || 1,
+            notes: po.notes,
+          };
+        }
+        return (
+          <HoldDetailsCard
+            hold={hold}
+            cells={cells}
+            order={order}
+            today={todayStr()}
+            busy={dropBusy}
+            onClose={() => setSelectedHold(null)}
+            onPick={(c) => setSelectedHold(c)}
+            // Modo consulta: sólo ver (sin quitar / convertir / editar).
+            onRemoveCell={readOnly ? null : async (c) => {
+              if (await removeHoldCells([c], `${order.no} · L${c.line_no} · ${fmtDMY(c.assigned_date).slice(0, 5)}`)) {
+                const rest = cells.filter((x) => x.holdId !== c.holdId);
+                setSelectedHold(rest.length ? rest[0] : null);
+              }
+            }}
+            onRemoveCells={readOnly ? null : async (list, label) => {
+              if (await removeHoldCells(list, label)) setSelectedHold(null);
+            }}
+            onConvert={isForecast && !readOnly ? () => {
+              const fo = forecastOrders.find((r) => String(r.id) === pid);
+              if (fo) { setSelectedHold(null); setFcConvert(fo); }
+            } : null}
+            onEdit={isForecast && !readOnly ? () => {
+              const fo = forecastOrders.find((r) => String(r.id) === pid);
+              // Abre el formulario con los valores de esta línea precargados.
+              if (fo) { setSelectedHold(null); setFcForm({ ...fo, __baseLine: String(hold.line_no) }); }
+            } : null}
+          />
+        );
+      })()}
+
+      {/* Convertir pronóstico → orden(es) SKM reales */}
+      {isForecast && fcConvert && (
+        <ConvertForecastModal
+          forecast={fcConvert}
+          today={todayStr()}
+          onClose={() => setFcConvert(null)}
+          onConverted={(r) => {
+            const no = fcConvert.forecast_no;
+            setFcConvert(null);
+            const wk = r.week ? ` · en el Plan Board, semana del ${fmtDMY(r.week).slice(0, 5)}` : "";
+            showToast(
+              `✅ ${no} → ${(r.workOrderNos || []).join(", ")} (${Math.round(r.pieces || 0).toLocaleString()} pzas)` +
+              (r.partial ? ` · conversión parcial, quedan ${Math.round(Number(r.forecastOrder?.open_quantity) || 0).toLocaleString()} pzas como pronóstico` : "") +
+              wk +
+              (r.planError ? ` · ⚠️ no se pudo poner en el plan del merchant: ${r.planError}` : ""),
+              !!r.planError
+            );
+            setFcListKey((k) => k + 1);
+            fetchData({ silent: true });
+          }}
+        />
+      )}
+
+      {/* Tablero de pronóstico: alta / edición y lista de pronósticos */}
+      {isForecast && fcForm && (
+        <ForecastOrderModal
+          initial={fcForm.id ? fcForm : null}
+          today={todayStr()}
+          holidayDatesFor={holidayDatesFor}
+          onClose={() => setFcForm(null)}
+          onSaved={(row, recalculated = []) => {
+            const wasEdit = !!fcForm.id;
+            setFcForm(null);
+            if (recalculated.length) {
+              const parts = recalculated.map((r) =>
+                `L${r.line}: ${r.cellsBefore} → ${r.cellsAfter} día(s)${r.lastDay ? `, termina ${fmtDMY(r.lastDay).slice(0, 5)}` : ""}`);
+              const left = recalculated.reduce((t, r) => t + (Number(r.unplaced) || 0), 0);
+              showToast(
+                `✅ ${row?.forecast_no || "Pronóstico"} re-calculado · ${parts.join(" · ")}` +
+                (left > 0 ? ` · ⚠️ ${Math.round(left).toLocaleString()} pzas no cupieron y regresaron a la bolsa` : ""),
+                left > 0
+              );
+            } else {
+              showToast(wasEdit
+                ? `✅ ${row?.forecast_no || "Pronóstico"} actualizado.`
+                : `✅ ${row?.forecast_no || "Pronóstico"} guardado. Arrástrelo a una línea para cargarlo.`);
+            }
+            setViewMode("day");
+            setShowPool(true);
+            fetchData({ silent: true });
+          }}
+        />
+      )}
+      {isForecast && fcListOpen && (
+        <ForecastOrdersListModal
+          key={fcListKey}
+          onConvert={(row) => setFcConvert(row)}
+          onClose={() => setFcListOpen(false)}
+          onNew={() => setFcForm({})}
+          onEdit={(row) => setFcForm(row)}
+          onChanged={() => fetchData({ silent: true })}
+        />
+      )}
+
       {/* Selector de semanas + envío al supermercado */}
       {sendOpen && !readOnly && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => !sendBusy && setSendOpen(false)}>
@@ -5209,7 +5660,38 @@ export default function PlanBoard({
         <div className="px-5 pt-4 pb-3 flex items-center justify-between gap-4 flex-wrap">
           <div className="min-w-[260px] flex-1">
             <h2 className="font-semibold text-gray-900 text-lg flex items-center gap-2">
-              {heading || "Plan Board"}
+              {onModeChange && !readOnly ? (
+                // Selector de tablero en el propio título: cambia entre el plan
+                // real y el pronóstico del cliente sin salir de la pestaña.
+                <span role="tablist" aria-label="Tablero" className="inline-flex items-center rounded-lg bg-gray-100 p-0.5">
+                  {[
+                    { k: "plan", label: "Plan Board", Icon: CalendarDays, on: "bg-white text-gray-900 shadow-sm" },
+                    { k: "forecast", label: "Pronóstico", Icon: TrendingUp, on: "bg-teal-600 text-white shadow-sm" },
+                  ].map(({ k, label, Icon, on }) => {
+                    const active = (isForecast ? "forecast" : "plan") === k;
+                    return (
+                      <button
+                        key={k}
+                        type="button"
+                        role="tab"
+                        aria-selected={active}
+                        onClick={() => { if (!active && !dropBusy) onModeChange(k); }}
+                        title={k === "forecast" ? "Pronóstico del cliente: cree pronósticos y cárguelos a las líneas" : "Plan real: órdenes y pre-órdenes del merchant"}
+                        className={`h-8 inline-flex items-center gap-1.5 rounded-md px-3 text-base font-semibold transition ${active ? on : "text-gray-500 hover:text-gray-800"}`}
+                      >
+                        <Icon className="w-4 h-4" /> {label}
+                      </button>
+                    );
+                  })}
+                </span>
+              ) : (
+                heading || (isForecast ? "Tablero de pronóstico" : "Plan Board")
+              )}
+              {isForecast && !onModeChange && (
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-700 bg-teal-50 border border-teal-200 rounded-full px-2 py-0.5">
+                  <TrendingUp className="w-3 h-3" /> Pronóstico del cliente
+                </span>
+              )}
               {readOnly && (
                 <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-600 bg-slate-100 border border-slate-200 rounded-full px-2 py-0.5">
                   <Lock className="w-3 h-3" /> Sólo consulta
@@ -5230,7 +5712,9 @@ export default function PlanBoard({
             </h2>
             <p className="text-sm text-gray-600">
               {subheading ||
-                (readOnly
+                (isForecast
+                  ? "Pronóstico del cliente: cree un pronóstico (estilo, cliente, cantidad, operarios, SAM, horas) y arrástrelo a una línea para reservar su capacidad. No afecta el Plan Board real."
+                  : readOnly
                   ? "Plan publicado por planeación. Se actualiza cuando planeación vuelve a enviar la semana."
                   : "Arrastre una orden del panel izquierdo a una casilla de la línea —o tóquela y luego toque la casilla— para programarla")}
             </p>
@@ -5580,7 +6064,7 @@ export default function PlanBoard({
                   <Check className="w-4 h-4" /> {selectMode ? "Seleccionando" : "Seleccionar"}
                 </button>
               )}
-              <button
+              {!isForecast && (<button
                 onClick={toggleBoardLock}
                 disabled={boardLockBusy || !boardLock.canLock}
                 title={boardLock.canLock
@@ -5590,7 +6074,7 @@ export default function PlanBoard({
               >
                 {boardLock.locked ? <Lock className="w-4 h-4" /> : <Unlock className="w-4 h-4" />}
                 {boardLock.locked ? `Bloqueado${boardLock.lockedBy ? ` · ${boardLock.lockedBy}` : ""}` : "Bloquear"}
-              </button>
+              </button>)}
               {viewMode === "week" && periods.length > 0 && (
                 <button
                   onClick={() => exportWeeksToExcel(periods)}
@@ -5616,6 +6100,17 @@ export default function PlanBoard({
                   <>
                     <div className="fixed inset-0 z-[58]" onClick={() => setMoreOpen(false)} />
                     <div className="absolute right-0 top-full mt-2 z-[59] w-64 rounded-xl border border-gray-200 bg-white p-1.5 shadow-xl text-left">
+                      {isForecast && (
+                        <button
+                          onClick={() => { setMoreOpen(false); setFcListOpen(true); }}
+                          className="w-full flex items-start gap-2.5 rounded-lg px-2.5 py-2 hover:bg-gray-50"
+                        >
+                          <ListChecks className="w-4 h-4 mt-0.5 text-teal-600 shrink-0" />
+                          <span><span className="block text-sm font-medium text-gray-800">Pronósticos</span>
+                            <span className="block text-[11px] text-gray-500">Editar, quitar del tablero, cancelar o borrar</span></span>
+                        </button>
+                      )}
+                      {!isForecast && (<>
                       <button
                         onClick={() => { setMoreOpen(false); setAddLine({ lineNo: "", operators: "", hours: "", effPct: "", sam: "" }); }}
                         className="w-full flex items-start gap-2.5 rounded-lg px-2.5 py-2 hover:bg-gray-50"
@@ -5632,6 +6127,7 @@ export default function PlanBoard({
                         <span><span className="block text-sm font-medium text-gray-800">Estándares por estilo</span>
                           <span className="block text-[11px] text-gray-500">SAM, operarios, horas y eficiencia</span></span>
                       </button>
+                      </>)}
                       {lineOrder.length > 0 && (
                         <button
                           onClick={() => { setMoreOpen(false); resetLineOrder(); }}
@@ -5646,6 +6142,27 @@ export default function PlanBoard({
                   </>
                 )}
               </div>
+              {isForecast ? (
+                <>
+                  <button
+                    onClick={() => setFcListOpen(true)}
+                    className="h-9 inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-teal-200 bg-white px-3 text-sm font-medium text-teal-700 hover:bg-teal-50 transition"
+                    title="Ver, editar, quitar del tablero o cancelar pronósticos"
+                  >
+                    <ListChecks className="w-4 h-4" /> Pronósticos
+                    <span className="rounded-full bg-teal-100 text-teal-800 text-[10px] font-bold px-1.5 leading-4">
+                      {forecastOrders.filter((r) => r.status !== "cancelled").length}
+                    </span>
+                  </button>
+                  <button
+                    onClick={() => setFcForm({})}
+                    className="h-9 inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-teal-600 px-4 text-sm font-semibold text-white shadow-sm hover:bg-teal-700 transition"
+                    title="Crear un pronóstico del cliente para cargarlo a una línea"
+                  >
+                    <Plus className="w-4 h-4" /> Nuevo pronóstico
+                  </button>
+                </>
+              ) : (
               <button
                 onClick={() => { setSendOpen(true); loadPublications(); }}
                 className="h-9 inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 transition"
@@ -5653,6 +6170,7 @@ export default function PlanBoard({
               >
                 <Send className="w-4 h-4" /> Enviar al supermercado
               </button>
+              )}
             </div>
           )}
           {readOnly && (
@@ -5803,6 +6321,19 @@ export default function PlanBoard({
               <ToggleChip on={reviewOnDrop} onClick={() => setReviewOnDrop((v) => !v)} color="indigo" label="Revisar estándar"
                 title="Al soltar una orden se muestra el estándar de su estilo para confirmarlo o ajustarlo antes de asignar." />
             )}
+            {!cellDetails && (
+              <div className="flex items-center gap-1.5" role="group" aria-label="Tamaño de casilla">
+                <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">Casilla</span>
+                <div className="flex rounded-lg border border-gray-300 overflow-hidden">
+                  {Object.entries(CELL_SIZES).map(([k, v]) => (
+                    <button key={k} onClick={() => setCellSize(k)} title={v.title} aria-pressed={cellSize === k}
+                      className={`w-8 py-1.5 text-xs font-semibold ${cellSize === k ? "bg-gray-900 text-white" : "bg-white text-gray-600 hover:bg-gray-50"} ${k !== "s" ? "border-l border-gray-300" : ""}`}>
+                      {v.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             <span className="mx-1 h-6 w-px bg-gray-200" />
             <label
               className="flex items-center gap-1.5"
@@ -5825,7 +6356,7 @@ export default function PlanBoard({
         <div className={`px-5 py-2 border-b text-sm flex items-center justify-between gap-3 ${armedPO.isPreOrder ? "bg-violet-100 border-violet-200 text-violet-900" : "bg-amber-100 border-amber-200 text-amber-800"}`}>
           <span className="truncate inline-flex items-center gap-1.5">
             <b className="font-mono">{armedPO.work_order_no}{armedPO.color ? ` · ${armedPO.color}` : ""}</b>
-            {armedPO.isPreOrder && <span className="text-[9px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5">PRE-ORDEN</span>}
+            {armedPO.isPreOrder && <span className="text-[9px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5">{PRE_LABEL}</span>}
             <span>lista para asignar — toque una casilla libre (o arrástrela).</span>
             <span className={armedPO.isPreOrder ? "text-violet-600" : "text-amber-600"}>Esc para cancelar.</span>
           </span>
@@ -5860,14 +6391,14 @@ export default function PlanBoard({
                 >
                   Insertar…
                 </button>
-                <button
+                {!isForecast && (<button
                   disabled={selectedIds.size === 0 || dropBusy}
                   onClick={confirmSelected}
                   title="Crea el borrador en el lado de los líderes de línea para las casillas seleccionadas."
                   className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40"
                 >
                   Enviar a líderes
-                </button>
+                </button>)}
                 <button
                   disabled={selectedIds.size === 0 || dropBusy}
                   onClick={deleteSelected}
@@ -5931,7 +6462,7 @@ export default function PlanBoard({
             {poolJobs.length + preOrderJobs.length}
           </span>
           <span className="text-xs font-semibold text-gray-700 whitespace-nowrap" style={{ writingMode: "vertical-rl" }}>
-            Órdenes del merchant
+            {isForecast ? "Pronósticos del cliente" : "Órdenes del merchant"}
           </span>
         </button>
       )}
@@ -5941,7 +6472,7 @@ export default function PlanBoard({
         <div className="w-full flex items-center justify-between px-4 py-2.5 gap-2 border-b border-amber-200 bg-amber-100/40 shrink-0">
           <button onClick={() => setShowPool((v) => !v)} className="flex items-center gap-2 text-sm font-semibold text-gray-800 min-w-0">
             <Package className="w-4 h-4 text-amber-600 shrink-0" />
-            <span className="truncate">Órdenes del merchant</span>
+            <span className="truncate">{isForecast ? "Pronósticos del cliente" : "Órdenes del merchant"}</span>
             <span className="shrink-0 text-xs font-bold text-amber-700 bg-amber-100 rounded-full px-2 py-0.5">
               {isSearching
                 ? `${filteredPoolJobs.length + filteredPreOrderJobs.length}/${poolJobs.length + preOrderJobs.length}`
@@ -5959,6 +6490,15 @@ export default function PlanBoard({
                 />
                 Desglose
               </label>
+            )}
+            {isForecast && (
+              <button
+                onClick={() => setFcForm({})}
+                title="Nuevo pronóstico"
+                className="inline-flex items-center gap-0.5 rounded-md bg-teal-600 px-1.5 py-0.5 text-[11px] font-semibold text-white hover:bg-teal-700"
+              >
+                <Plus className="w-3.5 h-3.5" /> Nuevo
+              </button>
             )}
             <button
               onClick={() => setShowPool(false)}
@@ -6005,18 +6545,29 @@ export default function PlanBoard({
                 No se pudo cargar el plan del merchant — mostrando todas las órdenes pendientes.
               </p>
             )}
-            {(preOrderKeys.size > 0 || preOrderJobs.length > 0) && (
+            {isForecast && preOrderJobs.length > 0 && (
+              <p className="mb-2 text-[10px] text-teal-800 inline-flex items-start gap-1.5">
+                <span className="inline-block w-2.5 h-2.5 mt-0.5 shrink-0 rounded-sm border border-dashed border-violet-500 bg-violet-100" />
+                <span>
+                  Arrastre un pronóstico a una línea (o tóquelo y luego toque una casilla): se reparte día por día con
+                  su capacidad (operarios × horas × 60 × eficiencia ÷ SAM). Toque una casilla para quitarla; use Seleccionar para moverlas.
+                </span>
+              </p>
+            )}
+            {!isForecast && (preOrderKeys.size > 0 || preOrderJobs.length > 0) && (
               <p className="mb-2 text-[10px] text-violet-700 inline-flex items-start gap-1.5">
                 <span className="inline-block w-2.5 h-2.5 mt-0.5 shrink-0 rounded-sm border border-dashed border-violet-500 bg-violet-100" />
                 <span>
-                  Borde punteado / <span className="font-bold bg-violet-600 text-white rounded-full px-1.5 py-0.5 leading-none">PRE</span> = pre-orden del merchant.
+                  Borde punteado / <span className="font-bold bg-violet-600 text-white rounded-full px-1.5 py-0.5 leading-none">{PRE_TAG}</span> = pre-orden del merchant.
                   {preOrderJobs.length > 0 && " Las PRE#### aún no son PO, pero puede colocarlas en una casilla como reserva: apartan la capacidad de esa línea/día. Toque la casilla para quitar la reserva; al convertir la pre-orden, la reserva se libera y asigna la PO real."}
                 </span>
               </p>
             )}
             {poolJobs.length + preOrderJobs.length === 0 ? (
               <p className="text-sm text-gray-500 py-1">
-                {merchantOk
+                {isForecast
+                  ? "No hay pronósticos por cargar. Use «Nuevo» para crear uno."
+                  : merchantOk
                   ? "El merchant aún no ha planificado órdenes (o ya están completamente programadas)."
                   : "No hay órdenes pendientes."}
               </p>
@@ -6049,8 +6600,10 @@ export default function PlanBoard({
                           </div>
                           <div className="pl-3 text-[10px] text-gray-400 leading-tight">{wl.range}</div>
                           <div className="pl-3 text-[10px] text-gray-500 leading-tight">
-                            {grp.jobs.length - grp.preCount} ord · {Math.round(grp.totalPzas).toLocaleString()} pzas
-                            {grp.preCount > 0 && (
+                            {isForecast
+                              ? `${grp.preCount} pronóstico(s) · ${Math.round(grp.prePzas).toLocaleString()} pzas por cargar`
+                              : `${grp.jobs.length - grp.preCount} ord · ${Math.round(grp.totalPzas).toLocaleString()} pzas`}
+                            {!isForecast && grp.preCount > 0 && (
                               <span className="text-violet-600">
                                 {" "}· {grp.preCount} pre · {Math.round(grp.prePzas).toLocaleString()} pzas
                               </span>
@@ -6082,7 +6635,35 @@ export default function PlanBoard({
                                 <div className="flex items-center gap-1.5">
                                   <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-violet-400" />
                                   <span className="font-mono text-[12px] font-bold text-violet-900 truncate flex-1 min-w-0">{job.work_order_no}</span>
-                                  <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5 shrink-0">PRE</span>
+                                  <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5 shrink-0">{PRE_TAG}</span>
+                                  {isForecast && (
+                                    <button
+                                      type="button"
+                                      title="Editar pronóstico"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        const row = forecastOrders.find((r) => String(r.id) === String(job.preOrderId));
+                                        if (row) setFcForm(row);
+                                      }}
+                                      className="shrink-0 p-0.5 rounded text-violet-500 hover:text-violet-800 hover:bg-violet-100"
+                                    >
+                                      <Pencil className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                  {isForecast && (
+                                    <button
+                                      type="button"
+                                      title="Convertir a SKM"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        const row = forecastOrders.find((r) => String(r.id) === String(job.preOrderId));
+                                        if (row) setFcConvert(row);
+                                      }}
+                                      className="shrink-0 p-0.5 rounded text-indigo-500 hover:text-indigo-800 hover:bg-indigo-100"
+                                    >
+                                      <ArrowRightLeft className="w-3 h-3" />
+                                    </button>
+                                  )}
                                 </div>
                                 <div className="mt-0.5 text-[10px] text-violet-700/80 truncate">
                                   {job.customer_name || "—"}{job.estilo ? ` · ${job.estilo}` : job.style_code ? ` · ${job.style_code}` : ""}
@@ -6123,7 +6704,7 @@ export default function PlanBoard({
                                     );
                                   })()}
                                   {isPre && (
-                                    <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5 shrink-0">PRE</span>
+                                    <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5 shrink-0">{PRE_TAG}</span>
                                   )}
                                   {job.color && (
                                     <span className="text-[10px] rounded-full bg-gray-100 text-gray-700 px-1.5 py-0.5 shrink-0">{job.color}</span>
@@ -6544,7 +7125,7 @@ export default function PlanBoard({
                                   }
                                   // An armed PO packs onto this cell even over a hold.
                                   if (armedPO && !dropBusy) assignPOAcrossDays(armedPO, lineNo, date);
-                                  else if (a.is_hold) removeHold(a);
+                                  else if (a.is_hold) setSelectedHold(a); // tarjeta de detalle (quitar desde ahí)
                                   else setSelectedAssignment(a);
                                 }}
                                 onMouseEnter={(e) => {
@@ -6571,7 +7152,7 @@ export default function PlanBoard({
                                     <span className="pointer-events-none absolute inset-0 z-20 rounded-[3px] border-[1.5px] border-dashed border-violet-700" />
                                     {slicePx >= 9 && !cellDetails ? (
                                       <span className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
-                                        <span className="rounded-[2px] bg-violet-700 px-[2px] font-black leading-none text-white" style={{ fontSize: 6 }}>PRE</span>
+                                        <span className="rounded-[2px] bg-violet-700 px-[2px] font-black leading-none text-white" style={{ fontSize: 6 }}>{PRE_TAG}</span>
                                       </span>
                                     ) : (
                                       <span className="pointer-events-none absolute bottom-0 left-0 z-20 w-0 h-0 border-b-[6px] border-r-[6px] border-b-violet-700 border-r-transparent" />
@@ -6579,6 +7160,23 @@ export default function PlanBoard({
                                   </>
                                 )}
                                 {isStart && <span className="absolute inset-y-0 left-0 w-1 bg-black/25" />}
+                                {!cellDetails && !preO && cellSize !== "s" && slicePx >= 12 && (
+                                  <span
+                                    className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center font-bold leading-none text-white tabular-nums"
+                                    style={{ fontSize: cellSize === "l" ? 10 : 8, textShadow: "0 0 2px rgba(0,0,0,.75), 0 1px 1px rgba(0,0,0,.6)" }}
+                                  >
+                                    {compactN(a.assigned_quantity)}
+                                  </span>
+                                )}
+                                {urgentOf(a) && (
+                                  <span
+                                    className="pointer-events-none absolute top-0 right-0 z-20 bg-orange-600 text-white rounded-bl-[3px] flex items-center justify-center"
+                                    style={{ width: 9, height: 9 }}
+                                    aria-label="Cambio urgente"
+                                  >
+                                    <Zap className="w-[7px] h-[7px]" strokeWidth={3} fill="currentColor" />
+                                  </span>
+                                )}
                                 {/* Etiqueta legible en la casilla (supermercado):
                                     OT + PO cliente + cantidad asignada. Un panel
                                     casi blanco sobre el color del bloque mantiene
@@ -6899,7 +7497,7 @@ export default function PlanBoard({
                             </span>
                           )}
                           {hasPre && (
-                            <span className="pointer-events-none absolute top-0 right-0 z-10 rounded-bl bg-violet-700 font-black leading-none text-white" style={{ fontSize: 7, padding: "1px 2px" }}>PRE</span>
+                            <span className="pointer-events-none absolute top-0 right-0 z-10 rounded-bl bg-violet-700 font-black leading-none text-white" style={{ fontSize: 7, padding: "1px 2px" }}>{PRE_TAG}</span>
                           )}
                           {filterHit && matchQty < total && (
                             <span className="pointer-events-none absolute bottom-0 right-0 z-10 rounded-tl bg-amber-500 font-bold leading-none text-white" style={{ fontSize: 7, padding: "1px 2px" }}>
@@ -6991,10 +7589,31 @@ export default function PlanBoard({
           });
         const orders = [...byOrder.values()];
         if (orders.length === 0) return null;
+        const totalPzs = orders.reduce((t, o) => t + o.qty, 0);
+        const preCount = orders.filter((o) => o.pre).length;
         return (
-          <div className="px-5 py-3 border-b bg-white">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-semibold text-gray-800 mr-1">Órdenes asignadas:</span>
+          <div className="px-5 py-2.5 border-b bg-white">
+            {/* Botón desplegable: abre / cierra la lista de órdenes asignadas */}
+            <button
+              type="button"
+              onClick={toggleOrdersOpen}
+              aria-expanded={ordersOpen}
+              aria-controls="pb-assigned-orders"
+              className={`w-full sm:w-auto inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition ${
+                ordersOpen ? "border-gray-300 bg-gray-50" : "border-gray-200 bg-white hover:bg-gray-50"
+              }`}
+            >
+              <ChevronDown className={`w-4 h-4 text-gray-500 transition-transform ${ordersOpen ? "rotate-180" : ""}`} />
+              <span className="font-semibold text-gray-800">Órdenes asignadas</span>
+              <span className="rounded-full bg-gray-900 text-white text-[11px] font-bold px-2 leading-5">{orders.length}</span>
+              <span className="text-xs text-gray-500 tabular-nums">
+                {Math.round(totalPzs).toLocaleString()} pzas
+                {preCount > 0 && <> · {preCount} {PRE_TAG}</>}
+              </span>
+              <span className="ml-auto sm:ml-2 text-xs text-gray-400">{ordersOpen ? "Ocultar" : "Ver todas"}</span>
+            </button>
+            {ordersOpen && (
+            <div id="pb-assigned-orders" className="mt-2.5 flex items-center gap-2 flex-wrap">
               {orders.map((o) => (
                 <span
                   key={o.key}
@@ -7002,11 +7621,12 @@ export default function PlanBoard({
                 >
                   <span className={`w-2.5 h-2.5 rounded-full ${blockColor(o.groupKey).dot}`} />
                   <span className="font-mono font-medium text-gray-800">{o.no}{o.color ? ` · ${o.color}` : ""}</span>
-                  {o.pre && <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5">PRE</span>}
+                  {o.pre && <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5">{PRE_TAG}</span>}
                   <span className="text-gray-500">{Math.round(o.qty).toLocaleString()} pzas</span>
                 </span>
               ))}
             </div>
+            )}
           </div>
         );
       })()}
@@ -7082,7 +7702,7 @@ export default function PlanBoard({
           <div className="font-medium mb-1 flex items-center gap-1.5">
             <span className="truncate">{woNo(hovered.assignment)}{hovered.assignment.color ? ` · ${hovered.assignment.color}` : ""}</span>
             {(hovered.assignment.is_hold || isPreOrder(hovered.assignment.work_order_id, hovered.assignment.color) || isPreOrder(hovered.assignment.work_order_no, hovered.assignment.color)) && (
-              <span className="text-[8px] font-bold leading-none rounded-full bg-violet-500 text-white px-1.5 py-0.5 shrink-0">PRE</span>
+              <span className="text-[8px] font-bold leading-none rounded-full bg-violet-500 text-white px-1.5 py-0.5 shrink-0">{PRE_TAG}</span>
             )}
           </div>
           <div className="space-y-0.5">
@@ -7127,208 +7747,414 @@ export default function PlanBoard({
         </div>
       )}
 
+      {/* ⚡ Cambio urgente en semana bloqueada */}
+      {urgentFor && (
+        <UrgentChangeModal
+          assignment={urgentFor}
+          workOrders={workOrders}
+          assignments={assignments}
+          weekLock={weekLockOf(urgentFor.assigned_date)}
+          weekLabel={weekLabelOf(weekKeyOf(urgentFor.assigned_date))}
+          produced={balanceOf(urgentFor)?.produced || 0}
+          pendingBalances={pendingBalanceGroups.groups.flatMap((g) => g.rows)}
+          onClose={() => setUrgentFor(null)}
+          onMissingStyle={(data, retry) => handleMissingStyle(data, retry, "Cambio urgente")}
+          onDone={(data) => {
+            setUrgentFor(null);
+            showToast(data.message || "⚡ Cambio urgente aplicado.");
+            if (data.warnings?.length) setTimeout(() => showToast(`⚠️ ${data.warnings.join(" ")}`, true), 4200);
+            fetchData({ silent: true });
+            balances.reload({ silent: true });
+            loadUrgentLog();
+          }}
+        />
+      )}
+
       {/* Assignment Details Modal */}
-      {selectedAssignment && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setSelectedAssignment(null)}>
-          <div className="bg-white rounded-xl shadow-xl w-full max-w-[260px] text-[12px]" onClick={(e) => e.stopPropagation()}>
-            <div className="px-3 py-2 border-b flex items-center gap-2">
-              <h3 className="font-semibold text-gray-900 text-[13px]">Detalles de Asignación</h3>
-              {(isPreOrder(selectedAssignment.work_order_id, selectedAssignment.color) || isPreOrder(selectedAssignment.work_order_no, selectedAssignment.color)) && (
-                <span className="text-[9px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5">PRE-ORDEN</span>
-              )}
-            </div>
-            <div className="p-3 space-y-1 text-[12px] max-h-[68vh] overflow-y-auto">
-              {(() => {
-                const wo = workOrders.find((w) => w.id === selectedAssignment.work_order_id);
-                return (
-                  <>
-                    <ModalRow k="Orden" v={woNo(selectedAssignment)} bold />
-                    <ModalRow k="Color" v={selectedAssignment.color || "—"} />
-                    <ModalRow k="Estilo N°" v={(wo && wo.estilo) || "—"} />
-                    <ModalRow k="Estilo" v={woStyle(selectedAssignment)} />
-                    <ModalRow k="Línea" v={selectedAssignment.line_no} />
-                    <ModalRow k="Cantidad" v={`${Math.round(selectedAssignment.assigned_quantity).toLocaleString()} pzas`} />
-                    <ModalRow k="Inicio" v={fmtDMY(selectedAssignment.planned_start_date)} />
-                    <ModalRow k="Fin" v={fmtDMY(selectedAssignment.planned_end_date)} />
-                    <ModalRow k="Estado" v={selectedAssignment.status} />
-                    {selectedAssignment.status === "completed" && selectedAssignment.produced_quantity != null && (
-                      <div className="flex justify-between gap-3">
-                        <span className="text-gray-500">Producido al cierre</span>
-                        <span className="font-semibold text-emerald-700">
-                          {Math.round(Number(selectedAssignment.produced_quantity)).toLocaleString()} pzas
-                        </span>
+      {selectedAssignment && (() => {
+        const sel = selectedAssignment;
+        const wo = workOrders.find((w) => w.id === sel.work_order_id);
+        const bc = blockColor(blockGroupKey(sel));
+        const today = todayStr();
+        const selDay = cellDateOf(sel);
+        const n0 = (v) => Math.round(Number(v) || 0).toLocaleString();
+        const qtyOf = (a) => Number(a.assigned_quantity) || 0;
+        const live = (a) => !a.is_hold && !["cancelled", "rejected"].includes(a.status);
+        const dm = (d) => (d ? `${d.slice(8, 10)}/${d.slice(5, 7)}` : "—");
+        const toDate = (d) => new Date(Number(d.slice(0, 4)), Number(d.slice(5, 7)) - 1, Number(d.slice(8, 10)));
+        const STATUS = { planned: "Planeada", released: "Enviada a líderes", in_progress: "En proceso", completed: "Completada" };
+
+        // ---- Este día ----
+        const bal = balanceOf(sel);
+        const dayAssigned = qtyOf(sel);
+        const dayProduced = sel.status === "completed" && sel.produced_quantity != null
+          ? Number(sel.produced_quantity) || 0
+          : Number(bal?.produced) || 0;
+        const dayPct = dayAssigned > 0 ? Math.min(Math.round((dayProduced / dayAssigned) * 100), 100) : 0;
+        const dayShort = bal && bal.is_past && bal.balance > 0 ? bal.balance : 0;
+
+        // ---- Plan del color en el tablero ----
+        const colorCells = assignments.filter(
+          (a) => live(a) && a.work_order_id === sel.work_order_id && String(a.color || "") === String(sel.color || "")
+        );
+        const bd = wo ? buildBreakdownFromLines(wo.lines, sel.color) : [];
+        const colorTarget = bd.reduce((t, p) => t + p.total, 0) || (wo ? targetOf(wo) : 0);
+        const pastQty = colorCells.filter((a) => cellDateOf(a) < today).reduce((t, a) => t + qtyOf(a), 0);
+        const nextQty = colorCells.filter((a) => cellDateOf(a) >= today).reduce((t, a) => t + qtyOf(a), 0);
+        const freeQty = Math.max(colorTarget - pastQty - nextQty, 0);
+        const planBase = Math.max(colorTarget, pastQty + nextQty, 1);
+        const lines = [...new Set(colorCells.map((a) => String(a.line_no)))]
+          .sort((x, y) => (Number(x) || 0) - (Number(y) || 0) || x.localeCompare(y));
+        const goToLine = (ln) => {
+          const onLine = colorCells.filter((a) => String(a.line_no) === ln);
+          if (!onLine.length) return;
+          const t = toDate(selDay).getTime();
+          onLine.sort((x, y) => Math.abs(toDate(cellDateOf(x)).getTime() - t) - Math.abs(toDate(cellDateOf(y)).getTime() - t));
+          setSelectedAssignment(onLine[0]);
+        };
+
+        // ---- Termina / entrega / holgura ----
+        const ends = colorCells.map(cellDateOf).filter(Boolean).sort();
+        const termina = ends.length ? ends[ends.length - 1] : null;
+        const entrega = deliveryOfWoColor(wo, sel.color);
+        const slack = termina && entrega ? differenceInDays(toDate(entrega), toDate(termina)) : null;
+
+        // ---- Días de esta orden en esta línea ----
+        const byDay = new Map();
+        assignments
+          .filter((a) => live(a) && a.work_order_id === sel.work_order_id && String(a.line_no) === String(sel.line_no))
+          .forEach((a) => {
+            const d = cellDateOf(a);
+            const g = byDay.get(d) || { d, qty: 0, rows: [] };
+            g.qty += qtyOf(a);
+            g.rows.push(a);
+            byDay.set(d, g);
+          });
+        const lineDays = [...byDay.values()].sort((x, y) => x.d.localeCompare(y.d));
+        const maxDay = Math.max(...lineDays.map((g) => g.qty), 1);
+        const pickDay = (g) => setSelectedAssignment(g.rows.find((r) => String(r.color || "") === String(sel.color || "")) || g.rows[0]);
+
+        // ---- Tallas ----
+        const sizeMax = Math.max(1, ...bd.flatMap((p) => p.styles.flatMap((s) => s.sizes.map((z) => z.quantity))));
+
+        const u = urgentOf(sel);
+        const isPre = isPreOrder(sel.work_order_id, sel.color) || isPreOrder(sel.work_order_no, sel.color);
+        const estiloNo = (wo && (wo.estilo || wo.style_code)) || sel.estilo || "—";
+
+        // ---- Acciones (misma lógica de siempre) ----
+        const sameOrderOnLine = assignments.filter(
+          (a) => a.work_order_id === sel.work_order_id && String(a.line_no) === String(sel.line_no) && !["cancelled"].includes(a.status)
+        );
+        const deletableOfOrder = sameOrderOnLine.filter((a) => !isLockedCell(a));
+        const selLocked = isLockedCell(sel);
+        const dayLabel = fmtDMY(sel.assigned_date || sel.planned_start_date).slice(0, 5);
+        const confirmableOfOrder = sameOrderOnLine.filter((a) => !isLockedCell(a));
+
+        const Label = ({ children, right }) => (
+          <div className="flex items-baseline justify-between gap-2 mb-1.5">
+            <span className="text-[12px] font-semibold text-gray-800">{children}</span>
+            {right != null && <span className="text-[11px] text-gray-500 tabular-nums">{right}</span>}
+          </div>
+        );
+        const Info = ({ k, v, mono }) => (
+          <div className="min-w-0">
+            <div className="text-[11px] text-gray-500">{k}</div>
+            <div className={`text-[13px] font-semibold text-gray-900 truncate ${mono ? "font-mono" : ""}`}>{v || "—"}</div>
+          </div>
+        );
+
+        return (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3" onClick={() => setSelectedAssignment(null)}>
+            <div
+              role="dialog"
+              aria-label={`Detalles de ${woNo(sel)}`}
+              className="relative bg-white rounded-2xl shadow-2xl w-full max-w-[780px] max-h-[92vh] flex flex-col overflow-hidden text-[12px]"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* ── Encabezado ── */}
+              <div className="relative pl-5 pr-3 py-3 border-b flex items-start gap-3">
+                <span className={`absolute left-0 top-0 bottom-0 w-1.5 ${bc.bg}`} aria-hidden />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="font-bold text-gray-900 text-[15px] tracking-tight">{woNo(sel)}</h3>
+                    <span className="text-[11px] rounded-full bg-gray-100 text-gray-600 px-2 py-0.5">{STATUS[sel.status] || sel.status}</span>
+                    {isPre && <span className="text-[10px] font-bold rounded-full bg-violet-600 text-white px-2 py-0.5">{PRE_LABEL}</span>}
+                    {u && <span className="text-[10px] font-bold rounded-full bg-orange-600 text-white px-2 py-0.5 inline-flex items-center gap-1"><Zap className="w-3 h-3" />URGENTE</span>}
+                  </div>
+                  <div className="text-[12px] text-gray-500 truncate mt-0.5">
+                    {woStyle(sel) || "—"} · <span className="font-mono">{estiloNo}</span>
+                  </div>
+                </div>
+                <span className="shrink-0 text-[12px] font-semibold rounded-lg bg-gray-900 text-white px-2.5 py-1">Línea {sel.line_no}</span>
+                <span className="shrink-0 text-[12px] rounded-lg border border-gray-200 text-gray-700 px-2.5 py-1 inline-flex items-center gap-1.5">
+                  <CalendarDays className="w-3.5 h-3.5 text-gray-500" />{fmtDMY(selDay)}
+                </span>
+                <button onClick={() => setSelectedAssignment(null)} className="shrink-0 p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100" aria-label="Cerrar">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* ── Cuerpo ── */}
+              <div className="flex-1 overflow-y-auto grid grid-cols-1 md:grid-cols-[1.05fr_1fr] md:divide-x divide-gray-200">
+                {/* Columna izquierda */}
+                <div className="p-4 space-y-4">
+                  <section>
+                    <Label right={`${dayPct}% cosido`}>Este día</Label>
+                    <div className="flex items-end gap-6">
+                      <div>
+                        <div className="text-[22px] font-bold text-gray-900 leading-none tabular-nums">{n0(dayAssigned)}</div>
+                        <div className="text-[11px] text-gray-500 mt-1">pzas asignadas</div>
+                      </div>
+                      <div>
+                        <div className={`text-[22px] font-bold leading-none tabular-nums ${dayProduced > 0 ? "text-emerald-700" : "text-gray-900"}`}>{n0(dayProduced)}</div>
+                        <div className="text-[11px] text-gray-500 mt-1">pzas cosidas</div>
+                      </div>
+                      {dayShort > 0 && (
+                        <div className="ml-auto text-right">
+                          <div className="text-[15px] font-bold text-rose-700 tabular-nums">{n0(dayShort)}</div>
+                          <div className="text-[11px] text-rose-600">sin hacer</div>
+                        </div>
+                      )}
+                    </div>
+                    <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
+                      <div className="h-full bg-emerald-500 rounded-full transition-all" style={{ width: `${dayPct}%` }} />
+                    </div>
+                    {sel.status === "completed" && sel.completed_at && (
+                      <div className="mt-1 text-[11px] text-gray-500">Cerrada el {fmtDMY(sel.completed_at)}</div>
+                    )}
+                  </section>
+
+                  {u && (
+                    <section className="rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 text-orange-900">
+                      <div className="font-semibold flex items-center gap-1"><Zap className="w-3.5 h-3.5" /> Cambio urgente</div>
+                      <div>{u.source_work_order_no}{u.source_color ? ` ${u.source_color}` : ""} → {u.target_work_order_no}{u.target_color ? ` ${u.target_color}` : ""} · {n0(u.moved_qty)} pzas</div>
+                      <div className="text-orange-800">{u.reason}</div>
+                      <div className="text-orange-700/80 text-[11px]">{u.changed_by_name || "—"} · {fmtDMY(u.created_at)}</div>
+                    </section>
+                  )}
+
+                  <section>
+                    <Label right={`${n0(pastQty + nextQty)} / ${n0(colorTarget)} pzas`}>
+                      Plan de {sel.color || "la orden"} en el tablero
+                    </Label>
+                    <div className="h-2.5 rounded-full bg-gray-100 overflow-hidden flex" role="img"
+                      aria-label={`Pasado ${n0(pastQty)}, por coser ${n0(nextQty)}, sin asignar ${n0(freeQty)}`}>
+                      <div className="h-full bg-slate-500" style={{ width: `${(pastQty / planBase) * 100}%` }} />
+                      <div className={`h-full ${bc.bg}`} style={{ width: `${(nextQty / planBase) * 100}%` }} />
+                      <div className="h-full bg-rose-200" style={{ width: `${(freeQty / planBase) * 100}%` }} />
+                    </div>
+                    <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-gray-600">
+                      <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-500" />Pasado {n0(pastQty)}</span>
+                      <span className="inline-flex items-center gap-1"><span className={`w-2 h-2 rounded-full ${bc.bg}`} />Por coser {n0(nextQty)}</span>
+                      <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-rose-200" />Sin asignar {n0(freeQty)}</span>
+                    </div>
+                    {lines.length > 0 && (
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                        <span className="text-[11px] text-gray-500">Líneas:</span>
+                        {lines.map((ln) => (
+                          <button key={ln} onClick={() => goToLine(ln)} title={`Ver Línea ${ln}`}
+                            className={`min-w-[24px] h-6 px-1.5 rounded-md text-[11px] font-semibold ${ln === String(sel.line_no) ? "bg-gray-900 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`}>
+                            {ln}
+                          </button>
+                        ))}
                       </div>
                     )}
-                    {selectedAssignment.status === "completed" && selectedAssignment.completed_at && (
-                      <ModalRow k="Cerrada" v={fmtDMY(selectedAssignment.completed_at)} />
+                  </section>
+
+                  <section className={`rounded-xl px-3 py-2.5 grid grid-cols-[1fr_1fr_auto] gap-3 items-center ${
+                    slack == null ? "bg-gray-50 border border-gray-100" : slack >= 0 ? "bg-emerald-50 border border-emerald-100" : "bg-rose-50 border border-rose-100"}`}>
+                    <div>
+                      <div className="text-[11px] text-gray-500">Termina</div>
+                      <div className="text-[13px] font-semibold text-gray-900">{termina ? fmtDMY(termina) : "—"}</div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-gray-500">Entrega</div>
+                      <div className="text-[13px] font-semibold text-gray-900">{entrega ? fmtDMY(entrega) : "Sin fecha"}</div>
+                    </div>
+                    <div className="text-right">
+                      {slack == null ? (
+                        <div className="text-[11px] text-gray-500">—</div>
+                      ) : (
+                        <>
+                          <div className={`text-[16px] font-bold tabular-nums ${slack >= 0 ? "text-emerald-700" : "text-rose-700"}`}>
+                            {slack >= 0 ? `+${slack}` : slack} d
+                          </div>
+                          <div className={`text-[11px] ${slack >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{slack >= 0 ? "de holgura" : "de atraso"}</div>
+                        </>
+                      )}
+                    </div>
+                  </section>
+
+                  {lineDays.length > 0 && (
+                    <section>
+                      <Label right={lineDays.length > 1 ? `${lineDays.length} días` : null}>Días en la Línea {sel.line_no}</Label>
+                      <div className="overflow-x-auto pb-1">
+                        <div className="flex items-end gap-2 min-w-max" style={{ height: 92 }}>
+                          {lineDays.map((g) => {
+                            const cur = g.d === selDay;
+                            const past = g.d < today;
+                            const h = Math.max(8, Math.round((g.qty / maxDay) * 52));
+                            return (
+                              <button key={g.d} onClick={() => pickDay(g)} title={`${fmtDMY(g.d)} · ${n0(g.qty)} pzas`}
+                                className="group flex flex-col items-center justify-end gap-1 w-9 h-full focus:outline-none">
+                                <span className={`text-[10px] tabular-nums ${cur ? "font-bold text-gray-900" : "text-gray-500"}`}>{n0(g.qty)}</span>
+                                <span
+                                  className={`w-5 rounded-md transition-opacity ${past ? "bg-slate-300" : bc.bg} ${!past && !cur ? "opacity-60 group-hover:opacity-90" : ""} ${cur ? "ring-2 ring-gray-900 ring-offset-1" : ""}`}
+                                  style={{ height: h }}
+                                />
+                                <span className={`text-[10px] ${cur ? "font-bold text-gray-900" : "text-gray-500"}`}>{dm(g.d)}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </section>
+                  )}
+
+                  <section className="pt-3 border-t grid grid-cols-3 gap-x-4 gap-y-3">
+                    <Info k="Cliente" v={wo?.customer_name} />
+                    <Info k="PO cliente" v={wo?.customer_po} mono />
+                    <Info k="Color" v={sel.color} />
+                    <Info k="Estilo N°" v={estiloNo} mono />
+                    <Info k="Total orden" v={wo ? `${n0(targetOf(wo))} pzas` : null} />
+                  </section>
+                </div>
+
+                {/* Columna derecha */}
+                <div className="p-4 space-y-4 bg-gray-50/40">
+                  <section>
+                    <Label>Desglose por tallas</Label>
+                    {bd.length === 0 ? (
+                      <div className="text-gray-500">Esta orden no tiene desglose por tallas.</div>
+                    ) : (
+                      <div className="space-y-2">
+                        {bd.map((po, pi) => (
+                          <div key={pi} className="rounded-xl border border-gray-200 bg-white p-3">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[12px] text-gray-500">PO <span className="font-bold text-gray-900">{po.customerPo || "—"}</span></span>
+                              <span className="text-[11px] text-gray-500 tabular-nums">{n0(po.total)} pzas</span>
+                            </div>
+                            {po.styles.map((st, si) => (
+                              <div key={si} className="mt-1.5">
+                                <div className="flex items-center justify-between text-[11px]">
+                                  <span className="inline-flex items-center gap-1.5 text-gray-600">
+                                    <span className={`w-2 h-2 rounded-full ${bc.dot}`} />
+                                    <span className="font-semibold">{sel.color || "—"}</span>
+                                    <span className="font-mono text-gray-500">· {st.estilo || "—"}</span>
+                                  </span>
+                                  {po.styles.length > 1 && <span className="text-gray-400 tabular-nums">{n0(st.total)}</span>}
+                                </div>
+                                <div className="mt-1.5 space-y-1.5">
+                                  {st.sizes.map((z) => {
+                                    const pct = st.total > 0 ? Math.round((z.quantity / st.total) * 100) : 0;
+                                    return (
+                                      <div key={z.talla} className="grid grid-cols-[4.5rem_1fr_3.5rem_2.25rem] items-center gap-2">
+                                        <span className="text-[12px] font-semibold text-gray-800 text-right truncate" title={z.talla}>{z.talla}</span>
+                                        <span className="h-3 rounded-full bg-gray-100 overflow-hidden">
+                                          <span className={`block h-full rounded-full ${bc.bg}`} style={{ width: `${(z.quantity / sizeMax) * 100}%` }} />
+                                        </span>
+                                        <span className="text-[12px] text-gray-800 text-right tabular-nums">{n0(z.quantity)}</span>
+                                        <span className="text-[11px] text-gray-400 text-right tabular-nums">{pct}%</span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
                     )}
+                  </section>
+
+                  <section>
                     {(() => {
-                      const b = balanceOf(selectedAssignment);
-                      if (!b) return null;
+                      const key = blockGroupKey(sel);
+                      const activeIdx = colorOverrides[key];
                       return (
                         <>
-                          <ModalRow k="Cosido ese día" v={`${Math.round(b.produced).toLocaleString()} pzas`} />
-                          {b.is_past && b.balance > 0 && (
-                            <div className="flex justify-between gap-3">
-                              <span className="text-gray-500">Saldo</span>
-                              <span className="font-semibold text-rose-700">
-                                {Math.round(b.balance).toLocaleString()} pzas sin hacer
-                              </span>
-                            </div>
-                          )}
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-[12px] font-semibold text-gray-800">Color del grupo <span className="font-normal text-gray-500">(mismo estilo)</span></span>
+                            {activeIdx != null && (
+                              <button onClick={() => setBlockColor(key, null)} className="text-[11px] text-gray-500 hover:text-gray-800 underline">Automático</button>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-10 gap-1.5">
+                            {WO_PALETTE.map((c, i) => {
+                              const on = activeIdx != null ? activeIdx === i : blockColor(key) === c;
+                              return (
+                                <button key={i} onClick={() => setBlockColor(key, i)} title={`Color ${i + 1}`} aria-pressed={on}
+                                  className={`aspect-square rounded-md ${c.bg} ${c.border} border transition-transform hover:scale-105 ${on ? "ring-2 ring-gray-900 ring-offset-1" : ""}`} />
+                              );
+                            })}
+                          </div>
                         </>
                       );
                     })()}
-                    {wo && <>
-                      <ModalRow k="Cliente" v={wo.customer_name} />
-                      {wo.customer_po && <ModalRow k="PO cliente" v={wo.customer_po} />}
-                      <ModalRow k="Total Orden" v={`${Math.round(targetOf(wo)).toLocaleString()} pzas`} />
-                      {(() => {
-                        const bd = buildBreakdownFromLines(wo.lines, selectedAssignment.color);
-                        if (bd.length === 0) return null;
-                        return (
-                          <div className="pt-2 border-t">
-                            <div className="text-gray-500 mb-1.5">Desglose · PO cliente → estilo → tallas</div>
-                            <div className="space-y-2">
-                              {bd.map((po, pi) => (
-                                <div key={pi} className="rounded-lg bg-gray-50 border border-gray-100 p-1.5">
-                                  <div className="flex items-center justify-between">
-                                    <span className="text-[12px] font-semibold text-gray-700">
-                                      <span className="text-gray-400 font-normal">PO</span> {po.customerPo || "—"}
-                                    </span>
-                                    <span className="text-[11px] text-gray-400">{Math.round(po.total).toLocaleString()} pzas</span>
-                                  </div>
-                                  {po.styles.map((st, si) => (
-                                    <div key={si} className="pl-2 mt-1">
-                                      <div className="text-[11px] text-gray-500 font-mono flex items-center gap-1.5">
-                                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${blockColor(blockGroupKey(selectedAssignment)).dot}`} />
-                                        {selectedAssignment.color ? `${selectedAssignment.color} · ` : ""}{st.estilo || "—"}
-                                      </div>
-                                      {st.sizes.length > 0 && (
-                                        <div className="flex flex-wrap gap-1 mt-0.5">
-                                          {st.sizes.map((s) => (
-                                            <span key={s.talla} className="text-[11px] rounded bg-blue-50 text-blue-700 px-1.5 py-0.5">
-                                              {s.talla}: {Math.round(s.quantity).toLocaleString()}
-                                            </span>
-                                          ))}
-                                        </div>
-                                      )}
-                                    </div>
-                                  ))}
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        );
-                      })()}
+                  </section>
+                </div>
+              </div>
 
-                      {/* Color del bloque en el tablero */}
-                      <div className="pt-2 border-t">
-                        {(() => {
-                          const key = blockGroupKey(selectedAssignment);
-                          const activeIdx = colorOverrides[key];
-                          return (
-                            <>
-                              <div className="flex items-center justify-between mb-1.5">
-                                <span className="text-gray-500">Color del grupo (mismo estilo)</span>
-                                {activeIdx != null && (
-                                  <button onClick={() => setBlockColor(key, null)} className="text-[11px] text-gray-500 hover:text-gray-800 underline">
-                                    Automático
-                                  </button>
-                                )}
-                              </div>
-                              <div className="flex flex-wrap gap-1">
-                                {WO_PALETTE.map((c, i) => {
-                                  const on = (activeIdx != null ? activeIdx === i : blockColor(key) === c);
-                                  return (
-                                    <button
-                                      key={i}
-                                      onClick={() => setBlockColor(key, i)}
-                                      title={`Color ${i + 1}`}
-                                      className={`w-5 h-5 rounded-md ${c.bg} ${c.border} border ${on ? "ring-2 ring-gray-900 ring-offset-1" : ""}`}
-                                    />
-                                  );
-                                })}
-                              </div>
-                            </>
-                          );
-                        })()}
-                      </div>
-                    </>}
-                  </>
-                );
-              })()}
-            </div>
-            <div className="px-3 py-2.5 border-t flex flex-wrap justify-between gap-2">
-              {(() => {
-                const sel = selectedAssignment;
-                const sameOrderOnLine = assignments.filter(
-                  (a) =>
-                    a.work_order_id === sel.work_order_id &&
-                    String(a.line_no) === String(sel.line_no) &&
-                    !["cancelled"].includes(a.status)
-                );
-                // Only today/future cells may be removed; past cells are locked.
-                const deletableOfOrder = sameOrderOnLine.filter((a) => !isLockedCell(a));
-                const selLocked = isLockedCell(sel);
-                const dayLabel = sel.assigned_date
-                  ? fmtDMY(sel.assigned_date).slice(0, 5)
-                  : fmtDMY(sel.planned_start_date).slice(0, 5);
-                // Cells of this order/line from today onward — the ones we can
-                // still push to the line leaders.
-                const confirmableOfOrder = sameOrderOnLine.filter((a) => !isLockedCell(a));
-                return (
-                  <div className="flex flex-wrap gap-2">
-                    {confirmableOfOrder.length > 0 && (
-                      <button
-                        disabled={dropBusy}
-                        title="Crea el borrador en el lado de los líderes de línea para esta orden en esta línea."
-                        onClick={async () => {
-                          const n = confirmableOfOrder.length;
-                          if (!window.confirm(`¿Enviar la orden ${woNo(sel)} de la Línea ${sel.line_no} a los líderes de línea? (${n} día(s))`)) return;
-                          const ok = await confirmAssignments(confirmableOfOrder.map((a) => a.id));
-                          if (ok) setSelectedAssignment(null);
-                        }}
-                        className="px-2.5 py-1.5 text-[12px] bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50"
-                      >
-                        Enviar a líderes ({confirmableOfOrder.length})
-                      </button>
-                    )}
+              {/* ── Acciones ── */}
+              <div className="px-4 py-3 border-t bg-white flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap gap-2">
+                  {canUrgentChange(sel) && (
                     <button
-                      disabled={dropBusy || selLocked}
-                      title={selLocked ? "Este día ya pasó: la cantidad asignada anterior no se puede eliminar." : "Elimina solo esta casilla (este día)"}
+                      disabled={dropBusy || boardLock.locked}
+                      title={boardLock.locked ? "El tablero completo está bloqueado." : "Cambia el color o el estilo de esta casilla sin desbloquear la semana."}
+                      onClick={() => { setUrgentFor(sel); setSelectedAssignment(null); }}
+                      className="px-3 py-2 text-[12px] font-medium bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 inline-flex items-center gap-1.5"
+                    >
+                      <Zap className="w-3.5 h-3.5" /> Cambio urgente
+                    </button>
+                  )}
+                  {confirmableOfOrder.length > 0 && (
+                    <button
+                      disabled={dropBusy}
+                      title="Crea el borrador en el lado de los líderes de línea para esta orden en esta línea."
+                      onClick={async () => {
+                        const n = confirmableOfOrder.length;
+                        if (!window.confirm(`¿Enviar la orden ${woNo(sel)} de la Línea ${sel.line_no} a los líderes de línea? (${n} día(s))`)) return;
+                        const ok = await confirmAssignments(confirmableOfOrder.map((a) => a.id));
+                        if (ok) setSelectedAssignment(null);
+                      }}
+                      className="px-3 py-2 text-[12px] font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50"
+                    >
+                      Enviar a líderes ({confirmableOfOrder.length})
+                    </button>
+                  )}
+                  <button
+                    disabled={dropBusy || selLocked}
+                    title={selLocked ? "Este día ya pasó: la cantidad asignada anterior no se puede eliminar." : "Elimina solo esta casilla (este día)"}
+                    onClick={() => {
+                      if (selLocked) return;
+                      if (window.confirm(`¿Quitar solo la casilla del ${dayLabel} en la Línea ${sel.line_no}?`)) removeAssignments([sel.id]);
+                    }}
+                    className="px-3 py-2 text-[12px] font-medium bg-white text-rose-700 rounded-lg hover:bg-rose-50 border border-rose-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {selLocked ? "Día pasado (bloqueado)" : "Quitar solo esta casilla"}
+                  </button>
+                  {deletableOfOrder.length > 1 && (
+                    <button
+                      disabled={dropBusy}
                       onClick={() => {
-                        if (selLocked) return;
-                        if (window.confirm(`¿Quitar solo la casilla del ${dayLabel} en la Línea ${sel.line_no}?`)) {
-                          removeAssignments([sel.id]);
+                        const past = sameOrderOnLine.length - deletableOfOrder.length;
+                        if (window.confirm(`¿Quitar la orden ${woNo(sel)} de la Línea ${sel.line_no}? Se eliminarán ${deletableOfOrder.length} día(s) de hoy en adelante${past > 0 ? `; los ${past} día(s) pasados se conservan.` : "."}`)) {
+                          removeAssignments(deletableOfOrder.map((a) => a.id));
                         }
                       }}
-                      className="px-2.5 py-1.5 text-[12px] bg-rose-50 text-rose-700 rounded-lg hover:bg-rose-100 border border-rose-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="px-3 py-2 text-[12px] font-medium bg-rose-600 text-white rounded-lg hover:bg-rose-700 disabled:opacity-50"
                     >
-                      {selLocked ? "Día pasado (bloqueado)" : "Quitar solo esta casilla"}
+                      Quitar orden de la línea ({deletableOfOrder.length})
                     </button>
-                    {deletableOfOrder.length > 1 && (
-                      <button
-                        disabled={dropBusy}
-                        onClick={() => {
-                          const past = sameOrderOnLine.length - deletableOfOrder.length;
-                          if (window.confirm(`¿Quitar la orden ${woNo(sel)} de la Línea ${sel.line_no}? Se eliminarán ${deletableOfOrder.length} día(s) de hoy en adelante${past > 0 ? `; los ${past} día(s) pasados se conservan.` : "."}`)) {
-                            removeAssignments(deletableOfOrder.map((a) => a.id));
-                          }
-                        }}
-                        className="px-2.5 py-1.5 text-[12px] bg-rose-600 text-white rounded-lg hover:bg-rose-700 disabled:opacity-50"
-                      >
-                        Quitar orden de la línea ({deletableOfOrder.length})
-                      </button>
-                    )}
-                  </div>
-                );
-              })()}
-              <button onClick={() => setSelectedAssignment(null)} className="px-3 py-1.5 text-[12px] bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200">Cerrar</button>
+                  )}
+                </div>
+                <button onClick={() => setSelectedAssignment(null)} className="px-4 py-2 text-[12px] font-medium bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200">Cerrar</button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Planner standards per style: per line-day list, or every style */}
       {styleList && (() => {
@@ -7412,7 +8238,7 @@ export default function PlanBoard({
                     <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${blockColor(o.groupKey).dot}`} />
                     <span className="font-mono text-sm font-medium text-gray-800 flex-1 truncate">{o.no}</span>
                     {o.isHold && <span className="text-[8px] font-medium leading-none rounded-full bg-violet-100 text-violet-700 px-1.5 py-0.5 shrink-0">reserva</span>}
-                    {o.pre && <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5 shrink-0">PRE</span>}
+                    {o.pre && <span className="text-[8px] font-bold leading-none rounded-full bg-violet-600 text-white px-1.5 py-0.5 shrink-0">{PRE_TAG}</span>}
                     <span className="text-sm text-gray-600">{Math.round(o.qty).toLocaleString()} pzas</span>
                   </div>
                 ))}

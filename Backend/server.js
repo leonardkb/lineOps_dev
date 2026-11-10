@@ -5,6 +5,7 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const { uploadBufferToS3, deleteFromS3, makeStylePhotoKey, generatePresignedGetUrl, generatePresignedPutUrl } = require("./s3-raw");
 const planWeekLocks = require("./plan-week-locks"); // 🔒 bloqueo de semanas del Plan Board (CEO)
+const planUrgentChanges = require("./plan-urgent-changes"); // ⚡ cambio urgente en semanas bloqueadas
 const itControlPanel = require("./it-control-panel"); // 🖥️ IT control panel: activity log + users
 const { getCachedPresignedUrl } = require("./presignCache");
 const registerPlanRebalance = require("./plan-rebalance"); // ⚖️ snapshots + redistribución exacta del Plan Board
@@ -457,17 +458,20 @@ console.log("✅ work_orders.master_code_id linked to master_codes");
 // ~línea 622, en el bloque async de arranque, junto a los otros initSchema:
 await registerEfficiencyPermission.initSchema({ pool, setSchema });
 await registerStyleOrders.initSchema({ pool, setSchema });
+
 await registerMaterialCatalog.initSchema({ pool, setSchema });   // catálogo de avíos/empaque (CIE001, CAJ001…)
 await registerSupermarketPlan.initSchema({ pool, setSchema });   // ← nueva
 await registerHolidays.initSchema({ pool, setSchema });
 await plannerStyleParams.initSchema({ pool, setSchema });   // planner style standards
 await registerPreOrders.initSchema({ pool, setSchema });
 await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
+await registerForecastOrders.initSchema({ pool, setSchema });  // 📈 Tablero de pronóstico (después de customers)
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
 await registerBom.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });
 await registerOrderClose.initSchema({ pool, setSchema });
 await planWeekLocks.initSchema({ pool, setSchema });   // 🔒 después de line_assignments
+await planUrgentChanges.initSchema({ pool, setSchema }); // ⚡ bitácora de cambios urgentes
 await registerPlanRebalance.initSchema({ pool, setSchema }); // ⚖️ plan_board_snapshots
 await registerCutOrders.initSchema({ pool, setSchema });
 await registerCutOrderRequests.initSchema({ pool, setSchema });   // solicitudes de corte (después de cut_orders)
@@ -1259,6 +1263,8 @@ plannerStyleParams(app, {
   effApproverRoles: ["ceo","master"],
 });
 
+
+
 const registerBom = require("./bom");
 registerBom(app, { authenticateToken, pool, setSchema, generatePresignedGetUrl });
 
@@ -1278,6 +1284,10 @@ registerMerchantAnalytics(app, { authenticateToken, pool, setSchema });
 
 const registerPreOrderHolds = require("./pre-order-holds");
 registerPreOrderHolds(app, { authenticateToken, pool, setSchema });
+
+// 📈 Tablero de pronóstico del cliente: pronósticos FC#### + sus reservas de línea/día.
+const registerForecastOrders = require("./forecast-orders");
+registerForecastOrders(app, { authenticateToken, pool, setSchema });
 
 const registerMerchantPlan = require("./merchant-plan");
 registerMerchantPlan(app, { authenticateToken, pool, setSchema });
@@ -1326,8 +1336,21 @@ registerSupermarketPlan(app, {
 const registerEfficiencyPermission = require("./efficiency-permission");
 registerEfficiencyPermission(app, { authenticateToken, pool, setSchema });
 
+const verificadorActivity = require("./verificador-activity");
+verificadorActivity(app, { authenticateToken, pool, setSchema });
+
 planWeekLocks(app, { authenticateToken, pool, setSchema, lockerRoles: ["ceo", "skyrina", "master"] });
 
+// ⚡ Cambio urgente de color/estilo en semanas bloqueadas (sin desbloquearlas).
+// Requiere que el trigger de semanas respete plan.urgent_override (ver
+// plan-urgent-changes.js). urgentRoles = quien puede hacerlo.
+planUrgentChanges(app, {
+  authenticateToken, pool, setSchema,
+  planWeekLocks, plannerStyleParams,
+  workOrders: registerWorkOrders,
+  mergeOrInsertAssignment, ensureDraftRunForAssignment, cleanupOrphanDraftRuns,
+  urgentRoles: ["planner", "master", "ceo", "skyrina"],
+});
 
 // 🖥️ IT control panel. itRoles = who can open it.
 itControlPanel(app, {
@@ -2777,6 +2800,7 @@ app.get("/api/verificador/run/:runId/sewed", authenticateToken, requireVerificad
  * POST /api/verificador/update-sewed/:runId
  * body: { entries: [{ operatorNo, operationName, slotLabel, sewedQty }] }
  * Sobrescribe las cantidades cosidas capturadas por el líder de línea.
+ * Las celdas que cambian quedan en la bitácora y le llegan como aviso al CEO.
  */
 app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerificador, async (req, res) => {
   const client = await pool.connect();
@@ -2793,6 +2817,7 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
     }
 
     let updatedCount = 0;
+    const changes = []; // { operatorNo, operationName, slotLabel, from, to } — para el aviso al CEO
 
     for (const entry of entries) {
       const { operatorNo, operationName, slotLabel, sewedQty } = entry;
@@ -2816,17 +2841,31 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
       if (slotResult.rows.length === 0) continue;
       const slotId = slotResult.rows[0].id;
 
+      // Valor ANTES del cambio (sin fila = 0).
+      const prev = await client.query(
+        `SELECT sewed_qty FROM operation_sewed_entries WHERE operation_id = $1 AND slot_id = $2`,
+        [operationId, slotId]
+      );
+      const before = Number(prev.rows[0]?.sewed_qty || 0);
+      const after = Number(sewedQty || 0);
+
       await client.query(
         `INSERT INTO operation_sewed_entries (run_id, operation_id, slot_id, sewed_qty, created_at, updated_at)
          VALUES ($1, $2, $3, $4, now(), now())
          ON CONFLICT (operation_id, slot_id)
          DO UPDATE SET sewed_qty = EXCLUDED.sewed_qty, updated_at = now()`,
-        [runId, operationId, slotId, Number(sewedQty || 0)]
+        [runId, operationId, slotId, after]
       );
       updatedCount++;
+      if (before !== after) {
+        changes.push({ operatorNo, operationName, slotLabel, from: before, to: after });
+      }
     }
 
     await client.query("COMMIT");
+
+    // Aviso al CEO (solo si algo cambió). Nunca lanza.
+    await verificadorActivity.logCorrection(client, { runId, user: req.user, changes });
 
     // Recalcula el estado de la ORDEN según lo producido (mismo criterio que el
     // líder de línea). Va fuera de la transacción ya commiteada, para que lea las
@@ -2845,7 +2884,7 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
       console.warn("⚠️  recálculo de estado de la orden falló (el guardado sí se realizó):", e.message);
     }
 
-    res.json({ success: true, updatedCount, statusChange });
+    res.json({ success: true, updatedCount, changedCount: changes.length, statusChange });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ /api/verificador/update-sewed error:", err.message);
@@ -2854,6 +2893,11 @@ app.post("/api/verificador/update-sewed/:runId", authenticateToken, requireVerif
     client.release();
   }
 });
+
+const registerVerificadorReport = require("./verificador-report");
+   registerVerificadorReport(app, { authenticateToken, pool, setSchema, requireVerificador })
+
+
 
 // ----------------------------------------------------------------------
 // Órdenes de trabajo asignadas a una línea (para el diálogo de impresión).

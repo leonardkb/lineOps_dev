@@ -39,9 +39,26 @@ export const buildTicketCode = ({ cutId, workOrderNo, color, talla, marker, mark
     pieces != null && Number(pieces) > 0 ? String(Math.round(Number(pieces))) : "",
   ].join("|");
 
-// Enlace que va dentro del QR. `origin` = dominio de la app (por defecto el
-// de la pestaña desde donde se imprime).
-export const buildTicketUrl = (fields, origin = typeof window !== "undefined" ? window.location.origin : "") =>
+// Dirección PÚBLICA de la app: la que un celular puede abrir (IP de la PC en
+// la red de la planta o el dominio real), p. ej. "http://192.168.1.50:3000".
+// Se toma de REACT_APP_PUBLIC_APP_URL (o VITE_PUBLIC_APP_URL); si no hay, de la
+// pestaña desde donde se imprime. NUNCA debe ser "localhost": en el celular
+// "localhost" es el propio celular y sale "no se puede conectar al servidor".
+const envUrl = (() => {
+  try { if (typeof process !== "undefined" && process.env?.REACT_APP_PUBLIC_APP_URL) return process.env.REACT_APP_PUBLIC_APP_URL; } catch { /* sin process */ }
+  try { if (import.meta?.env?.VITE_PUBLIC_APP_URL) return import.meta.env.VITE_PUBLIC_APP_URL; } catch { /* sin import.meta */ }
+  return "";
+})();
+
+export const ticketBaseUrl = () =>
+  (envUrl || (typeof window !== "undefined" ? window.location.origin : "")).replace(/\/+$/, "");
+
+// true si el QR quedaría apuntando a "localhost" (no abre en el celular).
+export const ticketUrlIsLocal = () =>
+  /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:|\/|$)/i.test(ticketBaseUrl());
+
+// Enlace que va dentro del QR.
+export const buildTicketUrl = (fields, origin = ticketBaseUrl()) =>
   `${origin}${TICKET_CARD_PATH}?t=${encodeURIComponent(buildTicketCode(fields))}`;
 
 // Acepta el código solo o el enlace completo (también escrito por un lector).

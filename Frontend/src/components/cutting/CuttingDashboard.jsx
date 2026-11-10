@@ -4,7 +4,7 @@
 // y las órdenes con restante por cortar (con su valor en piezas).
 //
 import { useState, useEffect, useMemo } from "react";
-import { RefreshCw, ClipboardList, Clock, CheckCircle, Scissors, Layers, FileSpreadsheet, Calendar, ChevronDown, ChevronRight, AlertTriangle } from "lucide-react";
+import { RefreshCw, ClipboardList, Clock, CheckCircle, Scissors, Layers, FileSpreadsheet, Calendar, ChevronDown, ChevronRight, AlertTriangle, Link2 } from "lucide-react";
 import * as ExcelJS from "exceljs";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import { colorForWO } from "../../lib/workOrderColors";
@@ -45,18 +45,34 @@ const markerTotalPieces = (m) =>
   m?.totalPieces != null ? num(m.totalPieces) : markerLines(m).reduce((s, l) => s + l.pieces, 0);
 const markerPanels = (m) =>
   m?.panels != null ? num(m.panels) : markerLines(m).reduce((s, l) => s + l.panels, 0);
+// Marcada de un GRUPO (CutPlanning): el tendido completo tiene groupPanels
+// paneles; esta orden sólo lleva una parte. Rendimiento/consumo van sobre el
+// tendido completo.
+const yieldPanels = (m) => num(m?.groupPanels) || markerPanels(m);
+
+// --- Cortes agrupados --------------------------------------------------------
+const groupNo = (id) => `GRUPO-${String(id).padStart(4, "0")}`;
+// "IC:NK-123" → "Item NK-123" · "DAMCHA02|MQE3421" → "Est. DAMCHA02 · MQE3421"
+const groupKeyLabel = (key) => {
+  const k = String(key || "");
+  if (!k) return "";
+  if (k.startsWith("IC:")) return `Item ${k.slice(3)}`;
+  const [st, fb] = k.split("|");
+  return [st && `Est. ${st}`, fb].filter(Boolean).join(" · ");
+};
+
 // Tolerancia de tela por panel (m), usada en el rendimiento.
 const TOLERANCE = 0.05;
 // Se recalculan siempre desde longitud + N° paneles + total piezas (así también
 // quedan correctas las marcadas guardadas con una fórmula anterior).
 // Rendimiento (m/pza) = (longitud + tolerancia) ÷ N° paneles.
 const markerYield = (m) => {
-  const panels = markerPanels(m);
+  const panels = yieldPanels(m);
   return panels > 0 ? (num(m?.longitud) + TOLERANCE) / panels : 0;
 };
 // Consumo (m) = (longitud ÷ N° paneles) × total piezas.
 const markerConsumo = (m) => {
-  const panels = markerPanels(m);
+  const panels = yieldPanels(m);
   return panels > 0 ? (num(m?.longitud) / panels) * markerTotalPieces(m) : 0;
 };
 const round2 = (v) => Math.round(num(v) * 100) / 100;
@@ -303,6 +319,9 @@ const flatMarcadaRow = (co, m, idx, cutNo) => {
     "Consumo (m)": round2(markerConsumo(m)),
     "Piezas por talla": lines.filter((l) => l.pieces > 0)
       .map((l) => `${tallaWithLabel(l.talla)}: ${Math.round(l.pieces).toLocaleString()}`).join(", "),
+    // Al final para no mover las columnas con formato (H–L).
+    "Grupo": co.cut_group_id ? groupNo(co.cut_group_id) : "",
+    "Paneles del grupo": m?.groupPanels ? num(m.groupPanels) : "",
   };
 };
 
@@ -382,6 +401,7 @@ export default function CuttingDashboard() {
   const [priorityFilter, setPriorityFilter] = useState("all"); // all | urgent | intermediate | normal
   const [hideDone, setHideDone] = useState(false); // ocultar cortadas/canceladas
   const [collapsed, setCollapsed] = useState({}); // { [groupKey]: true }
+  const [cutGroups, setCutGroups] = useState([]); // grupos de CutPlanning
 
   const toggleGroup = (key) =>
     setCollapsed((c) => ({ ...c, [key]: !c[key] }));
@@ -392,10 +412,17 @@ export default function CuttingDashboard() {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`${API_URL}/api/cut-orders`, { headers: authHeaders() });
+      const [res, gres] = await Promise.all([
+        fetch(`${API_URL}/api/cut-orders`, { headers: authHeaders() }),
+        // Opcional: si el backend aún no tiene grupos, el tablero sigue igual.
+        fetch(`${API_URL}/api/cut-groups`, { headers: authHeaders() }).catch(() => null),
+      ]);
       const data = await res.json();
-      if (data.success) setCutOrders(data.cutOrders || []);
-      else setError(data.error || "No se pudieron cargar las órdenes de corte");
+      const gdata = gres && gres.ok ? await gres.json().catch(() => ({})) : {};
+      if (data.success) {
+        setCutOrders(data.cutOrders || []);
+        setCutGroups(gdata.cutGroups || []);
+      } else setError(data.error || "No se pudieron cargar las órdenes de corte");
     } catch (err) {
       setError(err.message);
     } finally {
@@ -403,9 +430,30 @@ export default function CuttingDashboard() {
     }
   };
 
-  const stats = useMemo(() => {
-    const s = { total: cutOrders.length, pending: 0, in_progress: 0, completed: 0, remainingOrders: 0, remainingQty: 0 };
+  // gid → { id, label, members[] } para las insignias y la vista por grupo.
+  const groupInfo = useMemo(() => {
+    const keys = new Map(cutGroups.map((g) => [Number(g.id), g]));
+    const map = new Map();
     cutOrders.forEach((co) => {
+      if (!co.cut_group_id) return;
+      const gid = Number(co.cut_group_id);
+      const g = keys.get(gid);
+      const cur = map.get(gid) || {
+        id: gid,
+        label: groupKeyLabel(g?.group_key),
+        byLabel: g?.group_by === "item_code" ? "Item code" : g?.group_by === "style_fabric" ? "Estilo + tela" : "",
+        members: [],
+      };
+      cur.members.push(co);
+      map.set(gid, cur);
+    });
+    return map;
+  }, [cutOrders, cutGroups]);
+
+  const stats = useMemo(() => {
+    const s = { total: cutOrders.length, pending: 0, in_progress: 0, completed: 0, remainingOrders: 0, remainingQty: 0, grouped: 0 };
+    cutOrders.forEach((co) => {
+      if (co.cut_group_id) s.grouped++;
       if (s[co.status] != null) s[co.status]++;
       const rem = num(co.remaining_to_cut);
       if (co.status !== "completed" && co.status !== "cancelled" && rem > 0) {
@@ -417,6 +465,21 @@ export default function CuttingDashboard() {
   }, [cutOrders]);
 
   const cutNo = (co) => `CORTE-${String(co.id).padStart(4, "0")}`;
+
+  // Insignia "GRUPO-0003" con las órdenes con las que se corta.
+  const groupBadge = (co) => {
+    if (!co.cut_group_id) return null;
+    const g = groupInfo.get(Number(co.cut_group_id));
+    const mates = (g?.members || []).filter((x) => x.id !== co.id).map(cutNo);
+    return (
+      <span
+        className="text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1 bg-indigo-100 text-indigo-700 shrink-0"
+        title={[g?.label, mates.length ? `Se corta con ${mates.join(", ")}` : ""].filter(Boolean).join(" · ")}
+      >
+        <Link2 className="w-3 h-3" /> {groupNo(co.cut_group_id)}
+      </span>
+    );
+  };
 
   // Ordenadas por prioridad y luego por fecha de corte, para todas las vistas.
   const sortedCutOrders = useMemo(
@@ -452,6 +515,42 @@ export default function CuttingDashboard() {
 
   // Agrupación para "Todas las órdenes": por prioridad o por día de corte.
   const groups = useMemo(() => {
+    if (viewMode === "group") {
+      // Un bloque por grupo de corte (los más urgentes arriba) y al final las
+      // órdenes que se cortan solas.
+      const byG = new Map();
+      const solo = [];
+      visibleOrders.forEach((co) => {
+        if (!co.cut_group_id) return solo.push(co);
+        const gid = Number(co.cut_group_id);
+        if (!byG.has(gid)) byG.set(gid, []);
+        byG.get(gid).push(co);
+      });
+      const out = [...byG.entries()].map(([gid, items]) => {
+        const sorted = [...items].sort(byPriorityThenDate);
+        const info = groupInfo.get(gid);
+        return {
+          key: `g-${gid}`,
+          kind: "group",
+          label: groupNo(gid),
+          sub: info?.label || "",
+          byLabel: info?.byLabel || "",
+          items: sorted,
+          first: sorted[0],
+          qty: items.reduce((a, co) => a + num(co.quantity), 0),
+          rem: items.reduce((a, co) => a + (co.status === "cancelled" ? 0 : num(co.remaining_to_cut)), 0),
+        };
+      }).sort((a, b) => byPriorityThenDate(a.first, b.first));
+      if (solo.length) {
+        out.push({
+          key: "g-none", kind: "group", label: "Sin agrupar", sub: "Se cortan solas",
+          items: [...solo].sort(byPriorityThenDate),
+          qty: solo.reduce((a, co) => a + num(co.quantity), 0),
+          rem: solo.reduce((a, co) => a + (co.status === "cancelled" ? 0 : num(co.remaining_to_cut)), 0),
+        });
+      }
+      return out;
+    }
     if (viewMode === "priority") {
       return PRIORITY_ORDER
         .map((key) => ({
@@ -500,7 +599,7 @@ export default function CuttingDashboard() {
       const piecesByOrder = new Map(entries.map((e) => [e.co.id, e.pieces]));
       return { key: d || "sin-fecha", kind: "day", label: fmtDayHeader(d), items, breakdown, dayPieces, piecesByOrder };
     });
-  }, [visibleOrders, viewMode]);
+  }, [visibleOrders, viewMode, groupInfo]);
 
   // Total de marcadas cargadas (para habilitar/mostrar el export).
   const totalMarkers = useMemo(
@@ -538,7 +637,7 @@ export default function CuttingDashboard() {
       });
       // Cols: A WO, B PO, C Orden, D Cliente, E Color, F Marcada, G Tela,
       // H Longitud, I Rendimiento, J Total pzas, K N° paneles, L Consumo, M por talla.
-      const widths = [18, 14, 14, 20, 12, 16, 22, 12, 20, 12, 11, 12, 34];
+      const widths = [18, 14, 14, 20, 12, 16, 22, 12, 20, 12, 11, 12, 34, 13, 12];
       widths.forEach((w, i) => (ws.getColumn(i + 1).width = w));
       ["H", "I", "L"].forEach((col) => (ws.getColumn(col).numFmt = DEC_FMT));
       ["J", "K"].forEach((col) => (ws.getColumn(col).numFmt = INT_FMT));
@@ -602,7 +701,13 @@ export default function CuttingDashboard() {
 
       {/* Stat cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard icon={ClipboardList} label="Órdenes de corte" value={stats.total} tint="text-gray-700" />
+        <StatCard
+          icon={ClipboardList}
+          label="Órdenes de corte"
+          value={stats.total}
+          sub={groupInfo.size ? `${stats.grouped} en ${groupInfo.size} grupo${groupInfo.size > 1 ? "s" : ""}` : undefined}
+          tint="text-gray-700"
+        />
         <StatCard icon={Clock} label="En corte" value={stats.in_progress} sub={`${stats.pending} pendientes`} tint="text-purple-600" />
         <StatCard icon={CheckCircle} label="Cortadas" value={stats.completed} tint="text-green-600" />
         <StatCard
@@ -643,6 +748,7 @@ export default function CuttingDashboard() {
                       </span>
                       <span className={`text-[11px] rounded-full px-2 py-0.5 ${meta.pill}`}>{meta.label}</span>
                       <VerifyPill markers={co.markers} status={co.status} />
+                      {groupBadge(co)}
                     </div>
                     <p className="text-xs text-gray-500 truncate">
                       {co.work_order_no}{co.customer_po ? ` · PO ${co.customer_po}` : ""} · {co.customer_name}{co.color ? ` · ${co.color}` : ""} · 📅 {fmtDate(co.cut_date)}
@@ -674,7 +780,7 @@ export default function CuttingDashboard() {
                 {visibleOrders.length === cutOrders.length
                   ? `${cutOrders.length} órdenes`
                   : `${visibleOrders.length} de ${cutOrders.length} órdenes`}
-                {" · "}agrupadas por {viewMode === "priority" ? "prioridad" : "día en que se cortó"}
+                {" · "}agrupadas por {viewMode === "priority" ? "prioridad" : viewMode === "group" ? "grupo de corte" : "día en que se cortó"}
               </p>
             </div>
 
@@ -691,6 +797,12 @@ export default function CuttingDashboard() {
                 className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition ${viewMode === "day" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}
               >
                 <Calendar className="w-4 h-4" /> Por día
+              </button>
+              <button
+                onClick={() => setViewMode("group")}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition ${viewMode === "group" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}
+              >
+                <Link2 className="w-4 h-4" /> Por grupo
               </button>
             </div>
           </div>
@@ -752,18 +864,30 @@ export default function CuttingDashboard() {
                   {/* Encabezado de grupo (sticky) */}
                   <button
                     onClick={() => toggleGroup(g.key)}
-                    className={`w-full sticky top-0 z-10 flex items-center gap-2 px-5 py-2.5 text-left backdrop-blur ${g.kind === "priority" ? g.meta.head : "bg-gray-50 text-gray-700"}`}
+                    className={`w-full sticky top-0 z-10 flex items-center gap-2 px-5 py-2.5 text-left backdrop-blur ${g.kind === "priority" ? g.meta.head : g.kind === "group" && g.key !== "g-none" ? "bg-indigo-50/90 text-indigo-900" : "bg-gray-50 text-gray-700"}`}
                   >
                     {isCollapsed ? <ChevronRight className="w-4 h-4 shrink-0" /> : <ChevronDown className="w-4 h-4 shrink-0" />}
                     {g.kind === "priority" ? (
                       <span className={`w-2 h-2 rounded-full ${g.meta.dot}`} />
+                    ) : g.kind === "group" ? (
+                      <Link2 className="w-3.5 h-3.5 shrink-0 opacity-70" />
                     ) : (
                       <Calendar className="w-3.5 h-3.5 shrink-0 opacity-70" />
                     )}
-                    <span className="text-sm font-semibold">{g.label}</span>
+                    <span className={`text-sm font-semibold ${g.kind === "group" && g.key !== "g-none" ? "font-mono" : ""}`}>{g.label}</span>
                     <span className={`text-[11px] rounded-full px-2 leading-5 ${g.kind === "priority" ? g.meta.count : "bg-gray-200 text-gray-700"}`}>
                       {g.items.length}
                     </span>
+                    {/* En vista por grupo: clave del grupo y piezas */}
+                    {g.kind === "group" && (
+                      <>
+                        {g.sub && <span className="text-xs text-gray-500 truncate">{g.sub}</span>}
+                        <span className="ml-auto text-[11px] text-gray-500 whitespace-nowrap">
+                          {Math.round(g.qty).toLocaleString()} pzas
+                          {g.rem > 0 && <span className="text-amber-600 font-medium"> · restan {Math.round(g.rem).toLocaleString()}</span>}
+                        </span>
+                      </>
+                    )}
                     {/* En vista por día: total de piezas cortadas ese día */}
                     {g.kind === "day" && g.dayPieces > 0 && (
                       <span className="text-[11px] rounded-full px-2 leading-5 bg-blue-100 text-blue-700 font-semibold">
@@ -810,9 +934,11 @@ export default function CuttingDashboard() {
                             {mkCount > 0 && (
                               <VerifyPill markers={co.markers} status={co.status} />
                             )}
+                            {/* En vista por grupo el encabezado ya dice el grupo. */}
+                            {viewMode !== "group" && groupBadge(co)}
                             {/* En vista por día mostramos la prioridad; en vista por prioridad
                                 el color de la barra ya la indica, así que se omite. */}
-                            {viewMode === "day" && (
+                            {viewMode !== "priority" && (
                               <span className={`text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1 shrink-0 ${pr.pill}`}>
                                 <span className={`w-1.5 h-1.5 rounded-full ${pr.dot}`} />
                                 {pr.label}

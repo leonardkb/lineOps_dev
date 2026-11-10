@@ -16,14 +16,39 @@
 // Archivo autónomo (helpers propios). Los helpers marcados pueden extraerse a
 // un `lib/cutting/marcadas.js` compartido con CutPlanning.jsx y el dashboard.
 //
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Search, RefreshCw, Camera, Calendar, CheckCircle, Printer,
   Layers, AlertTriangle, RotateCcw, ShieldCheck,
+  Link2, ChevronLeft,
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 import { colorForWO } from "../../lib/workOrderColors";
-import { buildTicketUrl } from "./ticketCode";
+import * as ticketCode from "./ticketCode";
+
+// Importado como namespace: si el ticketCode.js del proyecto es una versión
+// vieja sin alguna de estas funciones, la pantalla NO se cae (un import con
+// nombre que no existe tumba todo el módulo con SyntaxError). Se usan
+// respaldos equivalentes a la versión actual de ticketCode.js.
+const TICKET_PATH = ticketCode.TICKET_CARD_PATH || "/corte/ticket";
+const ticketBaseUrl = () =>
+  typeof ticketCode.ticketBaseUrl === "function"
+    ? ticketCode.ticketBaseUrl()
+    : (typeof window !== "undefined" ? window.location.origin : "").replace(/\/+$/, "");
+const ticketUrlIsLocal = () =>
+  typeof ticketCode.ticketUrlIsLocal === "function"
+    ? ticketCode.ticketUrlIsLocal()
+    : /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:|\/|$)/i.test(ticketBaseUrl());
+const buildTicketUrl = (fields) => {
+  if (typeof ticketCode.buildTicketUrl === "function") return ticketCode.buildTicketUrl(fields);
+  const code = typeof ticketCode.buildTicketCode === "function"
+    ? ticketCode.buildTicketCode(fields)
+    : [`CORTE-${String(fields.cutId).padStart(4, "0")}`, fields.workOrderNo, fields.color, fields.talla,
+       fields.marker, fields.panelCount ? `P${fields.panelNo || 1}/${fields.panelCount}` : `P${fields.panelNo || 1}`,
+       fields.markerId, fields.pieces ? Math.round(Number(fields.pieces)) : ""]
+        .map((v) => String(v ?? "").replace(/[|\r\n]/g, "/").trim()).join("|");
+  return `${ticketBaseUrl()}${TICKET_PATH}?t=${encodeURIComponent(code)}`;
+};
 
 /* ======================================================================== */
 /* Helpers compartibles (candidatos a lib/cutting/marcadas.js)              */
@@ -112,6 +137,51 @@ const orderFabrics = (co) => {
   return out;
 };
 
+// ---- Avance POR TELA ------------------------------------------------------
+// Una CORTE con varias telas se planea completa en cada tela (CutPlanning).
+// Una pieza de la orden está cortada cuando TODAS sus telas planeadas están
+// cortadas, así que el cortado de cada talla es el MÍNIMO entre las telas que
+// tienen marcadas (una tela sin marcadas no frena el avance: así las órdenes
+// viejas, planeadas en una sola tela, no retroceden).
+const fup = (v) => (v ?? "").toString().trim().toUpperCase();
+const fabricKeyOf = (f) => `${f?.name ?? ""}|${f?.code ?? ""}`;
+const markerFabricKey = (m, options) => {
+  const code = fup(m?.fabricCode);
+  const name = fup(m?.fabricName);
+  const hit = (code && options.find((o) => fup(o.code) === code))
+    || (!code && name && options.find((o) => fup(o.name) === name))
+    || (!code && !name && options.length === 1 ? options[0] : null);
+  return hit ? fabricKeyOf(hit) : `X|${name}|${code}`;
+};
+// talla → { pieces, panels } de las marcadas VERIFICADAS, combinando telas.
+const cutByTallaAcrossFabrics = (list, options) => {
+  const byFabric = new Map(); // fabricKey → Map(talla → pzas)
+  const panels = new Map();   // talla → paneles (todas las telas)
+  list.forEach((m) => {
+    const fk = markerFabricKey(m, options);
+    if (!byFabric.has(fk)) byFabric.set(fk, new Map());
+    if (!m.done) return;
+    const bt = byFabric.get(fk);
+    m.lines.forEach((l) => {
+      const p = num(l.panels);
+      const per = num(l.perPanel);
+      if (p <= 0 || per <= 0) return;
+      const key = String(l.talla);
+      bt.set(key, (bt.get(key) || 0) + p * per);
+      panels.set(key, (panels.get(key) || 0) + p);
+    });
+  });
+  const out = new Map();
+  const fabrics = [...byFabric.values()];
+  const tallas = new Set();
+  fabrics.forEach((bt) => bt.forEach((_, t) => tallas.add(t)));
+  tallas.forEach((t) => {
+    const pieces = fabrics.length ? Math.min(...fabrics.map((bt) => bt.get(t) || 0)) : 0;
+    out.set(t, { pieces, panels: panels.get(t) || 0 });
+  });
+  return out;
+};
+
 const orderSizes = (co) =>
   Array.isArray(co?.sizes) && co.sizes.length
     ? co.sizes.map((s) => ({ talla: String(s.talla), quantity: num(s.quantity) }))
@@ -150,6 +220,10 @@ const buildMarkers = (co) => {
       done: !!m.done,
       completedAt: m.completedAt || null,
       saved: true,
+      // Marcada que viene de un GRUPO (CutPlanning): el trazo completo tiene
+      // groupPanels paneles / groupPieces piezas repartidas entre varias órdenes.
+      groupPanels: num(m.groupPanels) || null,
+      groupPieces: num(m.groupPieces) || null,
       lines,
     };
   });
@@ -160,12 +234,15 @@ const markerLines = (m) => m.lines.filter((l) => num(l.panels) > 0 && num(l.perP
 const markerPanels = (m) => markerLines(m).reduce((s, l) => s + num(l.panels), 0);
 const markerTotal = (m) => m.lines.reduce((s, l) => s + linePieces(l), 0);
 const TOLERANCE = 0.05;
+// En una marcada de grupo el trazo completo tiene más paneles que la parte de
+// esta orden: rendimiento y consumo se calculan sobre el trazo completo.
+const yieldPanels = (m) => num(m.groupPanels) || markerPanels(m);
 const markerYield = (m) => {
-  const panels = markerPanels(m);
+  const panels = yieldPanels(m);
   return panels > 0 ? (num(m.longitud) + TOLERANCE) / panels : 0;
 };
 const markerConsumo = (m) => {
-  const panels = markerPanels(m);
+  const panels = yieldPanels(m);
   return panels > 0 ? (num(m.longitud) / panels) * markerTotal(m) : 0;
 };
 const markerTickets = (m) =>
@@ -186,6 +263,7 @@ const serializeMarkers = (list) =>
     totalPieces: markerTotal(m),
     done: !!m.done,
     completedAt: m.completedAt || null,
+    ...(m.groupPanels ? { groupPanels: num(m.groupPanels), groupPieces: num(m.groupPieces) } : {}),
     lines: markerLines(m).map((l) => ({
       talla: l.talla,
       panels: num(l.panels),
@@ -208,6 +286,10 @@ export default function CutVerification() {
   const [markers, setMarkers] = useState([]);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+
+  // Layout maestro–detalle: en pantallas chicas se ve la lista o el detalle.
+  const [mobileList, setMobileList] = useState(true);
+  const editorRef = useRef(null);
 
   // TEMP build-check: if you don't see this in the browser console, the app is
   // NOT running this file (stale bundle / wrong-cased duplicate). Remove later.
@@ -244,7 +326,7 @@ export default function CutVerification() {
       })
       .filter((co) => {
         if (!q) return true;
-        const hay = `${co.work_order_no} ${co.customer_po || ""} ${co.customer_name || ""} ${co.modelo_code || ""} ${co.style_code || ""} ${co.estilo || ""} ${co.color || ""} ${co.fabric || ""} ${priorityMeta(co.priority).label}`.toLowerCase();
+        const hay = `${co.work_order_no} ${co.customer_po || ""} ${co.customer_name || ""} ${co.modelo_code || ""} ${co.style_code || ""} ${co.estilo || ""} ${co.color || ""} ${co.fabric || ""} ${co.fabric_code || ""} CORTE-${String(co.id).padStart(4, "0")} ${(co.item_codes || []).join(" ")} ${priorityMeta(co.priority).label}`.toLowerCase();
         return hay.includes(q);
       })
       .sort((a, b) => {
@@ -266,6 +348,27 @@ export default function CutVerification() {
     setError("");
   };
 
+  // Abrir una orden desde la lista: muestra el detalle (en celular) y lo trae
+  // a la vista si quedó fuera del scroll.
+  const selectOrder = (co) => {
+    if (selected?.id !== co.id) pickOrder(co);
+    setMobileList(false);
+    requestAnimationFrame(() => {
+      const el = editorRef.current;
+      if (!el) return;
+      const top = el.getBoundingClientRect().top;
+      if (top < 0 || top > window.innerHeight * 0.6) el.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
+  // Órdenes que se cortan junto con la seleccionada (agrupadas en planeación).
+  const groupMates = useMemo(() => {
+    if (!selected?.cut_group_id) return [];
+    return cutOrders
+      .filter((co) => Number(co.cut_group_id) === Number(selected.cut_group_id) && co.id !== selected.id)
+      .sort((a, b) => a.id - b.id);
+  }, [selected, cutOrders]);
+
   const pedido = useMemo(() => (selected ? orderSizes(selected) : []), [selected]);
   const fabricOptions = useMemo(() => (selected ? orderFabrics(selected) : []), [selected]);
 
@@ -273,22 +376,37 @@ export default function CutVerification() {
   // verificadas (m.done). Una marcada planeada pero no verificada aún NO cuenta
   // como cortada: no suma al avance ni descuenta del restante hasta que el
   // supervisor pulse "Completar marcada".
-  const cutByTalla = useMemo(() => {
-    const map = new Map();
-    markers.filter((m) => m.done).forEach((m) => {
-      m.lines.forEach((l) => {
-        const panels = num(l.panels);
-        const per = num(l.perPanel);
-        if (panels <= 0 || per <= 0) return;
-        const key = String(l.talla);
-        const cur = map.get(key) || { pieces: 0, panels: 0 };
-        cur.pieces += panels * per;
-        cur.panels += panels;
-        map.set(key, cur);
-      });
+  // Con varias telas: cortado por talla = mínimo entre las telas planeadas.
+  const cutByTalla = useMemo(
+    () => cutByTallaAcrossFabrics(markers, fabricOptions),
+    [markers, fabricOptions]
+  );
+
+  // Avance de cada tela (verificado vs pedido completo).
+  const fabricStatus = useMemo(() => {
+    const qty = new Map(pedido.map((p) => [String(p.talla), num(p.quantity)]));
+    const total = pedido.reduce((a, p) => a + num(p.quantity), 0);
+    const rows = fabricOptions.map((f) => ({ key: fabricKeyOf(f), code: f.code, name: f.name }));
+    const seen = new Set(rows.map((r) => r.key));
+    markers.forEach((m) => {
+      const k = markerFabricKey(m, fabricOptions);
+      if (!seen.has(k)) { seen.add(k); rows.push({ key: k, code: m.fabricCode || "", name: m.fabricName || "" }); }
     });
-    return map;
-  }, [markers]);
+    return rows.map((r) => {
+      const list = markers.filter((m) => markerFabricKey(m, fabricOptions) === r.key);
+      const sum = (arr) => {
+        const bt = new Map();
+        arr.forEach((m) => markerLines(m).forEach((l) => {
+          const k = String(l.talla);
+          bt.set(k, (bt.get(k) || 0) + num(l.panels) * num(l.perPanel));
+        }));
+        let c = 0;
+        bt.forEach((v, k) => { c += Math.min(v, qty.get(k) || 0); });
+        return c;
+      };
+      return { ...r, markers: list.length, verified: list.filter((m) => m.done).length, planned: sum(list), cut: sum(list.filter((m) => m.done)), total };
+    });
+  }, [markers, fabricOptions, pedido]);
 
   const summary = useMemo(() => {
     const base = pedido.map((p) => ({ ...p }));
@@ -333,16 +451,8 @@ export default function CutVerification() {
   // marcadas verificadas: así `amount_cut`/`remaining_to_cut` que se guardan en
   // el backend coinciden con el "Cortado" que se ve en pantalla.
   const sizeProgressFrom = (list) => {
-    const cut = new Map(); // talla → { pieces, panels }
-    list.filter((m) => m.done).forEach((m) => {
-      markerLines(m).forEach((l) => {
-        const key = String(l.talla);
-        const cur = cut.get(key) || { pieces: 0, panels: 0 };
-        cur.pieces += num(l.panels) * num(l.perPanel);
-        cur.panels += num(l.panels);
-        cut.set(key, cur);
-      });
-    });
+    // talla → { pieces, panels }; con varias telas, el mínimo entre telas.
+    const cut = cutByTallaAcrossFabrics(list, fabricOptions);
     const rows = [];
     const seen = new Set();
     pedido.forEach((p) => {
@@ -504,6 +614,12 @@ export default function CutVerification() {
     if (onlyMarker && markerTickets(onlyMarker) <= 0) {
       return setError("Esta marcada no tiene paneles ni piezas para imprimir");
     }
+    // Un QR con "localhost" no abre en el celular: avisar antes de imprimir.
+    if (ticketUrlIsLocal() && !window.confirm(
+      `Los QR apuntarán a ${ticketBaseUrl()}, que NO abre desde un celular.\n\n` +
+      "Abra la app con la IP de esta PC (ej. http://192.168.1.50:3000) o configure " +
+      "REACT_APP_PUBLIC_APP_URL antes de imprimir.\n\n¿Imprimir de todos modos?"
+    )) return;
     const esc = (s) => String(s ?? "—").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
     const estilo = co.modelo_code || co.style_no || co.style_code || co.estilo || co.style_description || "—";
 
@@ -695,126 +811,257 @@ export default function CutVerification() {
     w.focus();
   };
 
+  const sel = selected;
+  const selEstilo = sel ? sel.modelo_code || sel.style_no || sel.style_code || sel.estilo : "";
+  const selItems = sel && Array.isArray(sel.item_codes) ? sel.item_codes.filter(Boolean) : [];
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Cabecera de la pantalla */}
       <div className="flex items-center gap-2">
         <ShieldCheck className="w-5 h-5 text-gray-400" />
         <h1 className="text-lg font-bold text-gray-900">Verificación de corte</h1>
-        {/* TEMP build-check badge — remove once confirmed */}
-        <span className="text-[10px] font-mono rounded bg-green-100 text-green-700 px-1.5 py-0.5">build: done-filter</span>
-        <span className="text-xs text-gray-500">Verifique cada marcada e imprima sus tickets. Sólo aparecen órdenes ya planeadas.</span>
+        <span className="hidden md:inline text-xs text-gray-500">Verifique cada marcada e imprima sus tickets. Sólo aparecen órdenes ya planeadas.</span>
       </div>
 
+      {/* Maestro–detalle: lista fija a la izquierda, detalle a la derecha. */}
+      <div className="lg:grid lg:grid-cols-[340px_minmax(0,1fr)] lg:gap-5 lg:items-start">
       {/* Selector de orden */}
-      <div className="space-y-3">
-        <div className="flex flex-wrap gap-2">
+      <aside className={`${mobileList ? "flex" : "hidden"} lg:flex flex-col gap-3 lg:sticky lg:top-[4.5rem] lg:h-[calc(100vh-5.5rem)] min-h-0`}>
+        <div className="grid grid-cols-3 rounded-xl bg-gray-100 p-1">
           {[{ id: "pending", label: "Por verificar" }, { id: "verified", label: "Verificadas" }, { id: "all", label: "Todas" }].map((f) => (
             <button
               key={f.id}
               onClick={() => setFilter(f.id)}
-              className={`px-3 py-1.5 text-sm rounded-full border transition ${filter === f.id ? "bg-gray-900 text-white border-gray-900" : "bg-white text-gray-600 border-gray-200 hover:bg-gray-50"}`}
+              className={`py-1.5 text-sm rounded-lg transition ${filter === f.id ? "bg-white text-gray-900 font-semibold shadow-sm" : "text-gray-500 hover:text-gray-800"}`}
             >
               {f.label}
             </button>
           ))}
-          <button onClick={fetchCutOrders} className="ml-auto inline-flex items-center gap-1.5 text-sm text-gray-600 hover:text-gray-900 px-3 py-1.5 rounded-lg hover:bg-gray-100">
-            <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} /> Actualizar
-          </button>
         </div>
 
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-          <input
-            type="text" placeholder="Buscar orden, cliente, estilo, color, tela…"
-            value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full pl-10 pr-4 py-2 rounded-xl border border-gray-200 text-sm outline-none focus:ring-2 focus:ring-gray-900/10"
-          />
+        <div className="flex gap-2">
+          <div className="relative flex-1 min-w-0">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input
+              type="text" placeholder="Buscar orden, cliente, estilo, tela…"
+              value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 rounded-xl border border-gray-200 bg-white text-sm outline-none focus:ring-2 focus:ring-gray-900/10"
+            />
+          </div>
+          <button
+            onClick={fetchCutOrders}
+            title="Actualizar"
+            aria-label="Actualizar"
+            className="shrink-0 w-10 rounded-xl border border-gray-200 bg-white text-gray-500 hover:text-gray-900 hover:bg-gray-50 flex items-center justify-center"
+          >
+            <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
+          </button>
         </div>
 
         {error && !selected && <div className="bg-red-50 text-red-700 p-3 rounded-xl text-sm">{error}</div>}
 
-        <div className="rounded-2xl border bg-white shadow-sm divide-y max-h-[70vh] overflow-y-auto">
-          {loading ? (
-            <div className="p-8 text-center text-gray-500">Cargando…</div>
+        <div className="flex-1 min-h-0 flex flex-col rounded-2xl border bg-white shadow-sm overflow-hidden">
+          <div className="px-3 py-2 border-b bg-gray-50/80 text-xs text-gray-500">
+            {loading ? "Cargando…" : `${filtered.length} ${filtered.length === 1 ? "orden" : "órdenes"}`}
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto divide-y">
+          {loading && filtered.length === 0 ? (
+            <div className="p-8 text-center text-sm text-gray-500">Cargando…</div>
           ) : filtered.length === 0 ? (
-            <div className="p-8 text-center text-gray-500">No hay marcadas por verificar.</div>
+            <div className="p-8 text-center text-sm text-gray-500">No hay marcadas por verificar.</div>
           ) : (
             filtered.map((co) => {
               const meta = displayStatusMeta(co.status, co.markers);
               const pr = priorityMeta(co.priority);
               const isSel = selected?.id === co.id;
+              const estilo = co.modelo_code || co.style_no;
               return (
-                <button key={co.id} onClick={() => pickOrder(co)} className={`w-full text-left p-4 flex gap-3 items-center border-l-4 ${pr.accent} hover:bg-gray-50 ${isSel ? "bg-blue-50" : ""}`}>
-                  <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${colorForWO(co.work_order_id).dot}`} />
+                <button
+                  key={co.id}
+                  onClick={() => selectOrder(co)}
+                  aria-current={isSel ? "true" : undefined}
+                  className={`w-full text-left px-3 py-2.5 flex gap-2.5 border-l-4 ${pr.accent} hover:bg-gray-50 ${isSel ? "bg-blue-50 hover:bg-blue-50 ring-1 ring-inset ring-blue-200" : ""}`}
+                >
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-sm font-bold text-gray-900">{cutNo(co)}</span>
-                      <span className={`text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1 ${pr.pill}`}>
-                        <span className={`w-1.5 h-1.5 rounded-full ${pr.dot}`} />
-                        {pr.label}
-                      </span>
-                      <span className={`text-[11px] rounded-full px-2 py-0.5 ${meta.pill}`}>{meta.label}</span>
-                      <VerifyPill markers={co.markers} status={co.status} />
+                    <div className="flex items-center gap-2">
+                      <span className={`w-2 h-2 rounded-full shrink-0 ${colorForWO(co.work_order_id).dot}`} />
+                      <span className="font-mono text-[13px] font-bold text-gray-900">{cutNo(co)}</span>
+                      {co.cut_group_id && (
+                        <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-indigo-100 text-indigo-700 inline-flex items-center gap-0.5" title="Se corta junto con otras órdenes">
+                          <Link2 className="w-3 h-3" /> Grupo
+                        </span>
+                      )}
+                      <span className="ml-auto text-[11px] text-gray-400 tabular-nums">{fmtDate(co.cut_date)}</span>
                     </div>
-                    <p className="text-xs text-gray-500 truncate">
-                      {co.work_order_no}{co.customer_po ? ` · PO ${co.customer_po}` : ""} · {co.customer_name}{co.color ? ` · ${co.color}` : ""}{(co.modelo_code || co.style_no) ? ` · Est. ${co.modelo_code || co.style_no}` : ""}
-                      {co.fabric || co.fabric_code ? ` · ${[co.fabric_code, co.fabric].filter(Boolean).join(" ")}` : ""}
+                    <p className="mt-0.5 text-xs text-gray-700 truncate">
+                      {[co.customer_name, co.color, estilo && `Est. ${estilo}`].filter(Boolean).join(" · ")}
                     </p>
-                  </div>
-                  <div className="text-right text-[11px] text-gray-500">
-                    <div className="inline-flex items-center gap-1 text-gray-400"><Calendar className="w-3 h-3" /> {fmtDate(co.cut_date)}</div>
-                    <div className="mt-0.5">
-                      {num(co.remaining_to_cut) > 0 ? <span className="text-amber-600 font-medium">Restan {rnd(co.remaining_to_cut)}</span> : `${rnd(co.quantity)} pzas`}
+                    <p className="text-[11px] text-gray-400 truncate">
+                      {[co.work_order_no, co.customer_po && `PO ${co.customer_po}`, [co.fabric_code, co.fabric].filter(Boolean).join(" ")].filter(Boolean).join(" · ")}
+                    </p>
+                    <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
+                      {co.priority && co.priority !== "normal" && (
+                        <span className={`text-[10px] rounded-full px-1.5 py-0.5 ${pr.pill}`}>{pr.label}</span>
+                      )}
+                      <span className={`text-[10px] rounded-full px-1.5 py-0.5 ${meta.pill}`}>{meta.label}</span>
+                      <VerifyPill markers={co.markers} status={co.status} compact />
+                      <span className="ml-auto text-[11px] tabular-nums">
+                        {num(co.remaining_to_cut) > 0
+                          ? <span className="text-amber-600 font-medium">Restan {rnd(co.remaining_to_cut)}</span>
+                          : <span className="text-gray-500">{rnd(co.quantity)} pzas</span>}
+                      </span>
                     </div>
                   </div>
                 </button>
               );
             })
           )}
+          </div>
         </div>
-      </div>
+      </aside>
 
       {/* Verificación */}
-      <div>
+      <section ref={editorRef} className={`${mobileList ? "hidden" : "block"} lg:block min-w-0 scroll-mt-[4.5rem]`}>
+        <button
+          onClick={() => setMobileList(true)}
+          className="lg:hidden mb-3 inline-flex items-center gap-1.5 text-sm text-gray-600 hover:text-gray-900 px-2 py-1.5 -ml-2 rounded-lg hover:bg-gray-100"
+        >
+          <ChevronLeft className="w-4 h-4" /> Órdenes
+        </button>
         {!selected ? (
-          <div className="rounded-2xl border bg-white shadow-sm p-8 text-center text-gray-500">
-            Elija una orden planeada para verificar sus marcadas.
+          <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-10 text-center">
+            <ShieldCheck className="w-8 h-8 text-gray-300 mx-auto" />
+            <p className="mt-3 font-semibold text-gray-800">Elija una orden de la lista</p>
+            <p className="mt-1 text-sm text-gray-500">Aquí aparecen sus detalles y marcadas para verificarlas e imprimir tickets.</p>
           </div>
         ) : (
           <div className="rounded-2xl border bg-white shadow-sm">
             <div className="px-5 py-4 border-b flex items-start gap-3">
-              <div className="w-14 h-14 rounded-xl bg-gray-100 flex items-center justify-center overflow-hidden shrink-0">
-                {selected.master_code_photo_url ? <img src={selected.master_code_photo_url} alt="" className="w-full h-full object-cover" /> : <Camera className="w-5 h-5 text-gray-300" />}
+              <div className="w-12 h-12 rounded-xl bg-gray-100 flex items-center justify-center overflow-hidden shrink-0">
+                {sel.master_code_photo_url ? <img src={sel.master_code_photo_url} alt="" className="w-full h-full object-cover" /> : <Camera className="w-5 h-5 text-gray-300" />}
               </div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <h2 className="font-mono font-bold text-gray-900">{cutNo(selected)}</h2>
-                  <span className={`text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1 ${priorityMeta(selected.priority).pill}`}>
-                    <span className={`w-1.5 h-1.5 rounded-full ${priorityMeta(selected.priority).dot}`} />
-                    {priorityMeta(selected.priority).label}
+                  <h2 className="font-mono font-bold text-gray-900">{cutNo(sel)}</h2>
+                  <span className={`text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1 ${priorityMeta(sel.priority).pill}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${priorityMeta(sel.priority).dot}`} />
+                    {priorityMeta(sel.priority).label}
                   </span>
-                  <span className={`text-[11px] rounded-full px-2 py-0.5 ${displayStatusMeta(selected.status, markers).pill}`}>
-                    {displayStatusMeta(selected.status, markers).label}
+                  <span className={`text-[11px] rounded-full px-2 py-0.5 ${displayStatusMeta(sel.status, markers).pill}`}>
+                    {displayStatusMeta(sel.status, markers).label}
                   </span>
-                  <VerifyPill markers={markers} status={selected.status} />
+                  <VerifyPill markers={markers} status={sel.status} />
                 </div>
-                <p className="text-sm text-gray-600 truncate">{selected.work_order_no}{selected.customer_po ? ` · PO ${selected.customer_po}` : ""} · {selected.customer_name}</p>
+                <p className="text-sm text-gray-600 truncate">{[sel.customer_name, sel.work_order_no].filter(Boolean).join(" · ")}</p>
               </div>
             </div>
 
-            <div className="p-5 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3 text-sm border-b">
-              <Info label="PO cliente" value={selected.customer_po} />
-              <Info label="Estilo N°" value={selected.modelo_code || selected.style_no || selected.style_code || selected.estilo} />
-              <Info label="Color" value={selected.color} />
-              <Info label="Season" value={selected.season} />
-              <Info label="Tela(s)" value={fabricOptions.map((f) => f.code || f.name).filter(Boolean).join(" + ") || selected.fabric} />
-              <Info label="A cortar" value={`${rnd(selected.quantity)} pzas`} />
-              <Info label="Rendimiento" value={selected.yield_per_piece != null ? `${num(selected.yield_per_piece)} m/pza` : "—"} />
-              <Info label="Fecha" value={fmtDate(selected.cut_date)} icon={Calendar} />
+            {/* Detalles de la orden */}
+            <div className="px-5 py-4 border-b space-y-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
+                <Info label="Cliente" value={sel.customer_name} />
+                <Info label="PO cliente" value={sel.customer_po} />
+                <Info label="Work order" value={sel.work_order_no} />
+                <Info label="Estilo N°" value={selEstilo} />
+                <Info label="Color" value={sel.color} />
+                <Info label="Season" value={sel.season} />
+                <Info label="Tela(s)" value={fabricOptions.map((f) => [f.code, f.name].filter(Boolean).join(" ")).filter(Boolean).join(" + ") || sel.fabric} />
+                {selItems.length > 0
+                  ? <Info label="Item code" value={selItems.join(", ")} />
+                  : <Info label="Descripción" value={sel.style_description} />}
+                <Info label="A cortar" value={`${rnd(sel.quantity)} pzas`} />
+                <Info label="Rendimiento" value={sel.yield_per_piece != null ? `${rnd2(sel.yield_per_piece)} m/pza` : "—"} />
+                <Info label="Largo total" value={sel.total_length != null ? `${rnd2(sel.total_length)} m` : "—"} />
+                <Info label="Fecha de corte" value={fmtDate(sel.cut_date)} icon={Calendar} />
+              </div>
+
+              {sel.notes && sel.notes.trim() && (
+                <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">
+                  <span className="block text-[11px] text-gray-500">Notas de la orden</span>
+                  <span className="whitespace-pre-wrap">{sel.notes}</span>
+                </div>
+              )}
+
+              {sel.verified_at && (
+                <div className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-800">
+                  <ShieldCheck className="w-4 h-4 shrink-0" />
+                  Corte verificado{sel.verified_by ? ` por ${sel.verified_by}` : ""} el {new Date(sel.verified_at).toLocaleString()}
+                </div>
+              )}
+              {!sel.verified_at && sel.verification_notes && (
+                <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span><span className="font-semibold">Regresado a corte:</span> {sel.verification_notes}</span>
+                </div>
+              )}
+
+              {sel.cut_group_id && (
+                <div className="rounded-lg border border-indigo-200 bg-indigo-50/60 px-3 py-2.5 text-sm text-indigo-900">
+                  <div className="flex items-center gap-1.5 font-semibold">
+                    <Link2 className="w-4 h-4" /> Corte agrupado · GRUPO-{String(sel.cut_group_id).padStart(4, "0")}
+                  </div>
+                  <p className="mt-0.5 text-xs text-indigo-900/80">
+                    Las marcadas se tienden juntas. Aquí se ven sólo los paneles que le tocan a esta orden.
+                  </p>
+                  {groupMates.length > 0 && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                      <span className="text-xs text-indigo-900/80">Se corta con</span>
+                      {groupMates.map((co) => (
+                        <button
+                          key={co.id}
+                          onClick={() => selectOrder(co)}
+                          title={[co.work_order_no, co.customer_po && `PO ${co.customer_po}`, co.color].filter(Boolean).join(" · ")}
+                          className="text-xs font-mono rounded-md border border-indigo-200 bg-white px-2 py-1 text-indigo-800 hover:bg-indigo-100"
+                        >
+                          {cutNo(co)} · {rnd(co.quantity)} pzas
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="p-5 space-y-5">
+              {/* Avance por tela (sólo si la orden tiene varias) */}
+              {fabricStatus.length > 1 && (
+                <div>
+                  <div className="flex items-baseline justify-between gap-2 mb-2">
+                    <h3 className="font-semibold text-gray-900">Telas</h3>
+                    <span className="text-xs text-gray-500">Una pieza cuenta como cortada cuando todas sus telas están cortadas</span>
+                  </div>
+                  <div className="grid gap-2 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3">
+                    {fabricStatus.map((f) => {
+                      const pct = f.total > 0 ? Math.min(Math.round((f.cut / f.total) * 100), 100) : 0;
+                      const done = f.total > 0 && f.cut >= f.total;
+                      return (
+                        <div key={f.key} className={`rounded-xl border px-3 py-2.5 ${done ? "border-green-200 bg-green-50/60" : "border-gray-200 bg-gray-50"}`}>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-sm font-semibold text-gray-900 truncate">{f.code || "(sin código)"}</span>
+                            <span className="ml-auto text-[11px] text-gray-500 whitespace-nowrap">{f.verified}/{f.markers} marcadas</span>
+                          </div>
+                          {f.name && <div className="text-xs text-gray-500 truncate">{f.name}</div>}
+                          <div className="mt-2 h-1.5 rounded-full bg-gray-200 overflow-hidden">
+                            <div className={`h-full ${done ? "bg-green-500" : "bg-blue-500"}`} style={{ width: `${pct}%` }} />
+                          </div>
+                          <div className="mt-1 text-[11px]">
+                            {f.markers === 0 ? (
+                              <span className="text-amber-600 font-medium">Sin planear</span>
+                            ) : (
+                              <>
+                                <span className={done ? "text-green-700 font-medium" : "text-gray-700"}>{rnd(f.cut)} / {rnd(f.total)} cortadas</span>
+                                {f.planned < f.total && <span className="text-amber-600"> · planeado {rnd(f.planned)}</span>}
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               {/* Avance global */}
               <div className="rounded-2xl border border-gray-200 bg-gray-50/60 p-4">
                 <div className="flex flex-wrap items-end justify-between gap-3">
@@ -890,6 +1137,11 @@ export default function CutVerification() {
                               {[m.fabricCode, m.fabricName].filter(Boolean).join(" · ")}
                             </span>
                           )}
+                          {m.groupPanels && (
+                            <span className="text-[11px] rounded-full px-2 py-0.5 bg-indigo-100 text-indigo-700 inline-flex items-center gap-1" title="Trazo completo del grupo; esta orden se lleva la parte de abajo">
+                              <Link2 className="w-3 h-3" /> Trazo del grupo: {rnd(m.groupPanels)} paneles · {rnd(m.groupPieces)} pzas
+                            </span>
+                          )}
                           <div className="ml-auto text-right leading-tight">
                             <div className="text-base font-bold text-blue-700">{rnd(tot)} <span className="text-xs font-medium text-gray-400">pzas</span></div>
                             <div className="text-[11px] text-gray-500">{rnd(panels)} panel(es) · {used} talla(s)</div>
@@ -912,12 +1164,12 @@ export default function CutVerification() {
                             <div className="block">
                               <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Rendimiento (m/pza)</span>
                               <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-2 text-right text-sm font-semibold text-gray-700">{rnd2(yieldVal)}</div>
-                              <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long + {TOLERANCE}) ÷ {rnd(panels)} panel(es)</span>
+                              <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long + {TOLERANCE}) ÷ {rnd(yieldPanels(m))} panel(es){m.groupPanels ? " del grupo" : ""}</span>
                             </div>
                             <div className="block">
                               <span className="block text-[10px] uppercase tracking-wide text-gray-400 mb-0.5">Consumo (m)</span>
                               <div className="rounded-lg border border-blue-200 bg-blue-50/60 px-2 py-2 text-right text-sm font-bold text-blue-700">{rnd2(consumo)}</div>
-                              <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long ÷ {rnd(panels)}) × {rnd(tot)} pzas</span>
+                              <span className="block text-[10px] text-gray-400 mt-0.5 text-right">(long ÷ {rnd(yieldPanels(m))}) × {rnd(tot)} pzas</span>
                             </div>
                           </div>
 
@@ -1076,6 +1328,7 @@ export default function CutVerification() {
             </div>
           </div>
         )}
+      </section>
       </div>
     </div>
   );
@@ -1084,10 +1337,23 @@ export default function CutVerification() {
 /* ======================================================================== */
 /* UI atoms (compartibles con CutPlanning.jsx)                              */
 /* ======================================================================== */
-function VerifyPill({ markers, status }) {
+function VerifyPill({ markers, status, compact = false }) {
   const { total, verified, pending } = markerVerification(markers);
   if (total === 0) return null;
-  const base = "text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1";
+  const base = compact
+    ? "text-[10px] rounded-full px-1.5 py-0.5 inline-flex items-center gap-1"
+    : "text-[11px] rounded-full px-2 py-0.5 inline-flex items-center gap-1";
+  if (compact && status !== "completed" && status !== "cancelled") {
+    return pending > 0 ? (
+      <span className={`${base} bg-amber-100 text-amber-700`} title={`Falta verificar ${pending} marcada${pending > 1 ? "s" : ""}`}>
+        <AlertTriangle className="w-3 h-3" /> {pending} sin verificar
+      </span>
+    ) : (
+      <span className={`${base} bg-green-100 text-green-700`}>
+        <CheckCircle className="w-3 h-3" /> {verified}/{total}
+      </span>
+    );
+  }
   if (status === "completed" || status === "cancelled") {
     return (
       <span className={`${base} bg-slate-100 text-slate-600`}>
@@ -1127,12 +1393,12 @@ function Bar({ value, max, over }) {
 
 function Info({ label, value, icon: Icon }) {
   return (
-    <div className="rounded-xl p-3 border bg-gray-50 border-gray-100">
-      <div className="flex items-center gap-1.5 mb-1">
+    <div className="rounded-lg px-3 py-2 border bg-gray-50 border-gray-100 min-w-0">
+      <div className="flex items-center gap-1.5">
         {Icon && <Icon className="w-3.5 h-3.5 text-gray-400" />}
-        <span className="text-[11px] text-gray-500 uppercase tracking-wide">{label}</span>
+        <span className="text-[11px] text-gray-500">{label}</span>
       </div>
-      <div className="text-sm font-semibold text-gray-900">{value || "—"}</div>
+      <div className="mt-0.5 text-sm font-semibold text-gray-900 truncate" title={value ? String(value) : undefined}>{value || "—"}</div>
     </div>
   );
 }

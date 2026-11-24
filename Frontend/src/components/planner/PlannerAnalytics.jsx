@@ -540,7 +540,7 @@ export default function PlannerAnalytics() {
   }, [orderRows, ordOnly, ordProc, search, worstFirst]);
 
   return (
-    <div className="h-[calc(100dvh-64px)] flex flex-col bg-gray-50 text-gray-900 overflow-hidden">
+    <div className="h-[100dvh] flex flex-col bg-gray-50 text-gray-900 overflow-hidden">
         <NavCeo />
       {/* Encabezado + KPIs (fijos) */}
       <header className="shrink-0 bg-white border-b border-gray-200">
@@ -589,7 +589,7 @@ export default function PlannerAnalytics() {
             onRetry={() => setReloadKey((k) => k + 1)}
           />
         ) : tab === "orders" ? (
-          <div className="h-full max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-3">
+          <div className="h-full w-full px-2 sm:px-3 py-3">
             {/* Identical to Planificación Avanzada → Estado de Órdenes */}
             {/* approverMode: el CEO completa directo, sin regla ni solicitud */}
             <OrderStatus fill approverMode />

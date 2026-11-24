@@ -109,4 +109,26 @@ export function colorForStyle(styleCode, styleColorMap) {
   return colorForWO(`style:${code}`);
 }
 
+// ---- Forecast orders (FC####) ----------------------------------------------
+// Forecasts are colored by STYLE, not by order: every forecast of the same
+// style shares one color. The server keeps the style → palette index in
+// forecast_style_colors and sends it as `color_idx` on forecast rows and on
+// forecast holds, so the board, the lists and the overview always agree.
+// (The server's PALETTE_SIZE in forecast-orders.js must equal WO_PALETTE.length.)
+
+// Same normalization as the server: "fn-2798 " → "FN2798".
+export function forecastStyleKey(styleName) {
+  return String(styleName == null ? "" : styleName).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Palette entry for a forecast row or a forecast hold. Uses the server's
+// color_idx; falls back to a stable hash of the style when it's missing.
+export function colorForForecast(row) {
+  const idx = Number(row?.color_idx);
+  if (row && row.color_idx != null && Number.isInteger(idx) && idx >= 0) {
+    return WO_PALETTE[idx % WO_PALETTE.length];
+  }
+  return colorForWO(`fc-style:${forecastStyleKey(row?.style_name ?? row?.estilo ?? row?.style)}`);
+}
+
 export default WO_PALETTE;

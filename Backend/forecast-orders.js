@@ -51,6 +51,14 @@
 //   GET    /api/forecast-orders/:id
 //   POST   /api/forecast-orders                       -> create (auto FC####)
 //   PUT    /api/forecast-orders/:id                   -> edit (active only)
+//   POST   /api/forecast-orders/:id/to-pre-order      -> SEND to the merchant as a
+//          PRE#### (total or partial). No details are asked: the pre-order is
+//          built from the forecast (style, client, pieces, SAM, handover date)
+//          and lands in the merchant's «Pre-órdenes» table + notification bell,
+//          AND on the merchant plan board (merchant_week_plan) in the week the
+//          forecast sat on the board (else its handover week, else this week),
+//          ready to be dragged to another week.
+//          The merchant completes it to SKM with the usual wizard.
 //   POST   /api/forecast-orders/:id/convert           -> link the SKM orders made
 //          from it (total or partial), release / shrink its board cells and put
 //          the new SKMs on the merchant week plan so they show in the Plan Board
@@ -58,8 +66,13 @@
 //   DELETE /api/forecast-orders/:id                   -> delete (holds cascade)
 //
 //   GET    /api/forecast-holds[?from=&to=]            -> { holds:[...] }
+//   POST   /api/forecast-holds/place                  -> place a WHOLE drop in one
+//          request: packs the pieces day by day from startDate (weekends +
+//          sent holidays skipped) over a multi-year horizon, one transaction,
+//          one bulk insert. This is what the board uses for drag & drop.
 //   POST   /api/forecast-holds                        -> upsert ONE line/day
 //   DELETE /api/forecast-holds?id=                    -> one hold
+//   DELETE /api/forecast-holds?ids=1,2,3               -> several holds (one request)
 //   DELETE /api/forecast-holds?preOrderId=|forecastOrderId=  -> all of an order
 //
 //   POST   /api/forecast-orders/:id/capacity      -> change operators / SAM / hours /
@@ -79,6 +92,9 @@
 //     season?, handoverDate?, operators, samMinutes, workingHours,
 //     efficiency? (0.85 or 85; default 100%), notes? }
 // ==========================================================================
+
+// Tablero del merchant: la PRE que se manda desde aquí nace ya en su semana.
+const { placePreOrder } = require("./merchant-plan");
 
 async function initSchema({ pool, setSchema }) {
   const client = await pool.connect();
@@ -119,6 +135,10 @@ async function initSchema({ pool, setSchema }) {
     await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS work_order_nos TEXT;");
     await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ;");
     await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS converted_by BIGINT;");
+    // Hand-off to the merchant as PRE#### (see /to-pre-order). converted_pieces
+    // counts what left the forecast either way (sent as PRE or made as SKM).
+    await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS pre_order_ids BIGINT[] NOT NULL DEFAULT '{}';");
+    await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS pre_order_nos TEXT;");
     await client.query("ALTER TABLE forecast_orders DROP CONSTRAINT IF EXISTS chk_fc_status;");
     await client.query("ALTER TABLE forecast_orders ADD CONSTRAINT chk_fc_status CHECK (status IN ('active','partially_converted','converted','cancelled'));");
     await client.query("CREATE INDEX IF NOT EXISTS idx_forecast_orders_status ON forecast_orders(status);");
@@ -162,6 +182,10 @@ async function initSchema({ pool, setSchema }) {
         CONSTRAINT chk_flp_eff       CHECK (efficiency > 0 AND efficiency <= 1)
       );
     `);
+    // One color per FORECAST ORDER (FC####). color_idx points into WO_PALETTE
+    // (lib/workOrderColors.js). Backfill forecasts that have none, oldest first.
+    const colored = await migrateOrderColors(client);
+    if (colored) console.log(`\u2705 forecast colors assigned to ${colored} forecast order(s)`);
     console.log("\u2705 forecast_orders + forecast_day_holds + forecast_line_params tables ready in prod_db_schema");
   } finally {
     client.release();
@@ -172,6 +196,50 @@ async function initSchema({ pool, setSchema }) {
 // A forecast still lives on the board while it is active or partly converted.
 const OPEN_STATUSES = ["active", "partially_converted"];
 const OPEN_SQL = "('active','partially_converted')";
+
+// ---- forecast colors (one per FC####) --------------------------------------
+// Adds forecast_orders.color_idx and gives a color to forecasts without one.
+// Runs from initSchema AND, once per process, before the first request (see
+// withClient), so the routes never query a column that isn't there yet even if
+// the startup migration was skipped or failed.
+async function migrateOrderColors(client) {
+  await client.query("ALTER TABLE forecast_orders ADD COLUMN IF NOT EXISTS color_idx INT;");
+  const { rows } = await client.query(
+    "SELECT id FROM forecast_orders WHERE color_idx IS NULL ORDER BY created_at, id");
+  for (const r of rows) await ensureOrderColor(client, r.id);
+  return rows.length;
+}
+
+// Must match WO_PALETTE.length in lib/workOrderColors.js.
+const PALETTE_SIZE = 40;
+
+// Gives a forecast its color. `wanted` (0..PALETTE_SIZE-1) sets it explicitly.
+// Otherwise, if it has none yet, it gets the slot used by the fewest OTHER open
+// forecasts (lowest index first; the palette is ordered so neighbours look
+// different), so colors only repeat once more than PALETTE_SIZE are open.
+// force = true re-assigns automatically even if it already has one.
+async function ensureOrderColor(client, id, wanted = null, force = false) {
+  if (Number.isInteger(wanted) && wanted >= 0 && wanted < PALETTE_SIZE) {
+    await client.query("UPDATE forecast_orders SET color_idx = $2 WHERE id = $1", [id, wanted]);
+    return wanted;
+  }
+  const { rows: cur } = await client.query("SELECT color_idx FROM forecast_orders WHERE id = $1", [id]);
+  if (!cur[0]) return null;
+  if (cur[0].color_idx != null && !force) return cur[0].color_idx;
+  const { rows: pick } = await client.query(
+    `SELECT g.i
+       FROM generate_series(0, $1::int - 1) AS g(i)
+       LEFT JOIN forecast_orders f
+              ON f.color_idx = g.i AND f.id <> $2 AND f.status IN ${OPEN_SQL}
+      GROUP BY g.i
+      ORDER BY COUNT(f.id), g.i
+      LIMIT 1`,
+    [PALETTE_SIZE, id]
+  );
+  const idx = pick[0]?.i ?? 0;
+  await client.query("UPDATE forecast_orders SET color_idx = $2 WHERE id = $1", [id, idx]);
+  return idx;
+}
 const txt = (v, n) => (v == null ? null : String(v).trim().slice(0, n || 200) || null);
 const col = (v) => String(v == null ? "" : v).trim().toUpperCase().slice(0, 50);
 const numOr = (v, d = 0) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
@@ -186,6 +254,9 @@ const dateOr = (v) => {
   if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
   return null;
 };
+// How far ahead a drop / re-calculation may pack (≈ 6 years): a big forecast
+// on a small line can run through 2026, 2027, 2028, 2029…
+const HORIZON_DAYS = 2200;
 const ymdLocal = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 // Same key the board uses for capacity (style_code = forecast number).
@@ -215,10 +286,12 @@ const SELECT_COLS = `
   GREATEST(f.quantity - f.converted_pieces, 0)     AS open_quantity,       -- still forecast
   GREATEST(f.quantity - f.converted_pieces - COALESCE(h.held, 0), 0) AS remaining_quantity,
   f.work_order_ids, f.work_order_nos, f.converted_at, f.converted_by,
+  f.pre_order_ids, f.pre_order_nos,
   to_char(h.first_day, 'YYYY-MM-DD')               AS first_day,
   to_char(h.last_day,  'YYYY-MM-DD')               AS last_day,
   COALESCE(h.lines, '{}')                          AS lines,
-  COALESCE(lpx.line_params, '[]'::json)            AS line_params
+  COALESCE(lpx.line_params, '[]'::json)            AS line_params,
+  f.color_idx                                      -- forecast color (WO_PALETTE)
 `;
 const FROM_JOIN = `
   FROM forecast_orders f
@@ -290,6 +363,8 @@ function parseBody(body) {
       workingHours,
       efficiency: isNaN(efficiency) ? 1 : Math.round(efficiency * 1000) / 1000,
       notes: txt(b.notes, 2000),
+      // Optional: palette index chosen in the modal (this forecast only).
+      colorIdx: b.colorIdx === "" || b.colorIdx == null ? null : parseInt(b.colorIdx, 10),
     },
   };
 }
@@ -316,6 +391,15 @@ async function nextForecastNo(client) {
        FROM forecast_orders WHERE forecast_no LIKE 'FC%'`
   );
   return `FC${String((rows[0]?.maxseq || 0) + 1).padStart(4, "0")}`;
+}
+
+// Same numbering rule as pre-orders.js (PRE####).
+async function nextPreOrderNo(client) {
+  const { rows } = await client.query(
+    `SELECT COALESCE(MAX((substring(pre_order_no from '^PRE([0-9]+)'))::int), 0) AS maxseq
+       FROM pre_orders WHERE pre_order_no LIKE 'PRE%'`
+  );
+  return `PRE${String((rows[0]?.maxseq || 0) + 1).padStart(4, "0")}`;
 }
 
 async function getOrderById(client, id) {
@@ -353,7 +437,7 @@ async function capacityFor(client, { order, lineNo, from, to }) {
   const days = [];
   const start = new Date(`${from}T00:00:00`);
   const end = new Date(`${to}T00:00:00`);
-  for (let d = new Date(start), i = 0; d <= end && i < 800; d.setDate(d.getDate() + 1), i++) {
+  for (let d = new Date(start), i = 0; d <= end && i <= HORIZON_DAYS + 7; d.setDate(d.getDate() + 1), i++) {
     const key = ymdLocal(d);
     const free = Math.max(0, 1 - (used.get(key) || 0));
     // tiny epsilon so 0.9999999 × target doesn't lose a piece to float noise
@@ -460,7 +544,60 @@ async function carryToMerchantPlan(client, workOrderIds, week, userId) {
 // effective capacity. Same pieces, packed day by day into the free room left by
 // the other forecasts; weekends and `blocked` dates (holidays) are skipped.
 // Pieces that don't fit in the horizon go back to the pool (reported).
-async function repackLine(client, { order, lineNo, fromDate, blocked = [], userId = null, horizonDays = 400 }) {
+// Packs `qtyByColor` pieces of one forecast on one line, day by day from
+// `start`, into the free room (one capacity read), skipping weekends and the
+// `blocked` dates. Writes everything with ONE bulk upsert. Returns a summary.
+async function packIntoLine(client, { order, lineNo, start, qtyByColor, blocked = [], userId = null, horizonDays = HORIZON_DAYS, maxPerDay = null }) {
+  const ln = String(lineNo).trim();
+  const end = new Date(`${start}T00:00:00`);
+  end.setDate(end.getDate() + horizonDays);
+  const cap = await capacityFor(client, { order, lineNo: ln, from: start, to: ymdLocal(end) });
+  const blockedSet = new Set((blocked || []).filter(isYmd));
+  const free = new Map(cap.days.map((x) => [x.date, x.available]));
+
+  const dates = [], qtys = [], colors = [];
+  let unplaced = 0, firstDay = null, lastDay = null, pieces = 0;
+  for (const [color, qty] of qtyByColor) {
+    let remaining = Math.round((Number(qty) || 0) * 100) / 100;
+    pieces += remaining;
+    for (const day of cap.days) {
+      if (remaining <= 0) break;
+      const dow = new Date(`${day.date}T00:00:00`).getDay();
+      if (dow === 0 || dow === 6 || blockedSet.has(day.date)) continue;
+      const room = free.get(day.date) || 0;
+      if (room <= 0) continue;
+      // "2 órdenes/día": at most half a day for this forecast.
+      const q = Math.min(room, remaining, maxPerDay > 0 ? maxPerDay : Infinity);
+      dates.push(day.date); qtys.push(q); colors.push(color || "");
+      free.set(day.date, room - q);
+      remaining -= q;
+      if (!firstDay || day.date < firstDay) firstDay = day.date;
+      if (!lastDay || day.date > lastDay) lastDay = day.date;
+    }
+    unplaced += Math.max(0, remaining);
+  }
+  if (dates.length) {
+    await client.query(
+      `INSERT INTO forecast_day_holds
+         (forecast_order_id, line_no, assigned_date, quantity, color, created_by, created_at, updated_at)
+       SELECT $1, $2, d, q, c, $6, NOW(), NOW()
+         FROM unnest($3::date[], $4::numeric[], $5::text[]) AS t(d, q, c)
+       ON CONFLICT (forecast_order_id, line_no, assigned_date, color) DO UPDATE SET
+         quantity = forecast_day_holds.quantity + EXCLUDED.quantity, updated_at = NOW()`,
+      [order.id, ln, dates, qtys, colors, userId]
+    );
+  }
+  return {
+    line: ln, cells: dates.length, pieces, placed: pieces - unplaced, unplaced,
+    firstDay, lastDay, targetPcs: cap.target, horizonEnd: ymdLocal(end),
+  };
+}
+
+// Serializes all writers of one line (drops, single holds, re-calculations).
+const lockLine = (client, lineNo) =>
+  client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`fc-line|${String(lineNo).trim()}`]);
+
+async function repackLine(client, { order, lineNo, fromDate, blocked = [], userId = null, horizonDays = HORIZON_DAYS }) {
   const ln = String(lineNo).trim();
   const { rows: cells } = await client.query(
     `SELECT id, color, quantity, to_char(assigned_date,'YYYY-MM-DD') AS d
@@ -477,50 +614,79 @@ async function repackLine(client, { order, lineNo, fromDate, blocked = [], userI
     "DELETE FROM forecast_day_holds WHERE forecast_order_id = $1 AND line_no = $2 AND assigned_date >= $3",
     [order.id, ln, fromDate]
   );
+  const r = await packIntoLine(client, { order, lineNo: ln, start, qtyByColor: byColor, blocked, userId, horizonDays });
+  return { line: ln, cellsBefore: cells.length, cellsAfter: r.cells, pieces: r.pieces, unplaced: r.unplaced,
+           firstDay: r.firstDay, lastDay: r.lastDay, targetPcs: r.targetPcs };
+}
 
-  const end = new Date(`${start}T00:00:00`);
-  end.setDate(end.getDate() + horizonDays);
-  const cap = await capacityFor(client, { order, lineNo: ln, from: start, to: ymdLocal(end) });
-  const blockedSet = new Set((blocked || []).filter(isYmd));
-  const free = new Map(cap.days.map((x) => [x.date, x.available]));
+// Re-sizes a forecast that is already on the board after its quantity changed.
+//   Lower quantity  -> cells are trimmed from the END of the run (latest day
+//                      first) until the board holds no more than the new open
+//                      pieces. Pieces still waiting in the pool go first.
+//   Higher quantity -> the extra pieces are appended after the last cell, on
+//                      the line where the run ends, packed into the free room
+//                      (weekends and `blocked` holidays skipped).
+// Not on the board -> nothing to do; the pool simply shows the new remainder.
+async function resizeOnBoard(client, { order, oldQty, newQty, conv, fromDate, blockedDates = {}, userId = null }) {
+  const out = { trimmed: 0, added: 0, unplaced: 0, line: null };
+  const { rows: cells } = await client.query(
+    `SELECT id, line_no, color, quantity, to_char(assigned_date,'YYYY-MM-DD') AS d
+       FROM forecast_day_holds WHERE forecast_order_id = $1
+      ORDER BY assigned_date DESC, line_no DESC, id DESC`,
+    [order.id]
+  );
+  if (!cells.length) return out;
+  for (const ln of [...new Set(cells.map((c) => String(c.line_no)))].sort()) await lockLine(client, ln);
 
-  let after = 0, unplaced = 0, firstDay = null, lastDay = null;
-  const pieces = [...byColor.values()].reduce((t, q) => t + q, 0);
-  for (const [color, qty] of byColor) {
-    let remaining = Math.round(qty * 100) / 100;
-    for (const day of cap.days) {
-      if (remaining <= 0) break;
-      const dow = new Date(`${day.date}T00:00:00`).getDay();
-      if (dow === 0 || dow === 6 || blockedSet.has(day.date)) continue;
-      const room = free.get(day.date) || 0;
-      if (room <= 0) continue;
-      const q = Math.min(room, remaining);
-      await client.query(
-        `INSERT INTO forecast_day_holds
-           (forecast_order_id, line_no, assigned_date, quantity, color, created_by, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())
-         ON CONFLICT (forecast_order_id, line_no, assigned_date, color) DO UPDATE SET
-           quantity = forecast_day_holds.quantity + EXCLUDED.quantity, updated_at = NOW()`,
-        [order.id, ln, day.date, q, color, userId]
-      );
-      free.set(day.date, room - q);
-      remaining -= q;
-      after++;
-      if (!firstDay || day.date < firstDay) firstDay = day.date;
-      if (!lastDay || day.date > lastDay) lastDay = day.date;
+  const held = cells.reduce((t, c) => t + (Number(c.quantity) || 0), 0);
+  const newOpen = Math.max(0, newQty - conv);
+
+  if (newQty < oldQty) {
+    let cut = Math.max(0, held - newOpen);
+    for (const c of cells) {                       // latest day first
+      if (cut <= 1e-6) break;
+      const q = Number(c.quantity) || 0;
+      if (q <= cut + 1e-6) {
+        await client.query("DELETE FROM forecast_day_holds WHERE id = $1", [c.id]);
+        cut -= q; out.trimmed += q;
+      } else {
+        await client.query("UPDATE forecast_day_holds SET quantity = $2, updated_at = NOW() WHERE id = $1", [c.id, q - cut]);
+        out.trimmed += cut; cut = 0;
+      }
     }
-    unplaced += Math.max(0, remaining);
+  } else if (newQty > oldQty) {
+    const add = newQty - oldQty;
+    const tail = cells[0];                          // the run's last cell
+    const ln = String(tail.line_no);
+    const start = tail.d > fromDate ? tail.d : fromDate;
+    const r = await packIntoLine(client, {
+      order, lineNo: ln, start,
+      qtyByColor: new Map([[tail.color || "", add]]),
+      blocked: Array.isArray(blockedDates[ln]) ? blockedDates[ln] : [],
+      userId,
+    });
+    out.added = r.placed; out.unplaced = r.unplaced; out.line = ln;
   }
-  return { line: ln, cellsBefore: cells.length, cellsAfter: after, pieces, unplaced, firstDay, lastDay, targetPcs: cap.target };
+  return out;
 }
 
 function registerForecastOrders(app, deps) {
   const { authenticateToken, pool, setSchema } = deps;
 
+  // Once per process: make sure color_idx exists before any route uses it.
+  let colorsReady = null;
+  const ensureColors = (client) => {
+    if (!colorsReady) {
+      colorsReady = migrateOrderColors(client).catch((e) => { colorsReady = null; throw e; });
+    }
+    return colorsReady;
+  };
+
   const withClient = (label, handler) => async (req, res) => {
     const client = await pool.connect();
     try {
       await setSchema(client);
+      await ensureColors(client);
       await handler(client, req, res);
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -539,6 +705,33 @@ function registerForecastOrders(app, deps) {
   app.get("/api/forecast-orders/next-number", authenticateToken,
     withClient("GET /api/forecast-orders/next-number", async (client, req, res) => {
       res.json({ success: true, sequence: await nextForecastNo(client) });
+    }));
+
+  // Colors of the open forecasts, for the picker (shows which are taken).
+  // [{ id, forecast_no, style_name, color_idx }]
+  app.get("/api/forecast-colors", authenticateToken,
+    withClient("GET /api/forecast-colors", async (client, req, res) => {
+      const { rows } = await client.query(
+        `SELECT id, forecast_no, style_name, color_idx
+           FROM forecast_orders WHERE status IN ${OPEN_SQL} ORDER BY forecast_no`);
+      res.json({ success: true, paletteSize: PALETTE_SIZE, colors: rows });
+    }));
+
+  // Set ONE forecast's color from the board / details card.
+  // Body: { colorIdx: 0..PALETTE_SIZE-1 | null }   null → automatic again.
+  app.put("/api/forecast-orders/:id/color", authenticateToken,
+    withClient("PUT /api/forecast-orders/:id/color", async (client, req, res) => {
+      const id = parseInt(req.params.id, 10);
+      const raw = (req.body || {}).colorIdx;
+      const auto = raw === null || raw === "" || raw === undefined;
+      const idx = auto ? null : parseInt(raw, 10);
+      if (!auto && !(Number.isInteger(idx) && idx >= 0 && idx < PALETTE_SIZE)) {
+        return res.status(400).json({ success: false, error: `colorIdx must be 0–${PALETTE_SIZE - 1} or null` });
+      }
+      const { rows } = await client.query("SELECT id FROM forecast_orders WHERE id = $1", [id]);
+      if (!rows[0]) return res.status(404).json({ success: false, error: "Forecast order not found" });
+      const colorIdx = await ensureOrderColor(client, id, idx, auto);
+      res.json({ success: true, id, colorIdx });
     }));
 
   app.get("/api/forecast-orders", authenticateToken,
@@ -561,7 +754,7 @@ function registerForecastOrders(app, deps) {
         params.push(`%${search}%`);
         const p = `$${params.length}`;
         where.push(`(f.forecast_no ILIKE ${p} OR f.style_name ILIKE ${p} OR f.customer_name ILIKE ${p}
-                     OR f.style_description ILIKE ${p} OR f.season ILIKE ${p})`);
+                     OR f.style_description ILIKE ${p} OR f.season ILIKE ${p} OR f.pre_order_nos ILIKE ${p})`);
       }
       const { rows } = await client.query(
         `SELECT ${SELECT_COLS} ${FROM_JOIN}
@@ -624,6 +817,7 @@ function registerForecastOrders(app, deps) {
         }
       }
       if (id == null) return res.status(409).json({ success: false, error: "Could not assign a forecast number, try again" });
+      await ensureOrderColor(client, id, data.colorIdx);
       res.json({ success: true, forecastOrder: await getOrderById(client, id) });
     }));
 
@@ -637,15 +831,25 @@ function registerForecastOrders(app, deps) {
       if (!OPEN_STATUSES.includes(cur.status)) {
         return res.status(400).json({ success: false, error: `A ${cur.status} forecast order can't be edited` });
       }
-      const held = Number(cur.held_quantity) || 0;
+      // The quantity can go up or down freely; the board is re-sized below.
+      // Pieces already converted to SKM are real orders and can't be undone.
       const conv = Number(cur.converted_pieces) || 0;
-      if (data.quantity + 1e-6 < held + conv) {
+      if (data.quantity + 1e-6 < conv) {
         return res.status(400).json({
           success: false,
-          error: `${Math.round(conv).toLocaleString()} pcs are already converted to SKM and ${Math.round(held).toLocaleString()} are placed on the board. The quantity can't go below ${Math.round(held + conv).toLocaleString()}.`,
+          error: `${Math.round(conv).toLocaleString()} pzas ya se convirtieron a SKM; la cantidad no puede ser menor.`,
         });
       }
+      const b = req.body || {};
+      const fromDate = isYmd(b.fromDate) ? b.fromDate : ymdLocal(new Date());
+      const blockedDates = b.blockedDates && typeof b.blockedDates === "object" ? b.blockedDates : {};
+      const uid = req.user?.id ?? null;
       const cust = await resolveCustomer(client, data);
+
+      await client.query("BEGIN");
+      const { rows: lockRows } = await client.query(
+        "SELECT quantity FROM forecast_orders WHERE id = $1 FOR UPDATE", [id]);
+      const oldQty = Number(lockRows[0]?.quantity) || 0;
       await client.query(
         `UPDATE forecast_orders SET
             style_name = $2, style_description = $3, customer_id = $4, customer_name = $5,
@@ -655,9 +859,21 @@ function registerForecastOrders(app, deps) {
           WHERE id = $1`,
         [id, data.styleName, data.styleDescription, cust.customerId, cust.customerName,
          data.season, data.quantity, data.handoverDate, data.operators, data.samMinutes,
-         data.workingHours, data.efficiency, data.notes, req.user?.id ?? null]
+         data.workingHours, data.efficiency, data.notes, uid]
       );
-      res.json({ success: true, forecastOrder: await getOrderById(client, id) });
+      let resized = null;
+      if (Math.abs(data.quantity - oldQty) > 1e-6) {
+        // Read the order back so packing uses the capacity just saved.
+        const { rows: fresh } = await client.query(
+          "SELECT id, forecast_no, status, operators_count, sam_minutes, working_hours, efficiency FROM forecast_orders WHERE id = $1", [id]);
+        resized = await resizeOnBoard(client, {
+          order: fresh[0], oldQty, newQty: data.quantity, conv, fromDate, blockedDates, userId: uid,
+        });
+      }
+      // A color picked in the modal applies to this forecast only.
+      await ensureOrderColor(client, id, data.colorIdx);
+      await client.query("COMMIT");
+      res.json({ success: true, resized, forecastOrder: await getOrderById(client, id) });
     }));
 
   // ---- POST /:id/capacity: change capacity for chosen lines and re-pack -----
@@ -748,6 +964,7 @@ function registerForecastOrders(app, deps) {
       const { rows: fresh } = await client.query(
         "SELECT id, forecast_no, status, operators_count, sam_minutes, working_hours, efficiency FROM forecast_orders WHERE id = $1", [id]);
       const recalculated = [];
+      for (const ln of [...lines].sort()) await lockLine(client, ln);
       for (const ln of lines) {
         recalculated.push(await repackLine(client, {
           order: fresh[0], lineNo: ln, fromDate,
@@ -756,6 +973,159 @@ function registerForecastOrders(app, deps) {
       }
       await client.query("COMMIT");
       res.json({ success: true, recalculated, forecastOrder: await getOrderById(client, id) });
+    }));
+
+  // ---- POST /:id/to-pre-order: send the forecast to the merchant ---------
+  // The planner does NOT fill the SKM details here. A PRE#### is created from
+  // what the forecast already knows and shows up in the merchant's
+  // «Pre-órdenes» table (pending, with a "from forecast FC####" badge and an
+  // unread notification). The merchant then completes it to SKM with the same
+  // wizard as any other pre-order.
+  // Body: { pieces?, customerPo?, notes?, fromDate? }
+  //   pieces ≥ open pieces (or omitted) → forecast 'converted', all cells released
+  //   pieces <  open pieces             → 'partially_converted', cells released
+  //                                        earliest first; the rest stays forecast
+  // The PRE gets planned_week = week of the forecast's next planned day (else
+  // its first cell, its handover week, or this week) and a row on the merchant
+  // plan board in that same week, so the merchant sees it in the week grid and
+  // can move it. The SKM made from it later inherits that week.
+  app.post("/api/forecast-orders/:id/to-pre-order", authenticateToken,
+    withClient("POST /api/forecast-orders/:id/to-pre-order", async (client, req, res) => {
+      const id = parseInt(req.params.id, 10);
+      const b = req.body || {};
+      const fromDate = isYmd(b.fromDate) ? b.fromDate : ymdLocal(new Date());
+      const uid = req.user?.id ?? null;
+
+      await client.query("BEGIN");
+      const { rows: cur } = await client.query(
+        `SELECT id, forecast_no, status, style_name, style_description, customer_id, customer_name,
+                season, quantity, converted_pieces, sam_minutes, notes, pre_order_ids, pre_order_nos,
+                to_char(handover_date,'YYYY-MM-DD') AS handover_date
+           FROM forecast_orders WHERE id = $1 FOR UPDATE`, [id]);
+      const f = cur[0];
+      if (!f) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "Forecast order not found" }); }
+      if (!OPEN_STATUSES.includes(f.status)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, error: `This forecast order is ${f.status}` });
+      }
+      const open = Math.max(0, (Number(f.quantity) || 0) - (Number(f.converted_pieces) || 0));
+      if (!(open > 0)) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "Nothing left to send for this forecast" }); }
+      const asked = numOr(b.pieces, 0);
+      const pieces = Math.round(Math.min(asked > 0 ? asked : open, open) * 100) / 100;
+
+      // Client: catalog id if we have it (or an exact name match) → code for the PRE.
+      const cust = await resolveCustomer(client, { customerId: f.customer_id, customerName: f.customer_name });
+      let clienteCode = null;
+      if (cust.customerId) {
+        const { rows: c } = await client.query("SELECT code FROM customers WHERE id = $1", [cust.customerId]);
+        clienteCode = String(c[0]?.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 3) || null;
+      }
+
+      // Week where the forecast sits on the board (next planned day, else first cell / handover).
+      const { rows: wk } = await client.query(
+        `SELECT to_char(MIN(assigned_date) FILTER (WHERE assigned_date >= $2),'YYYY-MM-DD') AS next_day,
+                to_char(MIN(assigned_date),'YYYY-MM-DD') AS first_day
+           FROM forecast_day_holds WHERE forecast_order_id = $1`, [id, fromDate]);
+      // Siempre hay semana: sin casillas ni fecha de entrega, la semana actual.
+      const anchor = wk[0]?.next_day || wk[0]?.first_day || f.handover_date || fromDate;
+      const plannedWeek = mondayOf(anchor);
+
+      const noteParts = [
+        `Desde pronóstico ${f.forecast_no}`,
+        `Estilo: ${f.style_name}`,
+        f.season ? `Temporada: ${f.season}` : null,
+        txt(b.notes, 1500),
+        f.notes ? `Notas del pronóstico: ${f.notes}` : null,
+      ].filter(Boolean);
+
+      // Insert the PRE. Number clash (two people at once) → retry inside a SAVEPOINT
+      // so the transaction survives the failed attempt.
+      let pre = null;
+      for (let attempt = 0; attempt < 5 && !pre; attempt++) {
+        const no = await nextPreOrderNo(client);
+        await client.query("SAVEPOINT pre_no");
+        try {
+          const { rows } = await client.query(
+            `INSERT INTO pre_orders
+               (pre_order_no, tipo, modelo, correlativo, style_code, estilo, style_description,
+                customer_id, customer_name, cliente_code, customer_po, pieces, sam_minutes,
+                target_date, planned_week, notes, status,
+                source_forecast_id, source_forecast_no, source_style_name, source_season,
+                sent_by, merchant_seen_at,
+                created_by, updated_by, created_at, updated_at)
+             VALUES ($1,NULL,NULL,NULL,NULL,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',
+                     $12,$13,$14,$15,$16,NULL,$16,$16,NOW(),NOW())
+             RETURNING id, pre_order_no`,
+            [no, f.style_description || f.style_name, cust.customerId, cust.customerName || f.customer_name,
+             clienteCode, txt(b.customerPo, 60), pieces, Number(f.sam_minutes) || 0,
+             f.handover_date, plannedWeek, noteParts.join(" · ").slice(0, 2000),
+             f.id, f.forecast_no, txt(f.style_name, 120), txt(f.season, 60), uid]
+          );
+          await client.query("RELEASE SAVEPOINT pre_no");
+          pre = rows[0];
+        } catch (e) {
+          await client.query("ROLLBACK TO SAVEPOINT pre_no");
+          if (e.code !== "23505") throw e;
+        }
+      }
+      if (!pre) { await client.query("ROLLBACK"); return res.status(409).json({ success: false, error: "Could not assign a pre-order number, try again" }); }
+
+      // Merchant plan board: the PRE row in plannedWeek. Best effort (own
+      // SAVEPOINT): if it fails the PRE still exists, keeps planned_week, and
+      // the merchant can drop it on the board by hand.
+      let boardRowId = null, boardError = null;
+      await client.query("SAVEPOINT merchant_board");
+      try {
+        boardRowId = await placePreOrder(client, {
+          id: pre.id,
+          pre_order_no: pre.pre_order_no,
+          customer_name: cust.customerName || f.customer_name,
+          customer_po: txt(b.customerPo, 60),
+          style_code: null,
+          estilo: null,
+          display_style: f.style_name,
+          style_description: f.style_description || f.style_name,
+          pieces,
+          sam_minutes: Number(f.sam_minutes) || 0,
+        }, plannedWeek, uid);
+        await client.query("RELEASE SAVEPOINT merchant_board");
+      } catch (e) {
+        await client.query("ROLLBACK TO SAVEPOINT merchant_board");
+        boardError = e.message;
+        console.warn(`\u26a0\ufe0f  forecast ${id} → ${pre.pre_order_no}: merchant board row not created:`, e.message);
+      }
+
+      // Forecast: pieces leave it (like an SKM conversion) and it remembers the PRE.
+      const newConverted = (Number(f.converted_pieces) || 0) + pieces;
+      const isFinal = newConverted + 1e-6 >= (Number(f.quantity) || 0);
+      const preIds = [...new Set([...(f.pre_order_ids || []).map(Number), Number(pre.id)])];
+      const preNos = [...new Set([...String(f.pre_order_nos || "").split(",").map((x) => x.trim()).filter(Boolean), pre.pre_order_no])];
+      await client.query(
+        `UPDATE forecast_orders SET
+            status = $2, converted_pieces = $3, pre_order_ids = $4, pre_order_nos = $5,
+            converted_at = CASE WHEN $6 THEN NOW() ELSE converted_at END,
+            converted_by = CASE WHEN $6 THEN $7 ELSE converted_by END,
+            updated_by = $7, updated_at = NOW()
+          WHERE id = $1`,
+        [id, isFinal ? "converted" : "partially_converted", newConverted, preIds, preNos.join(", "), isFinal, uid]
+      );
+
+      // Board cells: all released on a full hand-off; else shrink earliest first.
+      let releasedPieces = 0;
+      if (isFinal) {
+        const r = await client.query("DELETE FROM forecast_day_holds WHERE forecast_order_id = $1 RETURNING quantity", [id]);
+        releasedPieces = r.rows.reduce((t, x) => t + (Number(x.quantity) || 0), 0);
+      } else {
+        releasedPieces = await shrinkForecastHolds(client, id, pieces);
+      }
+
+      await client.query("COMMIT");
+      res.json({
+        success: true, partial: !isFinal, pieces, releasedPieces, plannedWeek,
+        onMerchantBoard: boardRowId != null, boardError,
+        preOrder: { id: pre.id, pre_order_no: pre.pre_order_no },
+        forecastOrder: await getOrderById(client, id),
+      });
     }));
 
   // ---- POST /:id/convert: the SKM orders made from this forecast ----------
@@ -942,7 +1312,8 @@ function registerForecastOrders(app, deps) {
                 o.season,
                 o.sam_minutes,
                 to_char(o.handover_date, 'YYYY-MM-DD') AS target_date,
-                o.status                          AS pre_status
+                o.status                          AS pre_status,
+                o.color_idx                                            -- forecast color (WO_PALETTE)
            FROM forecast_day_holds h
            JOIN forecast_orders o ON o.id = h.forecast_order_id
           WHERE ${where.join(" AND ")}
@@ -950,6 +1321,53 @@ function registerForecastOrders(app, deps) {
         params
       );
       res.json({ success: true, holds: rows });
+    }));
+
+  // ---- POST /api/forecast-holds/place: a whole drop in ONE request --------
+  // Body: { forecastOrderId | preOrderId, lineNo, startDate, quantity, color?,
+  //         blockedDates?: ["YYYY-MM-DD", …] }   (holidays of that line)
+  // Packs `quantity` from startDate on (≈ 6-year horizon), capped at what the
+  // forecast still has unplaced. Pieces that don't fit are reported (unplaced).
+  app.post("/api/forecast-holds/place", authenticateToken,
+    withClient("POST /api/forecast-holds/place", async (client, req, res) => {
+      const b = req.body || {};
+      const orderId = parseInt(b.forecastOrderId ?? b.preOrderId, 10);
+      const lineNo = txt(b.lineNo, 20);
+      const startDate = isYmd(b.startDate) ? b.startDate : null;
+      const asked = numOr(b.quantity, 0);
+      if (isNaN(orderId) || !lineNo || !startDate) {
+        return res.status(400).json({ success: false, error: "forecastOrderId, lineNo and startDate (YYYY-MM-DD) are required" });
+      }
+      await client.query("BEGIN");
+      await lockLine(client, lineNo);
+      const { rows } = await client.query(
+        `SELECT f.id, f.forecast_no, f.status, f.quantity, f.converted_pieces,
+                f.operators_count, f.sam_minutes, f.working_hours, f.efficiency,
+                COALESCE((SELECT SUM(quantity) FROM forecast_day_holds WHERE forecast_order_id = f.id), 0) AS held
+           FROM forecast_orders f WHERE f.id = $1 FOR UPDATE`,
+        [orderId]
+      );
+      const order = rows[0];
+      if (!order) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "Forecast order not found" }); }
+      if (!OPEN_STATUSES.includes(order.status)) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ success: false, error: `This forecast order is ${order.status}` });
+      }
+      // Never place more than the forecast still has off the board.
+      const left = Math.max(0, (Number(order.quantity) || 0) - (Number(order.converted_pieces) || 0) - (Number(order.held) || 0));
+      const qty = Math.min(asked > 0 ? asked : left, left);
+      if (!(qty > 0)) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "Nothing left to place for this forecast" }); }
+
+      const r = await packIntoLine(client, {
+        order, lineNo, start: startDate,
+        qtyByColor: new Map([[col(b.color), qty]]),
+        blocked: Array.isArray(b.blockedDates) ? b.blockedDates : [],
+        userId: req.user?.id ?? null,
+        // splitDay: the board's "2 órdenes/día" — half of this forecast's day.
+        maxPerDay: b.splitDay === true ? Math.floor(targetOf(await effectiveParams(client, order, lineNo)) / 2) : null,
+      });
+      await client.query("COMMIT");
+      res.json({ success: true, ...r });
     }));
 
   // Upsert one hold. Re-dropping the same order+line+day+color ADDS to it.
@@ -966,7 +1384,7 @@ function registerForecastOrders(app, deps) {
       }
       await client.query("BEGIN");
       // Serialize writers on this line-day so two drops can't both take the last pieces.
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`fc|${lineNo}|${assignedDate}`]);
+      await lockLine(client, lineNo);
 
       const { rows: oRows } = await client.query(
         `SELECT id, forecast_no, status, operators_count, working_hours, sam_minutes, efficiency
@@ -1006,6 +1424,13 @@ function registerForecastOrders(app, deps) {
 
   app.delete("/api/forecast-holds", authenticateToken,
     withClient("DELETE /api/forecast-holds", async (client, req, res) => {
+      const idsParam = req.query.ids ?? (Array.isArray(req.body?.ids) ? req.body.ids.join(",") : null);
+      if (idsParam) {
+        const ids = String(idsParam).split(",").map((v) => parseInt(v, 10)).filter((v) => !isNaN(v));
+        if (!ids.length) return res.status(400).json({ success: false, error: "ids is empty" });
+        const r = await client.query("DELETE FROM forecast_day_holds WHERE id = ANY($1::bigint[])", [ids]);
+        return res.json({ success: true, deleted: r.rowCount });
+      }
       const id = req.query.id ?? req.body?.id ?? null;
       const orderId = req.query.forecastOrderId ?? req.query.preOrderId ?? req.body?.forecastOrderId ?? req.body?.preOrderId ?? null;
       if (id == null && orderId == null) {

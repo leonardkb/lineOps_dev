@@ -1,15 +1,16 @@
 // components/supermarket/PublishedWeekBar.jsx
 //
 // Selector de semanas publicadas + resumen de lo que hay que surtir.
-// Vive DENTRO de la pestaña Plan Board, no arriba: la barra de navegación del
-// área es NavSupermarket.
+// Vive DENTRO de la pestaña Plan Board, justo encima del tablero, en UNA sola
+// franja con el mismo lenguaje que la barra del PlanBoard (segmentos grises,
+// activo en blanco), para que se lea como parte del tablero y no como otra
+// tarjeta. Menos alto = el tablero empieza más arriba.
 //
-// Componente presentacional: no pide datos ni guarda estado. Todo entra por
-// props y las acciones salen por callbacks.
+// Componente presentacional: no pide datos ni guarda estado.
 
 import { format, addDays, getWeek } from "date-fns";
 import { es } from "date-fns/locale";
-import { RefreshCw, Loader2, Check } from "lucide-react";
+import { RefreshCw, Loader2 } from "lucide-react";
 
 export const weekLabel = (weekStart) => {
   const s = new Date(`${weekStart}T00:00:00`);
@@ -28,103 +29,81 @@ export default function PublishedWeekBar({
   totals = { pzas: 0, cells: 0, pre: false },
   activeMeta = null,
 }) {
+  const seg = (on) =>
+    `h-8 px-3 text-sm whitespace-nowrap rounded-md transition inline-flex items-center gap-2 ${
+      on ? "bg-white shadow-sm text-gray-900 font-semibold" : "text-gray-600 hover:text-gray-900"
+    }`;
+
   return (
     <div className="bg-white rounded-xl border shadow-sm">
-      <div className="px-5 py-3 flex items-center justify-between gap-4 flex-wrap border-b">
-        {/* Lo que el supermercado necesita de un vistazo: cuánto surtir. */}
-        <dl className="flex items-center gap-6">
-          <div>
-            <dd className="font-semibold text-gray-900 tabular-nums leading-tight">
-              {Math.round(totals.pzas).toLocaleString()}
-            </dd>
-            <dt className="text-xs text-gray-500 leading-tight">piezas</dt>
+      <div className="px-4 py-2.5 flex items-center gap-x-5 gap-y-2 flex-wrap">
+        <nav className="flex bg-gray-200/60 rounded-lg p-0.5 overflow-x-auto max-w-full" aria-label="Semanas publicadas">
+          <button
+            onClick={() => onSelectWeek("all")}
+            aria-pressed={activeWeek === "all"}
+            title="Ver todas las semanas publicadas"
+            className={seg(activeWeek === "all")}
+          >
+            Todas <span className="text-xs text-gray-400 tabular-nums">{weeks.length}</span>
+          </button>
+          {weeks.map((w) => {
+            const lbl = weekLabel(w.weekStart);
+            const on = activeWeek === w.weekStart;
+            return (
+              <button
+                key={w.weekStart}
+                onClick={() => onSelectWeek(w.weekStart)}
+                aria-pressed={on}
+                title={w.hasPreOrders ? "Ver sólo esta semana (incluye pre-órdenes)" : "Ver sólo esta semana"}
+                className={seg(on)}
+              >
+                {lbl.top}
+                <span className={`text-xs tabular-nums font-normal ${on ? "text-gray-500" : "text-gray-400"}`}>{lbl.range}</span>
+                {w.hasPreOrders && (
+                  <span className="text-[10px] font-semibold rounded px-1 py-0.5 bg-violet-100 text-violet-700">Pre</span>
+                )}
+                {w.revision > 1 && (
+                  <span
+                    title={`Revisión ${w.revision}: planeación reenvió esta semana`}
+                    className="text-[10px] font-semibold rounded px-1 py-0.5 bg-amber-100 text-amber-800"
+                  >
+                    rev {w.revision}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </nav>
+
+        <dl className="flex items-baseline gap-4 text-sm">
+          <div className="flex items-baseline gap-1.5">
+            <dd className="font-bold text-gray-900 tabular-nums">{Math.round(totals.pzas).toLocaleString()}</dd>
+            <dt className="text-gray-500">pzas</dt>
           </div>
-          <div>
-            <dd className="font-semibold text-gray-900 tabular-nums leading-tight">
-              {totals.cells.toLocaleString()}
-            </dd>
-            <dt className="text-xs text-gray-500 leading-tight">casillas</dt>
+          <div className="flex items-baseline gap-1.5">
+            <dd className="font-semibold text-gray-700 tabular-nums">{totals.cells.toLocaleString()}</dd>
+            <dt className="text-gray-500">casillas</dt>
           </div>
-          {totals.pre && (
-            <span className="text-xs font-medium text-violet-700 bg-violet-50 border border-violet-200 rounded-full px-2.5 py-1">
-              Incluye pre-órdenes
-            </span>
-          )}
         </dl>
 
         <button
           onClick={onRefresh}
           disabled={refreshing}
-          className="px-3 py-1.5 text-sm text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 inline-flex items-center gap-1.5"
+          className="ml-auto h-8 px-3 text-sm text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 inline-flex items-center gap-1.5"
         >
           {refreshing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
           Actualizar
         </button>
       </div>
 
-      <nav className="px-5 py-3 flex items-center gap-1.5 flex-wrap" aria-label="Semanas publicadas">
-        <button
-          onClick={() => onSelectWeek("all")}
-          aria-current={activeWeek === "all" ? "true" : undefined}
-          title={activeWeek === "all" ? "En uso — el tablero muestra todas las semanas publicadas" : "Ver todas las semanas publicadas"}
-          className={`px-3 py-1.5 text-sm rounded-lg border transition inline-flex items-center gap-1.5 ${
-            activeWeek === "all"
-              ? "bg-gray-900 text-white border-gray-900 ring-2 ring-gray-900 ring-offset-1"
-              : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50"
-          }`}
-        >
-          {activeWeek === "all" && <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />}
-          Todas
-          <span className={`text-xs ${activeWeek === "all" ? "text-gray-400" : "text-gray-400"}`}>{weeks.length}</span>
-        </button>
-
-        {weeks.map((w) => {
-          const lbl = weekLabel(w.weekStart);
-          const on = activeWeek === w.weekStart;
-          return (
-            <button
-              key={w.weekStart}
-              onClick={() => onSelectWeek(w.weekStart)}
-              aria-current={on ? "true" : undefined}
-              title={on ? "Semana en uso — el tablero muestra sólo esta semana" : "Ver sólo esta semana"}
-              className={`px-3 py-1.5 text-sm rounded-lg border transition inline-flex items-center gap-2 ${
-                on
-                  ? "bg-gray-900 text-white border-gray-900 ring-2 ring-gray-900 ring-offset-1"
-                  : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50"
-              }`}
-            >
-              {/* La semana seleccionada queda marcada como "en uso": el tablero
-                  de abajo muestra sólo esa semana. */}
-              {on && <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />}
-              <span className="font-medium">{lbl.top}</span>
-              <span className={`text-xs tabular-nums ${on ? "text-gray-400" : "text-gray-500"}`}>
-                {lbl.range}
-              </span>
-              {w.hasPreOrders && (
-                <span
-                  title="Esta semana incluye pre-órdenes"
-                  className={`text-[10px] font-semibold rounded px-1.5 py-0.5 ${
-                    on ? "bg-violet-500 text-white" : "bg-violet-50 text-violet-700 border border-violet-200"
-                  }`}
-                >
-                  Pre
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </nav>
-
       {activeMeta && (
-        <div className="px-5 pb-3 flex items-center gap-3 flex-wrap text-xs text-gray-500">
+        <div className="px-4 py-2 border-t border-gray-100 flex items-center gap-3 flex-wrap text-xs text-gray-500">
           <span>
             Publicado {format(new Date(activeMeta.publishedAt), "d MMM yyyy, HH:mm", { locale: es })}
             {activeMeta.revision > 1 && ` · revisión ${activeMeta.revision}`}
           </span>
           {activeMeta.note && (
-            <span className="text-gray-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
-              {activeMeta.note}
-            </span>
+            <span className="text-gray-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">{activeMeta.note}</span>
           )}
         </div>
       )}

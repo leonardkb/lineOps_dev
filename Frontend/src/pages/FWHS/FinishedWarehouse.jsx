@@ -7,6 +7,7 @@ import PrePacking from "../../components/FWH/PrePacking";
 import FinishedWarehouseDashboard from "../../components/FWH/Finishedwarehousedashboard";
 import FinishedWarehouseScan from "../../components/FWH/Finishedwarehousescan";
 import FinishedWarehouseInventory from "../../components/FWH/FinishedWarehouseInventory";
+import FinishedWarehouseBanda from "../../components/FWH/FinishedWarehouseBanda";
 // When they exist, drop these in and replace the placeholders below:
 // import FinishedWarehouseDashboard from "./FinishedWarehouseDashboard";
 // import FinishedInventory from "./FinishedInventory";
@@ -29,6 +30,8 @@ export default function FinishedWarehouse() {
       {tab === "inventario" && (
         <FinishedWarehouseInventory active ={tab} onNavigate={setTab} />
       )}
+
+      {tab === "banda"      &&  <FinishedWarehouseBanda  onNavigate={setTab} />}
     </div>
   );
 }

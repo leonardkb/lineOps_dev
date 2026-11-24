@@ -76,7 +76,18 @@ function ChipGrid({ options, value, onChange, cols = "grid-cols-3 sm:grid-cols-5
   );
 }
 
-// Drop blank entries and duplicates from a line's fabric list.
+// Identity of a tela inside a line: name + code + consumo (rendimiento).
+// Same name and code with a different consumo is a DIFFERENT tela
+// (e.g. MONIQUE / MQE1200PQE / 0.15 vs MONIQUE / MQE1200PQE / 0.25).
+// The yield is normalised so "0.15" and "0.150" still count as the same.
+const normYield = (y) => {
+  const s = (y ?? "").toString().trim();
+  if (s === "" || isNaN(parseFloat(s))) return "";
+  return String(parseFloat(s));
+};
+const fabricKey = (f) => `${(f?.name || "").trim()}|${(f?.code || "").trim()}|${normYield(f?.yield)}`.toUpperCase();
+
+// Drop blank entries and exact duplicates (name + code + consumo) from a line's fabric list.
 function cleanFabrics(list) {
   const out = [];
   const seen = new Set();
@@ -85,7 +96,7 @@ function cleanFabrics(list) {
     if (!name) continue;
     const code = (f.code || "").trim() || null;
     const yieldVal = (f.yield ?? "").toString().trim();
-    const key = `${name}|${code || ""}`.toUpperCase();
+    const key = fabricKey({ name, code, yield: yieldVal });
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({ name, code, yield: yieldVal === "" ? null : yieldVal });
@@ -167,9 +178,9 @@ function buildPoPlan({ colorRows, sizes, fabricsFor, ratio = 1, withItemCode = f
         // packing y sku son piezas: se suman igual que la cantidad.
         dup.packingQty += cell.packingQty;
         dup.skuQty += cell.skuQty;
-        const seenTela = new Set(dup.fabrics.map((f) => `${f.name}|${f.code || ""}`.toUpperCase()));
+        const seenTela = new Set(dup.fabrics.map(fabricKey));
         for (const f of cell.fabrics || []) {
-          const k = `${f.name}|${f.code || ""}`.toUpperCase();
+          const k = fabricKey(f);
           if (!seenTela.has(k)) { seenTela.add(k); dup.fabrics = [...dup.fabrics, f]; }
         }
       } else {
@@ -179,13 +190,13 @@ function buildPoPlan({ colorRows, sizes, fabricsFor, ratio = 1, withItemCode = f
   }
 
   const firstOf = (cells, k) => cells.find((c) => c[k])?.[k] || null;
-  // Distinct name+code pairs across the PO's lines.
+  // Distinct telas (name + code + consumo) across the PO's lines.
   const mergeFabrics = (cells) => {
     const out = [];
     const seen = new Set();
     for (const c of cells) {
       for (const f of c.fabrics || []) {
-        const key = `${f.name}|${f.code || ""}`.toUpperCase();
+        const key = fabricKey(f);
         if (seen.has(key)) continue;
         seen.add(key);
         out.push(f);

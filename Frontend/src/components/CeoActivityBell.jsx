@@ -12,10 +12,14 @@
 //      (el CEO la activa una vez desde el panel de avisos).
 // La campana sigue igual: abre el historial completo.
 //
-// Fuentes: avisos del verificador (/api/ceo/verificador-activity) y cambios
+// Fuentes: avisos del verificador (/api/ceo/verificador-activity), cambios
 // urgentes del Plan Board en semanas bloqueadas (/api/ceo/urgent-changes,
-// ver plan-urgent-changes.js). Los ids de cambios urgentes llevan prefijo
-// "u-" para no chocar con los del verificador.
+// ver plan-urgent-changes.js) y etapas de las curvas de aprendizaje
+// (/api/ceo/learning-curve-events, ver learning-curves.js) y semanas
+// bloqueadas / desbloqueadas por el director de fábrica
+// (/api/ceo/week-lock-events, ver plan-week-locks.js). Los ids llevan prefijo
+// "u-" (urgentes), "lc-" (curvas) y "wl-" (semanas) para no chocar con los
+// del verificador.
 //
 // Uso (NavCeo.jsx):
 //   const activity = useVerificadorActivity();
@@ -47,17 +51,39 @@ function timeAgo(iso) {
   return new Date(t).toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" });
 }
 
-const ICON = { correction: "✏️", report_download: "📥", urgent_change: "⚡" };
+const ICON = {
+  correction: "✏️", report_download: "📥", urgent_change: "⚡", learning_curve: "📈",
+  week_lock: "🔒", week_unlock: "🔓",
+};
 const LABEL = {
   correction: "Corrección de producción",
   report_download: "Descarga de reporte",
   urgent_change: "Cambio urgente · semana bloqueada",
+  learning_curve: "Curva de aprendizaje",
+  week_lock: "Semana bloqueada · Director de fábrica",
+  week_unlock: "Semana desbloqueada · Director de fábrica",
 };
-const ACCENT = { correction: "border-l-amber-500", report_download: "border-l-blue-500", urgent_change: "border-l-orange-600" };
+const ACCENT = {
+  correction: "border-l-amber-500",
+  report_download: "border-l-blue-500",
+  urgent_change: "border-l-orange-600",
+  learning_curve: "border-l-sky-600",
+  week_lock: "border-l-red-600",
+  week_unlock: "border-l-emerald-600",
+};
+const isWeekLockAction = (a) => a === "week_lock" || a === "week_unlock";
 // Avisos con detalle desplegable.
 const hasDetail = (it) =>
-  (it.action === "correction" && (it.details?.changes || []).length > 0) || it.action === "urgent_change";
+  (it.action === "correction" && (it.details?.changes || []).length > 0) ||
+  it.action === "urgent_change" ||
+  it.action === "learning_curve" ||
+  isWeekLockAction(it.action);
+// Avisos cuyo detalle es una ficha (no la tabla de cambios del verificador).
+const hasCard = (it) => it.action === "urgent_change" || it.action === "learning_curve" || isWeekLockAction(it.action);
+const isCurve = (id) => String(id).startsWith("lc-");
 const isUrgent = (id) => String(id).startsWith("u-");
+const isWeekLock = (id) => String(id).startsWith("wl-");
+const sourceOf = (id) => (isCurve(id) ? "lc" : isUrgent(id) ? "u" : isWeekLock(id) ? "wl" : "v");
 
 const notifSupported = () => typeof window !== "undefined" && "Notification" in window;
 
@@ -84,29 +110,37 @@ export function useVerificadorActivity() {
         fetch(`${API_URL}${path}`, { headers: authHeaders() })
           .then((r) => r.json().catch(() => null))
           .catch(() => null);
-      const [data, urgent] = await Promise.all([
+      const [data, urgent, curves, weeks] = await Promise.all([
         get("/api/ceo/verificador-activity?limit=30"),
         get("/api/ceo/urgent-changes?limit=30"),
+        get("/api/ceo/learning-curve-events?limit=30"),
+        get("/api/ceo/week-lock-events?limit=30"),
       ]);
       const okV = !!data?.success;
       const okU = !!urgent?.success;
-      if (!okV && !okU) {
+      const okL = !!curves?.success;
+      const okW = !!weeks?.success;
+      if (!okV && !okU && !okL && !okW) {
         if (data?.error) setError(data.error);
         return;
       }
       setError("");
       // Si una fuente falla, se conserva lo que ya habia de ella.
-      const prevOf = (pred) => itemsRef.current.filter(pred);
-      const vList = okV ? data.items || [] : prevOf((i) => !isUrgent(i.id));
-      const uList = okU ? urgent.items || [] : prevOf((i) => isUrgent(i.id));
-      const list = [...vList, ...uList]
+      const prevOf = (src) => itemsRef.current.filter((i) => sourceOf(i.id) === src);
+      const vList = okV ? data.items || [] : prevOf("v");
+      const uList = okU ? urgent.items || [] : prevOf("u");
+      const lList = okL ? curves.items || [] : prevOf("lc");
+      const wList = okW ? weeks.items || [] : prevOf("wl");
+      const list = [...vList, ...uList, ...lList, ...wList]
         .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
         .slice(0, 50);
       itemsRef.current = list;
       setItems(list);
       const vUnread = okV ? Number(data.unread) || 0 : vList.filter((i) => i.unread).length;
       const uUnread = okU ? Number(urgent.unread) || 0 : uList.filter((i) => i.unread).length;
-      setUnread(vUnread + uUnread);
+      const lUnread = okL ? Number(curves.unread) || 0 : lList.filter((i) => i.unread).length;
+      const wUnread = okW ? Number(weeks.unread) || 0 : wList.filter((i) => i.unread).length;
+      setUnread(vUnread + uUnread + lUnread + wUnread);
 
       // Avisos nuevos desde la última consulta -> tarjeta + campana + SO.
       if (knownIds.current) {
@@ -122,8 +156,12 @@ export function useVerificadorActivity() {
                 ? `${fresh.length} avisos nuevos`
                 : first.action === "urgent_change"
                 ? `⚡ ${LABEL.urgent_change}`
+                : first.action === "learning_curve"
+                ? `📈 ${LABEL.learning_curve}`
+                : isWeekLockAction(first.action)
+                ? `${ICON[first.action]} ${LABEL[first.action]}`
                 : `Verificador: ${LABEL[first.action] || "aviso"}`,
-              { body: `${first.summary}\n${first.user_name || ""}`, tag: "ceo-activity", requireInteraction: first.action === "urgent_change" }
+              { body: `${first.summary}\n${first.user_name || ""}`, tag: "ceo-activity", requireInteraction: first.action === "urgent_change" || isWeekLockAction(first.action) }
             );
             n.onclick = () => {
               window.focus();
@@ -170,8 +208,12 @@ export function useVerificadorActivity() {
     if (wasUnread) setUnread((u) => Math.max(u - 1, 0));
     setToasts((prev) => prev.filter((t) => t.id !== id));
     try {
-      const url = isUrgent(id)
+      const url = isCurve(id)
+        ? `${API_URL}/api/ceo/learning-curve-events/${String(id).slice(3)}/seen`
+        : isUrgent(id)
         ? `${API_URL}/api/ceo/urgent-changes/${String(id).slice(2)}/seen`
+        : isWeekLock(id)
+        ? `${API_URL}/api/ceo/week-lock-events/${String(id).slice(3)}/seen`
         : `${API_URL}/api/ceo/verificador-activity/${id}/seen`;
       await fetch(url, { method: "POST", headers: authHeaders() });
     } catch {
@@ -187,6 +229,8 @@ export function useVerificadorActivity() {
       await Promise.all([
         fetch(`${API_URL}/api/ceo/verificador-activity/seen`, { method: "POST", headers: authHeaders() }),
         fetch(`${API_URL}/api/ceo/urgent-changes/seen`, { method: "POST", headers: authHeaders() }),
+        fetch(`${API_URL}/api/ceo/learning-curve-events/seen`, { method: "POST", headers: authHeaders() }),
+        fetch(`${API_URL}/api/ceo/week-lock-events/seen`, { method: "POST", headers: authHeaders() }),
       ]);
     } catch {
       load();
@@ -276,7 +320,7 @@ function UrgentDetail({ d = {} }) {
       <dt className="text-gray-500">Antes</dt>
       <dd className="text-gray-900">{side(d.from)}</dd>
       <dt className="text-gray-500">Ahora</dt>
-      <dd className="font-semibold text-gray-900">{side(d.to)} · {Math.round(d.movedQty || 0).toLocaleString()} pzas</dd>
+      <dd className="font-semibold text-gray-900">{side(d.to)} · {Math.round(d.placedQty ?? d.movedQty ?? 0).toLocaleString()} pzas{d.placedQty != null && d.placedQty !== d.movedQty ? ` (en lugar de ${Math.round(d.movedQty).toLocaleString()})` : ""}</dd>
       {d.sourceLeft > 0 && (
         <>
           <dt className="text-gray-500">Se quedan</dt>
@@ -299,6 +343,79 @@ function UrgentDetail({ d = {} }) {
           <dd className="text-orange-800">{d.warnings.join(" ")}</dd>
         </>
       )}
+    </dl>
+  );
+}
+
+// ======================================================================
+// Detalle de un aviso de curva de aprendizaje
+// ======================================================================
+const pctOf = (e) => (e == null ? "—" : `${Math.round(Number(e) * 100)}%`);
+const dmOf = (d) => (d ? `${String(d).slice(8, 10)}/${String(d).slice(5, 7)}/${String(d).slice(0, 4)}` : "—");
+const CURVE_EVENT = { created: "Curva creada", stage: "Cambio de etapa", completed: "Curva completada", cancelled: "Curva cancelada" };
+const CURVE_TYPE = { new: "Estilo nuevo", existing: "Estilo existente", custom: "Personalizada" };
+
+function CurveDetail({ d = {} }) {
+  const steps = Array.isArray(d.steps) ? d.steps : [];
+  return (
+    <div className="mt-2 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs">
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+        <dt className="text-gray-500">Estilo</dt>
+        <dd className="text-gray-900">{d.style} · Línea {d.lineNo}{d.curveType ? ` · ${CURVE_TYPE[d.curveType] || d.curveType}` : ""}</dd>
+        <dt className="text-gray-500">Evento</dt>
+        <dd className="text-gray-900">{CURVE_EVENT[d.event] || d.event}</dd>
+        {d.efficiency != null && (
+          <>
+            <dt className="text-gray-500">Eficiencia</dt>
+            <dd className="font-semibold text-gray-900">
+              {d.fromEfficiency != null ? `${pctOf(d.fromEfficiency)} → ` : ""}{pctOf(d.efficiency)}
+            </dd>
+          </>
+        )}
+        {d.day != null && (
+          <>
+            <dt className="text-gray-500">Día de curva</dt>
+            <dd className="text-gray-900">Día {d.day}{d.effectiveDate ? ` · ${dmOf(d.effectiveDate)}` : ""}</dd>
+          </>
+        )}
+      </dl>
+      {steps.length > 0 && (
+        <ol className="mt-2 flex gap-1" aria-label="Etapas">
+          {steps.map((s, i) => {
+            const on = d.stageIndex === i;
+            return (
+              <li key={i} className={`flex-1 rounded px-1 py-0.5 text-center tabular-nums ${on ? "bg-sky-700 text-white font-semibold" : "bg-white text-gray-700 border border-sky-200"}`}>
+                {pctOf(s.eff)}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+// ======================================================================
+// Detalle de un bloqueo / desbloqueo de semana por el director de fábrica
+// ======================================================================
+function WeekLockDetail({ action, d = {} }) {
+  const locking = action === "week_lock";
+  // Si después alguien la volvió a cambiar, se dice cómo está ahora.
+  const stillSo = d.lockedNow === locking;
+  return (
+    <dl className={`mt-2 rounded-md border px-3 py-2 text-xs grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 ${locking ? "border-red-200 bg-red-50" : "border-emerald-200 bg-emerald-50"}`}>
+      <dt className="text-gray-500">Semana</dt>
+      <dd className="text-gray-900">Sem {d.isoWeek} · {dmOf(d.weekStart)} – {dmOf(d.weekEnd)}</dd>
+      <dt className="text-gray-500">Acción</dt>
+      <dd className="font-semibold text-gray-900">{locking ? "🔒 Bloqueada" : "🔓 Desbloqueada"}</dd>
+      <dt className="text-gray-500">Por</dt>
+      <dd className="text-gray-900">{d.actorRoleLabel || "Director de fábrica"}</dd>
+      <dt className="text-gray-500">Nota</dt>
+      <dd className="text-gray-900">{d.note || "—"}</dd>
+      <dt className="text-gray-500">Ahora</dt>
+      <dd className={stillSo ? "text-gray-900" : "text-orange-800 font-semibold"}>
+        {d.lockedNow ? "Bloqueada" : "Desbloqueada"}{!stillSo && " (cambió después de este aviso)"}
+      </dd>
     </dl>
   );
 }
@@ -362,7 +479,7 @@ export default function CeoActivityBell({ activity }) {
             <div>
               <h3 className="font-semibold">Avisos</h3>
               <p className="text-xs text-gray-500">
-                {unread > 0 ? `${unread} sin ver` : "Todo visto"} · verificador y cambios urgentes del Plan Board
+                {unread > 0 ? `${unread} sin ver` : "Todo visto"} · verificador, cambios urgentes, curvas de aprendizaje y semanas bloqueadas
               </p>
             </div>
             {unread > 0 && (
@@ -412,7 +529,7 @@ export default function CeoActivityBell({ activity }) {
                             onClick={() => setExpandedId(isOpen ? null : it.id)}
                             className="text-xs text-blue-700 hover:underline cursor-pointer"
                           >
-                            {it.action === "urgent_change"
+                            {hasCard(it)
                               ? (isOpen ? "Ocultar detalle" : "Ver detalle")
                               : (isOpen ? "Ocultar cambios" : `Ver cambios (${changes.length})`)}
                           </button>
@@ -425,6 +542,10 @@ export default function CeoActivityBell({ activity }) {
                       </div>
                       {isOpen && (it.action === "urgent_change"
                         ? <UrgentDetail d={it.details} />
+                        : it.action === "learning_curve"
+                        ? <CurveDetail d={it.details} />
+                        : isWeekLockAction(it.action)
+                        ? <WeekLockDetail action={it.action} d={it.details} />
                         : <ChangeList changes={changes} />)}
                     </div>
                   </div>
@@ -505,7 +626,15 @@ export function CeoActivityToasts({ activity }) {
             <span aria-hidden className="text-xl leading-6">{ICON[t.action] || "🔔"}</span>
             <div className="min-w-0 flex-1">
               <p className="text-xs font-semibold text-red-600">
-                {t.action === "urgent_change" ? "⚡ Cambio urgente en semana bloqueada" : "Nuevo aviso del verificador"}
+                {t.action === "urgent_change"
+                  ? "⚡ Cambio urgente en semana bloqueada"
+                  : t.action === "learning_curve"
+                  ? "📈 Curva de aprendizaje"
+                  : t.action === "week_lock"
+                  ? "🔒 El director de fábrica bloqueó una semana"
+                  : t.action === "week_unlock"
+                  ? "🔓 El director de fábrica desbloqueó una semana"
+                  : "Nuevo aviso del verificador"}
               </p>
               <p className="text-sm font-semibold mt-0.5">{t.summary}</p>
               <p className="text-xs text-gray-500 mt-0.5">
@@ -518,7 +647,7 @@ export function CeoActivityToasts({ activity }) {
                     onClick={() => openItem(t.id)}
                     className="text-xs font-semibold px-3 py-1.5 rounded-md bg-gray-900 text-white hover:bg-gray-700 cursor-pointer"
                   >
-                    {t.action === "urgent_change" ? "Ver detalle" : "Ver cambios"}
+                    {hasCard(t) ? "Ver detalle" : "Ver cambios"}
                   </button>
                 )}
                 <button

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Plus, Search, ArrowRight, Trash2, Ban, ClipboardList, Package, Check } from "lucide-react";
+import { Plus, Search, ArrowRight, Trash2, Ban, ClipboardList, Package, Check, TrendingUp } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
 
 /* -----------------------------------------------------------------------
@@ -13,7 +13,16 @@ import { API_URL } from "../../lib/masterCodeCatalog";
  *    onCountsChange  ({pending, converted, cancelled, all}) tras cada carga
  *    onToast         (msg, isError) — si no viene, usa su propio toast
  *    showNewButton   muestra el botón "Nueva pre-orden" (default: true)
+ *
+ *  Pre-órdenes que vienen del PRONÓSTICO (el planner las manda desde el
+ *  tablero de pronóstico): llevan la etiqueta «Pronóstico FC####» y, mientras
+ *  no se hayan visto, se resaltan como «Nueva». Al mostrarse aquí se marcan
+ *  como vistas (POST /api/pre-orders/inbox/seen) y se avisa a la campana del
+ *  MerchantNavbar con el evento "preorders:inbox-changed". Se completan a PO
+ *  exactamente igual que las demás.
  * --------------------------------------------------------------------- */
+
+const INBOX_EVENT = "preorders:inbox-changed";
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
@@ -58,6 +67,9 @@ export default function PreOrdenesPanel({
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState(null);
   const [localToast, setLocalToast] = useState(null);
+  // Ids que llegaron sin ver en esta visita: se siguen resaltando aunque ya
+  // se hayan marcado como vistas en el servidor.
+  const [freshIds, setFreshIds] = useState(() => new Set());
 
   // Los callbacks del padre se guardan en refs: si entraran en las
   // dependencias de load(), un padre que se re-renderiza al recibir los
@@ -81,9 +93,21 @@ export default function PreOrdenesPanel({
       const res = await fetch(`${API_URL}/api/pre-orders?status=${tab}`, { headers: authHeaders() });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "No se pudieron cargar las pre-órdenes");
-      setRows(data.preOrders || []);
+      const list = data.preOrders || [];
+      setRows(list);
       setCounts(data.counts || {});
       onCountsRef.current?.(data.counts || {});
+
+      // Avisos del pronóstico que el merchant está viendo ahora → vistos.
+      const unseen = list.filter((r) => r.source_forecast_id && !r.merchant_seen_at).map((r) => r.id);
+      if (unseen.length) {
+        setFreshIds((prev) => new Set([...prev, ...unseen]));
+        fetch(`${API_URL}/api/pre-orders/inbox/seen`, {
+          method: "POST", headers: authHeaders(), body: JSON.stringify({ ids: unseen }),
+        })
+          .then(() => window.dispatchEvent(new Event(INBOX_EVENT)))
+          .catch(() => {});
+      }
     } catch (err) {
       toast(err.message, true);
       setRows([]);
@@ -98,7 +122,8 @@ export default function PreOrdenesPanel({
     const q = search.trim().toLowerCase();
     if (!q) return rows;
     return rows.filter((r) =>
-      [r.pre_order_no, r.style_code, r.estilo, r.customer_name, r.customer_po, r.style_description]
+      [r.pre_order_no, r.style_code, r.estilo, r.customer_name, r.customer_po, r.style_description,
+       r.source_forecast_no, r.source_style_name]
         .filter(Boolean)
         .some((v) => String(v).toLowerCase().includes(q))
     );
@@ -228,16 +253,38 @@ export default function PreOrdenesPanel({
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {visible.map((r) => (
-                  <tr key={r.id} className="hover:bg-slate-50/70">
+                  <tr key={r.id} className={freshIds.has(r.id) ? "bg-teal-50/60 hover:bg-teal-50" : "hover:bg-slate-50/70"}>
                     <td className="px-4 py-3">
-                      <p className="font-mono font-bold text-slate-800">{r.pre_order_no}</p>
+                      <div className="flex items-center gap-1.5">
+                        <p className="font-mono font-bold text-slate-800">{r.pre_order_no}</p>
+                        {freshIds.has(r.id) && (
+                          <span className="rounded-full bg-teal-600 px-1.5 py-px text-[10px] font-semibold text-white">Nueva</span>
+                        )}
+                      </div>
+                      {r.source_forecast_no && (
+                        <p className="mt-0.5 inline-flex items-center gap-1 rounded border border-teal-200 bg-white px-1.5 py-px text-[10px] font-semibold text-teal-700"
+                          title="Enviada por planeación desde el tablero de pronóstico">
+                          <TrendingUp size={10} /> Pronóstico {r.source_forecast_no}
+                        </p>
+                      )}
                       {r.customer_po && <p className="text-[11px] text-slate-400">PO {r.customer_po}</p>}
                     </td>
                     <td className="px-4 py-3">
-                      <p className="font-mono text-slate-800">{r.style_code || "—"}</p>
-                      <p className="text-[11px] text-slate-400">
-                        {r.estilo ? `estilo ${r.estilo}` : "estilo cliente pendiente"}
-                      </p>
+                      {r.style_code ? (
+                        <p className="font-mono text-slate-800">{r.style_code}</p>
+                      ) : r.source_style_name ? (
+                        <>
+                          <p className="text-slate-800">{r.source_style_name}</p>
+                          <p className="text-[11px] text-amber-600">código maestro pendiente</p>
+                        </>
+                      ) : (
+                        <p className="font-mono text-slate-800">—</p>
+                      )}
+                      {(r.style_code || !r.source_style_name) && (
+                        <p className="text-[11px] text-slate-400">
+                          {r.estilo ? `estilo ${r.estilo}` : "estilo cliente pendiente"}
+                        </p>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <p className="text-slate-800">{r.customer_name || "—"}</p>

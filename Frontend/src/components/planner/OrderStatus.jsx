@@ -22,7 +22,8 @@
 // Props:
 //   approverMode  true en la vista del CEO (PlannerAnalytics): cierra sin regla.
 
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState, useCallback } from "react";
+import { createPortal } from "react-dom";
 
 // ---------------------------------------------------------------------------
 // API — if your other planner components use a shared api helper, swap these
@@ -142,6 +143,8 @@ const DAY_STATE = {
   short: "border-rose-200 bg-rose-50 text-rose-600",
   today: "border-indigo-300 bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200",
   future: "border-gray-200 bg-white text-gray-600",
+  // Produccion reportada en un dia SIN asignacion en el tablero.
+  unplanned: "border-dashed border-sky-300 bg-sky-50 text-sky-700",
 };
 
 // ---------------------------------------------------------------------------
@@ -152,7 +155,9 @@ function buildRows(orders, assignments, balances, closeByOrder = new Map()) {
 
   // Produced per (order, line, day) from day-balances, when the server has it.
   const prodByCell = new Map();
+  const unplannedRows = [];
   for (const b of balances) {
+    if (b.unplanned) { unplannedRows.push(b); continue; }
     prodByCell.set(`${b.work_order_id}|${b.line_no}|${b.assigned_date}`, b);
   }
 
@@ -174,6 +179,22 @@ function buildRows(orders, assignments, balances, closeByOrder = new Map()) {
     days.set(date, cell);
   }
 
+  // Produccion fuera de plan: entra al desglose como celda con assigned = 0,
+  // para que la suma de las lineas cuadre con produced_quantity de la orden.
+  // Si la orden nunca tuvo asignacion en esa linea, la linea aparece igual.
+  for (const b of unplannedRows) {
+    const woId = Number(b.work_order_id);
+    const line = String(b.line_no ?? "").trim();
+    const date = ymd(b.assigned_date);
+    if (!line || !date) continue;
+    if (!planByOrder.has(woId)) planByOrder.set(woId, new Map());
+    const lines = planByOrder.get(woId);
+    if (!lines.has(line)) lines.set(line, new Map());
+    const days = lines.get(line);
+    if (days.has(date)) continue; // ya hay celda planeada ese dia: no duplicar
+    days.set(date, { date, assigned: 0, colors: new Set(), unplanned: true, unplannedQty: Number(b.produced) || 0 });
+  }
+
   return orders
     .filter((o) => o.status !== "cancelled")
     .map((o) => {
@@ -186,6 +207,9 @@ function buildRows(orders, assignments, balances, closeByOrder = new Map()) {
         const days = [...lineMap.get(line).values()]
           .sort((a, b) => a.date.localeCompare(b.date))
           .map((c) => {
+            if (c.unplanned) {
+              return { ...c, colors: [], produced: c.unplannedQty, hasProd: true, state: "unplanned" };
+            }
             const bal = prodByCell.get(`${id}|${line}|${c.date}`);
             const prod = bal ? Number(bal.produced) || 0 : 0;
             const state = c.date === today ? "today"
@@ -196,13 +220,18 @@ function buildRows(orders, assignments, balances, closeByOrder = new Map()) {
           });
         const assigned = days.reduce((s, d) => s + d.assigned, 0);
         const lineProduced = days.reduce((s, d) => s + d.produced, 0);
+        // Inicio / fin / dias son del PLAN: los dias fuera de plan no deben
+        // mover el fin de plan ni la fecha de entrega calculada.
+        const planDays = days.filter((d) => !d.unplanned);
         return {
           line,
           days,
+          planDayCount: planDays.length,
           assigned,
           produced: lineProduced,
-          start: days[0]?.date || null,
-          end: days[days.length - 1]?.date || null,
+          unplannedProduced: days.reduce((s, d) => s + (d.unplanned ? d.produced : 0), 0),
+          start: planDays[0]?.date || null,
+          end: planDays[planDays.length - 1]?.date || null,
         };
       });
 
@@ -370,104 +399,241 @@ function CloseBar({ row, onComplete, approverMode }) {
   );
 }
 
-function LineDetail({ row, onOpenPhoto, onComplete, approverMode }) {
+// ---------------------------------------------------------------------------
+// Side panel with the full detail of one order (opens when a row is clicked).
+// Esc closes it; ↑/↓ or the arrow buttons move to the previous / next order
+// of the current list.
+// ---------------------------------------------------------------------------
+function Fact({ label, children, className = "" }) {
   return (
-    <div className="border-t border-gray-100 bg-gray-50/70 px-5 pt-4">
-    <CloseBar row={row} onComplete={onComplete} approverMode={approverMode} />
-    <div className="grid gap-5 py-4 md:grid-cols-[180px_1fr]">
-      {/* Merchant photo + order facts */}
-      <div className="space-y-3">
-        {row.photo ? (
-          <Thumb src={row.photo} alt={row.no} onOpen={onOpenPhoto} size="h-44 w-full" />
-        ) : (
-          <div className="flex h-44 w-full flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-gray-200 bg-white text-xs text-gray-400">
-            <IconImage className="h-6 w-6" />
-            Sin foto del merchant
-          </div>
-        )}
-        <dl className="space-y-1 text-xs">
-          {row.description && (<div><dt className="text-gray-400">Descripción</dt><dd className="text-gray-700">{row.description}</dd></div>)}
-          {row.merchant && (<div><dt className="text-gray-400">Merchant</dt><dd className="text-gray-700">{row.merchant}</dd></div>)}
-          {row.raw.fabric_name && (<div><dt className="text-gray-400">Tela</dt><dd className="text-gray-700">{row.raw.fabric_name}</dd></div>)}
-          {Array.isArray(row.raw.colors) && row.raw.colors.length > 0 && (
-            <div>
-              <dt className="text-gray-400">Colores</dt>
-              <dd className="text-gray-700">{row.raw.colors.map((c) => `${c.color} (${fmtN(c.quantity)})`).join(", ")}</dd>
-            </div>
-          )}
-        </dl>
-      </div>
-
-      {/* Per-line breakdown */}
-      <div className="min-w-0">
-        <div className="mb-3 flex flex-wrap items-baseline gap-x-5 gap-y-1 text-xs text-gray-500">
-          <span>Total <b className="text-gray-800">{fmtN(row.total)}</b></span>
-          <span>Asignado <b className="text-gray-800">{fmtN(row.assigned)}</b></span>
-          <span>Producido <b className="text-gray-800">{fmtN(row.produced)}</b></span>
-          {row.unassigned > 0 && (
-            <span className="rounded-md bg-amber-50 px-2 py-0.5 font-medium text-amber-700">
-              Sin asignar {fmtN(row.unassigned)} pzas
-            </span>
-          )}
-        </div>
-
-        {row.lines.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-gray-200 bg-white px-4 py-6 text-center text-sm text-gray-500">
-            Esta orden aún no está en ninguna línea. Asígnela desde el Plan Board.
-          </div>
-        ) : (
-          <div className="space-y-2">
-            {row.lines.map((l) => {
-              const linePct = l.assigned > 0 ? (l.produced / l.assigned) * 100 : 0;
-              const lateLine = row.commit && l.end && l.end > row.commit;
-              return (
-                <div key={l.line} className="rounded-lg border border-gray-200 bg-white p-3">
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                    <span className="inline-flex h-7 min-w-[2.5rem] items-center justify-center rounded-md bg-gray-900 px-2 text-xs font-semibold text-white">
-                      {lineLabel(l.line)}
-                    </span>
-                    <div className="text-xs text-gray-500">
-                      <span className="text-gray-800">{fmtShort(l.start)} – {fmtShort(l.end)}</span>
-                      {" "}({l.days.length} {l.days.length === 1 ? "día" : "días"})
-                      {lateLine && <span className="ml-2 font-medium text-rose-600">termina después de la entrega</span>}
-                    </div>
-                    <div className="ml-auto flex w-full items-center gap-3 sm:w-64">
-                      <span className="whitespace-nowrap text-xs text-gray-500">
-                        {fmtN(l.produced)} / {fmtN(l.assigned)}
-                      </span>
-                      <Bar pct={linePct} />
-                      <span className="w-9 text-right text-xs font-medium text-gray-700">{Math.round(linePct)}%</span>
-                    </div>
-                  </div>
-
-                  {/* Day strip */}
-                  <div className="mt-2.5 flex flex-wrap gap-1.5">
-                    {l.days.map((d) => (
-                      <div
-                        key={d.date}
-                        className={`rounded-md border px-2 py-1 text-[11px] leading-tight ${DAY_STATE[d.state]}`}
-                        title={`${fmtDate(d.date)} · asignado ${fmtN(d.assigned)}${d.hasProd ? ` · producido ${fmtN(d.produced)}` : ""}${d.colors.length ? ` · ${d.colors.join(", ")}` : ""}`}
-                      >
-                        <div className="font-medium">{fmtShort(d.date)}</div>
-                        <div className="tabular-nums">
-                          {d.hasProd || d.state === "today" ? `${fmtN(d.produced)}/` : ""}{fmtN(d.assigned)}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-            <div className="flex flex-wrap gap-3 pt-1 text-[11px] text-gray-400">
-              <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm bg-emerald-400" />Día cumplido</span>
-              <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm bg-rose-400" />Día con saldo</span>
-              <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm bg-indigo-400" />Hoy</span>
-              <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm border border-gray-300 bg-white" />Programado</span>
-            </div>
-          </div>
-        )}
-      </div>
+    <div className={`min-w-0 ${className}`}>
+      <dt className="text-[11px] uppercase tracking-wide text-gray-400">{label}</dt>
+      <dd className="mt-0.5 text-sm text-gray-800">{children}</dd>
     </div>
+  );
+}
+
+function OrderPanel({ row, onClose, onPrev, onNext, position, onOpenPhoto, onComplete, approverMode }) {
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  // Keyboard: Esc closes, ↑/↓ move between orders. Ignored while another
+  // dialog (close-order modal, photo lightbox) sits on top.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (document.querySelector("[data-os-overlay]")) return;
+      const tag = e.target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.key === "Escape") onClose();
+      else if (e.key === "ArrowUp" && onPrev) { e.preventDefault(); onPrev(); }
+      else if (e.key === "ArrowDown" && onNext) { e.preventDefault(); onNext(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, onPrev, onNext]);
+
+  // Lock page scroll behind the panel.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
+  const d = DELIVERY[row.delivery];
+  const p = PROGRESS[row.progress];
+  const navBtn = "rounded-md p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 disabled:opacity-30 disabled:hover:bg-transparent";
+
+  return (
+    <div className="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-label={`Detalle de ${row.no}`}>
+      <div
+        className={`absolute inset-0 bg-gray-900/30 transition-opacity duration-200 ${shown ? "opacity-100" : "opacity-0"}`}
+        onClick={onClose}
+      />
+      <aside
+        className={`absolute inset-y-0 right-0 flex w-full max-w-[640px] flex-col bg-white shadow-2xl transition-transform duration-200 ease-out ${
+          shown ? "translate-x-0" : "translate-x-full"
+        }`}
+      >
+        {/* Header */}
+        <header className="flex items-start gap-3 border-b border-gray-100 px-5 py-4">
+          <span className={`mt-1 h-10 w-1 shrink-0 rounded-full ${d.strip}`} aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="truncate font-mono text-base font-bold text-gray-900">{row.no}</h2>
+              <span className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${p.cls}`}>{p.label}</span>
+              <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${d.pill}`}>
+                <d.Icon className="h-3 w-3" />
+                {d.label}
+              </span>
+            </div>
+            <p className="mt-0.5 truncate text-xs text-gray-500">
+              {[row.customer, row.po && `PO ${row.po}`, row.style].filter(Boolean).join(" · ")}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-0.5">
+            {position && <span className="mr-1 text-[11px] tabular-nums text-gray-400">{position}</span>}
+            <button type="button" onClick={onPrev} disabled={!onPrev} className={navBtn} aria-label="Orden anterior" title="Anterior (↑)">
+              <IconChevron className="h-4 w-4 -rotate-90" />
+            </button>
+            <button type="button" onClick={onNext} disabled={!onNext} className={navBtn} aria-label="Orden siguiente" title="Siguiente (↓)">
+              <IconChevron className="h-4 w-4 rotate-90" />
+            </button>
+            <button type="button" onClick={onClose} className={`${navBtn} ml-1`} aria-label="Cerrar" title="Cerrar (Esc)">
+              <IconX className="h-5 w-5" />
+            </button>
+          </div>
+        </header>
+
+        {/* Body */}
+        <div className="flex-1 space-y-5 overflow-y-auto px-5 py-5">
+          <CloseBar row={row} onComplete={onComplete} approverMode={approverMode} />
+
+          {/* Photo + facts */}
+          <section className="grid gap-4 sm:grid-cols-[160px_1fr]">
+            {row.photo ? (
+              <Thumb src={row.photo} alt={row.no} onOpen={onOpenPhoto} size="h-40 w-full" />
+            ) : (
+              <div className="flex h-40 w-full flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-gray-200 bg-gray-50 text-xs text-gray-400">
+                <IconImage className="h-6 w-6" />
+                Sin foto del merchant
+              </div>
+            )}
+            <dl className="grid grid-cols-2 content-start gap-x-4 gap-y-3">
+              <Fact label="Entrega merchant">{fmtDate(row.commit)}</Fact>
+              <Fact label="Fin de plan">
+                {row.planEnd ? fmtDate(row.planEnd) : "—"}
+                {row.planStart && <span className="block text-[11px] text-gray-400">inicia {fmtDate(row.planStart)}</span>}
+              </Fact>
+              <Fact label="Δ días">
+                <span className={`font-semibold tabular-nums ${row.delta == null ? "text-gray-300" : row.delta > 0 ? "text-rose-600" : "text-emerald-600"}`}>
+                  {row.delta == null ? "—" : row.delta > 0 ? `+${row.delta}` : row.delta}
+                </span>
+              </Fact>
+              {row.merchant && <Fact label="Merchant">{row.merchant}</Fact>}
+              {row.description && <Fact label="Descripción" className="col-span-2">{row.description}</Fact>}
+              {row.raw.fabric_name && <Fact label="Tela" className="col-span-2">{row.raw.fabric_name}</Fact>}
+              {Array.isArray(row.raw.colors) && row.raw.colors.length > 0 && (
+                <Fact label="Colores" className="col-span-2">
+                  <span className="flex flex-wrap gap-1">
+                    {row.raw.colors.map((c) => (
+                      <span key={c.color} className="rounded-md bg-gray-100 px-1.5 py-0.5 text-xs text-gray-700">
+                        {c.color} <span className="text-gray-400">{fmtN(c.quantity)}</span>
+                      </span>
+                    ))}
+                  </span>
+                </Fact>
+              )}
+            </dl>
+          </section>
+
+          {/* Quantities */}
+          <section className="rounded-xl border border-gray-200 p-4">
+            <div className="mb-3 flex items-baseline justify-between">
+              <h3 className="text-sm font-semibold text-gray-900">Avance</h3>
+              <span className="text-sm font-semibold tabular-nums text-gray-700">{Math.round(row.pct)}%</span>
+            </div>
+            <Bar pct={row.pct} tone={row.progress === "completed" ? "bg-emerald-500" : "bg-indigo-500"} />
+            <div className="mt-3 grid grid-cols-3 gap-3 text-center">
+              {[
+                ["Total", row.total],
+                ["Asignado", row.assigned],
+                ["Producido", row.produced],
+              ].map(([k, v]) => (
+                <div key={k} className="rounded-lg bg-gray-50 py-2">
+                  <div className="text-[11px] text-gray-400">{k}</div>
+                  <div className="text-sm font-semibold tabular-nums text-gray-800">{fmtN(v)}</div>
+                </div>
+              ))}
+            </div>
+            {row.unassigned > 0 && (
+              <p className="mt-3 rounded-md bg-amber-50 px-2.5 py-1.5 text-xs font-medium text-amber-700">
+                Sin asignar {fmtN(row.unassigned)} pzas
+              </p>
+            )}
+          </section>
+
+          {/* Per-line breakdown */}
+          <section>
+            <h3 className="mb-2 text-sm font-semibold text-gray-900">
+              Líneas {row.lines.length > 0 && <span className="font-normal text-gray-400">({row.lines.length})</span>}
+            </h3>
+            {row.lines.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-4 py-6 text-center text-sm text-gray-500">
+                Esta orden aún no está en ninguna línea. Asígnela desde el Plan Board.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {row.lines.map((l) => {
+                  const linePct = l.assigned > 0 ? (l.produced / l.assigned) * 100 : 0;
+                  const lateLine = row.commit && l.end && l.end > row.commit;
+                  return (
+                    <div key={l.line} className="rounded-lg border border-gray-200 p-3">
+                      <div className="flex items-center gap-3">
+                        <span className="inline-flex h-7 min-w-[2.5rem] items-center justify-center rounded-md bg-gray-900 px-2 text-xs font-semibold text-white">
+                          {lineLabel(l.line)}
+                        </span>
+                        <div className="min-w-0 flex-1 text-xs text-gray-500">
+                          {l.planDayCount > 0 ? (
+                            <>
+                              <span className="text-gray-800">{fmtShort(l.start)} – {fmtShort(l.end)}</span>
+                              {" "}({l.planDayCount} {l.planDayCount === 1 ? "día" : "días"})
+                            </>
+                          ) : (
+                            <span className="text-gray-800">Sin asignación en el tablero</span>
+                          )}
+                        </div>
+                        <span className="whitespace-nowrap text-xs tabular-nums text-gray-500">
+                          {fmtN(l.produced)} / {fmtN(l.assigned)}
+                        </span>
+                        <span className="w-9 text-right text-xs font-medium text-gray-700">{Math.round(linePct)}%</span>
+                      </div>
+                      <div className="mt-2"><Bar pct={linePct} /></div>
+                      {(lateLine || l.unplannedProduced > 0) && (
+                        <div className="mt-1.5 flex flex-wrap gap-x-3 text-xs">
+                          {lateLine && <span className="font-medium text-rose-600">termina después de la entrega</span>}
+                          {l.unplannedProduced > 0 && (
+                            <span className="font-medium text-sky-700">+{fmtN(l.unplannedProduced)} fuera de plan</span>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Day strip */}
+                      <div className="mt-2.5 flex flex-wrap gap-1.5">
+                        {l.days.map((d) => (
+                          <div
+                            key={d.date}
+                            className={`rounded-md border px-2 py-1 text-[11px] leading-tight ${DAY_STATE[d.state]}`}
+                            title={d.unplanned
+                              ? `${fmtDate(d.date)} · producido ${fmtN(d.produced)} sin asignación en el tablero`
+                              : `${fmtDate(d.date)} · asignado ${fmtN(d.assigned)}${d.hasProd ? ` · producido ${fmtN(d.produced)}` : ""}${d.colors.length ? ` · ${d.colors.join(", ")}` : ""}`}
+                          >
+                            <div className="font-medium">{fmtShort(d.date)}</div>
+                            <div className="tabular-nums">
+                              {d.unplanned
+                                ? `+${fmtN(d.produced)}`
+                                : <>{d.hasProd || d.state === "today" ? `${fmtN(d.produced)}/` : ""}{fmtN(d.assigned)}</>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+                <div className="flex flex-wrap gap-3 pt-1 text-[11px] text-gray-400">
+                  <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm bg-emerald-400" />Día cumplido</span>
+                  <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm bg-rose-400" />Día con saldo</span>
+                  <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm bg-indigo-400" />Hoy</span>
+                  <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm border border-gray-300 bg-white" />Programado</span>
+                  <span className="inline-flex items-center gap-1"><i className="h-2 w-2 rounded-sm border border-dashed border-sky-400 bg-sky-50" />Fuera de plan</span>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      </aside>
     </div>
   );
 }
@@ -545,6 +711,7 @@ function CloseOrderModal({ row, onClose, onDone }) {
 
   return (
     <div
+      data-os-overlay
       className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900/50 p-4"
       onClick={() => !busy && onClose()}
       role="dialog"
@@ -677,6 +844,55 @@ function CloseOrderModal({ row, onClose, onDone }) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+// ── KPI cards ──────────────────────────────────────────────────────
+// One card per bucket. Clicking a card applies that filter to the table;
+// clicking the active card clears it again.
+const KPI_TONE = {
+  emerald: { text: "text-emerald-600", bar: "bg-emerald-500", ring: "ring-emerald-300 border-emerald-300", icon: "bg-emerald-50 text-emerald-600" },
+  rose: { text: "text-rose-600", bar: "bg-rose-500", ring: "ring-rose-300 border-rose-300", icon: "bg-rose-50 text-rose-600" },
+  amber: { text: "text-amber-600", bar: "bg-amber-400", ring: "ring-amber-300 border-amber-300", icon: "bg-amber-50 text-amber-600" },
+  indigo: { text: "text-indigo-600", bar: "bg-indigo-500", ring: "ring-indigo-300 border-indigo-300", icon: "bg-indigo-50 text-indigo-600" },
+  slate: { text: "text-gray-700", bar: "bg-gray-400", ring: "ring-gray-300 border-gray-300", icon: "bg-gray-100 text-gray-600" },
+};
+
+function KpiCard({ label, value, total, tone, Icon, active, onClick }) {
+  const t = KPI_TONE[tone];
+  const pct = total > 0 ? Math.round((value / total) * 100) : 0;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      title={active ? "Quitar filtro" : `Filtrar: ${label}`}
+      className={`flex min-w-0 flex-col gap-1 rounded-lg border bg-white px-3 py-2 text-left transition hover:border-gray-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 ${
+        active ? `ring-2 ${t.ring}` : "border-gray-200"
+      }`}
+    >
+      <span className="flex items-center gap-1.5 truncate text-xs text-gray-500">
+        <Icon className={`h-3.5 w-3.5 shrink-0 ${t.text}`} />
+        {label}
+      </span>
+      <span className="flex items-baseline gap-1.5">
+        <span className={`text-xl font-semibold leading-none tabular-nums ${t.text}`}>{fmtN(value)}</span>
+        <span className="text-[11px] text-gray-400 tabular-nums">{pct}%</span>
+      </span>
+      <span className="h-1 overflow-hidden rounded-full bg-gray-100">
+        <span className={`block h-full rounded-full ${t.bar}`} style={{ width: `${pct}%` }} />
+      </span>
+    </button>
+  );
+}
+
+// The page shell can expose an element with this id next to the
+// "Planificación Avanzada" title; the KPIs render there when it exists,
+// otherwise they render at the top of this tab.
+const KPI_SLOT_ID = "planning-header-kpis";
+function useHeaderSlot() {
+  const [slot, setSlot] = useState(null);
+  useLayoutEffect(() => { setSlot(document.getElementById(KPI_SLOT_ID)); }, []);
+  return slot;
+}
+
 export default function OrderStatus({ approverMode = false } = {}) {
   const [orders, setOrders] = useState([]);
   const [assignments, setAssignments] = useState([]);
@@ -687,12 +903,12 @@ export default function OrderStatus({ approverMode = false } = {}) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const [deliveryFilter, setDeliveryFilter] = useState("all"); // all | open | late | unplanned
+  const [deliveryFilter, setDeliveryFilter] = useState("all"); // all | open | ontime | late | unplanned
   const [progressFilter, setProgressFilter] = useState("all"); // all | pending | in_progress | completed
   const [lineFilter, setLineFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [worst, setWorst] = useState(true);
-  const [expanded, setExpanded] = useState(() => new Set());
+  const [selectedId, setSelectedId] = useState(null);
   const [lightbox, setLightbox] = useState(null);
 
   const load = useCallback(async () => {
@@ -701,7 +917,9 @@ export default function OrderStatus({ approverMode = false } = {}) {
     const [wo, la, db, cr] = await Promise.allSettled([
       getJson("/api/work-orders"),
       getJson("/api/line-assignments"),
-      getJson("/api/line-assignments/day-balances"),
+      // includeUnplanned: tambien lo producido en dias sin asignacion, para que
+      // el desglose por linea cuadre con el Producido de la orden.
+      getJson("/api/line-assignments/day-balances?includeUnplanned=true"),
       getJson("/api/work-order-close-requests?kind=request&status=pending,rejected&limit=500"),
     ]);
     if (wo.status === "fulfilled") setOrders(wo.value.workOrders || []);
@@ -755,8 +973,8 @@ export default function OrderStatus({ approverMode = false } = {}) {
   };
 
   const counts = useMemo(() => {
-    const c = { ontime: 0, late: 0, unplanned: 0 };
-    for (const r of rows) c[r.delivery] += 1;
+    const c = { ontime: 0, late: 0, unplanned: 0, pending: 0, in_progress: 0, completed: 0 };
+    for (const r of rows) { c[r.delivery] += 1; c[r.progress] += 1; }
     return c;
   }, [rows]);
 
@@ -771,6 +989,7 @@ export default function OrderStatus({ approverMode = false } = {}) {
     return rows
       .filter((r) => {
         if (deliveryFilter === "open" && r.progress === "completed") return false;
+        if (deliveryFilter === "ontime" && r.delivery !== "ontime") return false;
         if (deliveryFilter === "late" && r.delivery !== "late") return false;
         if (deliveryFilter === "unplanned" && r.delivery !== "unplanned") return false;
         if (progressFilter !== "all" && r.progress !== progressFilter) return false;
@@ -785,17 +1004,62 @@ export default function OrderStatus({ approverMode = false } = {}) {
       .sort(worst ? worstFirst : byDelivery);
   }, [rows, deliveryFilter, progressFilter, lineFilter, search, worst]);
 
-  const toggle = (id) => setExpanded((prev) => {
-    const next = new Set(prev);
-    next.has(id) ? next.delete(id) : next.add(id);
-    return next;
-  });
+  // Side panel: look the row up by id so it stays fresh after a reload.
+  const toggle = (id) => setSelectedId((cur) => (cur === id ? null : id));
+  const selectedIdx = selectedId == null ? -1 : visible.findIndex((r) => r.id === selectedId);
+  const selectedRow = selectedIdx >= 0
+    ? visible[selectedIdx]
+    : rows.find((r) => r.id === selectedId) || null;
+  const closePanel = useCallback(() => setSelectedId(null), []);
+  const goPrev = selectedIdx > 0 ? () => setSelectedId(visible[selectedIdx - 1].id) : null;
+  const goNext = selectedIdx >= 0 && selectedIdx < visible.length - 1
+    ? () => setSelectedId(visible[selectedIdx + 1].id)
+    : null;
+
+  // Keep the selected row in view while stepping through orders.
+  useEffect(() => {
+    if (selectedId == null) return;
+    document.querySelector(`[data-order-row="${selectedId}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [selectedId]);
 
   const openPhoto = (src, alt) => setLightbox({ src, alt });
   const totalCount = counts.ontime + counts.late + counts.unplanned || 1;
+  const headerSlot = useHeaderSlot();
+  const kpis = (
+    <div className="grid w-full grid-cols-3 gap-2 lg:grid-cols-6">
+      {[
+        { key: "ontime", group: "delivery", label: "A tiempo", tone: "emerald", Icon: IconCheck },
+        { key: "late", group: "delivery", label: "Atrasadas", tone: "rose", Icon: IconAlert },
+        { key: "unplanned", group: "delivery", label: "Por planear", tone: "amber", Icon: IconClock },
+        { key: "completed", group: "progress", label: "Completadas", tone: "emerald", Icon: IconCheck },
+        { key: "in_progress", group: "progress", label: "En proceso", tone: "indigo", Icon: IconLoader },
+        { key: "pending", group: "progress", label: "Pendientes", tone: "slate", Icon: IconCalendar },
+      ].map((k) => {
+        const isDelivery = k.group === "delivery";
+        const current = isDelivery ? deliveryFilter : progressFilter;
+        const set = isDelivery ? setDeliveryFilter : setProgressFilter;
+        const active = current === k.key;
+        return (
+          <KpiCard
+            key={k.key}
+            label={k.label}
+            value={counts[k.key]}
+            total={rows.length}
+            tone={k.tone}
+            Icon={k.Icon}
+            active={active}
+            onClick={() => set(active ? "all" : k.key)}
+          />
+        );
+      })}
+    </div>
+  );
+
 
   return (
     <div className="space-y-3">
+      {headerSlot ? createPortal(kpis, headerSlot) : kpis}
+
       {/* Summary bar */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <div className="flex h-2 min-w-[200px] flex-1 overflow-hidden rounded-full bg-gray-100">
@@ -804,12 +1068,6 @@ export default function OrderStatus({ approverMode = false } = {}) {
           <div className="bg-amber-400" style={{ width: `${(counts.unplanned / totalCount) * 100}%` }} />
         </div>
         <div className="flex flex-wrap items-center gap-4 text-xs text-gray-500">
-          {["ontime", "late", "unplanned"].map((k) => (
-            <span key={k} className="inline-flex items-center gap-1.5">
-              <i className={`h-2 w-2 rounded-full ${DELIVERY[k].dot}`} />
-              {DELIVERY[k].label} <b className="text-gray-800">{counts[k]}</b>
-            </span>
-          ))}
           <span className="inline-flex items-center gap-1">
             <IconInfo className="h-3.5 w-3.5" />
             El fin de plan debe caer <b className="text-gray-700">antes o el mismo día</b> que la entrega del merchant.
@@ -825,6 +1083,7 @@ export default function OrderStatus({ approverMode = false } = {}) {
           options={[
             { id: "all", label: "Todas" },
             { id: "open", label: "Abiertas" },
+            { id: "ontime", label: "A tiempo" },
             { id: "late", label: "Atrasadas" },
             { id: "unplanned", label: "Por planear" },
           ]}
@@ -906,23 +1165,24 @@ export default function OrderStatus({ approverMode = false } = {}) {
             {visible.map((r) => {
               const d = DELIVERY[r.delivery];
               const p = PROGRESS[r.progress];
-              const open = expanded.has(r.id);
+              const open = selectedId === r.id;
               return (
-                <div key={r.id} className="relative border-b border-gray-100 last:border-b-0">
+                <div key={r.id} data-order-row={r.id} className="relative border-b border-gray-100 last:border-b-0">
                   <span className={`absolute inset-y-0 left-0 w-1 ${d.strip}`} aria-hidden="true" />
                   <div
                     role="button"
                     tabIndex={0}
                     onClick={() => toggle(r.id)}
                     onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), toggle(r.id))}
-                    aria-expanded={open}
+                    aria-haspopup="dialog"
+                    aria-pressed={open}
                     className={`grid cursor-pointer grid-cols-[minmax(300px,2.4fr)_minmax(110px,0.9fr)_minmax(170px,1.3fr)_120px_120px_80px_130px] items-center gap-4 px-5 py-3 transition-colors focus:outline-none focus-visible:bg-indigo-50/40 ${
-                      open ? "bg-gray-50" : "hover:bg-gray-50/70"
+                      open ? "bg-indigo-50/60" : "hover:bg-gray-50/70"
                     }`}
                   >
                     {/* Orden */}
                     <div className="flex min-w-0 items-center gap-3">
-                      <IconChevron className={`h-4 w-4 shrink-0 text-gray-300 transition-transform ${open ? "rotate-90 text-gray-500" : ""}`} />
+                      <IconChevron className={`h-4 w-4 shrink-0 transition-colors ${open ? "text-indigo-500" : "text-gray-300"}`} />
                       <Thumb src={r.photo} alt={r.no} onOpen={openPhoto} />
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
@@ -947,15 +1207,15 @@ export default function OrderStatus({ approverMode = false } = {}) {
                       {r.lines.length === 0 ? (
                         <span className="text-xs text-gray-300">Sin línea</span>
                       ) : (
-                        r.lines.slice(0, 4).map((l) => (
+                        r.lines.slice(0, 6).map((l) => (
                           <span key={l.line} className="rounded-md border border-gray-200 bg-gray-50 px-1.5 py-0.5 text-[11px] font-semibold text-gray-700"
                                 title={`${lineLabel(l.line)}: ${fmtN(l.assigned)} pzas, ${fmtShort(l.start)} – ${fmtShort(l.end)}`}>
                             {lineLabel(l.line)}
                           </span>
                         ))
                       )}
-                      {r.lines.length > 4 && (
-                        <span className="px-1 text-[11px] text-gray-400">+{r.lines.length - 4}</span>
+                      {r.lines.length > 6 && (
+                        <span className="px-1 text-[11px] text-gray-400">+{r.lines.length - 6}</span>
                       )}
                     </div>
 
@@ -991,15 +1251,25 @@ export default function OrderStatus({ approverMode = false } = {}) {
                     </div>
                   </div>
 
-                  {open && (
-                    <LineDetail row={r} onOpenPhoto={openPhoto} onComplete={setClosing} approverMode={approverMode} />
-                  )}
                 </div>
               );
             })}
           </div>
         </div>
       </div>
+
+      {selectedRow && (
+        <OrderPanel
+          row={selectedRow}
+          onClose={closePanel}
+          onPrev={goPrev}
+          onNext={goNext}
+          position={selectedIdx >= 0 ? `${selectedIdx + 1} / ${visible.length}` : null}
+          onOpenPhoto={openPhoto}
+          onComplete={setClosing}
+          approverMode={approverMode}
+        />
+      )}
 
       {closing && (
         <CloseOrderModal row={closing} onClose={() => setClosing(null)} onDone={onCloseDone} />
@@ -1014,6 +1284,7 @@ export default function OrderStatus({ approverMode = false } = {}) {
       {/* Photo lightbox */}
       {lightbox && (
         <div
+          data-os-overlay
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
           onClick={() => setLightbox(null)}
           role="dialog"

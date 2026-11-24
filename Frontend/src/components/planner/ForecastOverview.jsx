@@ -2,7 +2,7 @@
 //
 // Analíticas de Planeación → «Resumen de pronóstico».
 // Vista analítica del Tablero de pronóstico (pronósticos FC#### del cliente):
-//   • KPIs: pronósticos, clientes, piezas, % en tablero, convertido a SKM,
+//   • KPIs: pronósticos, clientes, piezas, % en tablero, enviado a pre-orden / SKM,
 //     atrasados, fecha en que termina todo, líneas ocupadas.
 //   • Por cliente: piezas, avance, cuándo termina y cuántos días faltan.
 //   • Carga por línea: pronósticos, piezas, días ocupados, ocupada hasta.
@@ -19,6 +19,7 @@ import {
   ArrowRightLeft, Loader2, Search, BarChart3, RefreshCw, CalendarDays,
 } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
+import { colorForForecast } from "../../lib/workOrderColors";
 
 const authHeaders = () => ({ Authorization: `Bearer ${localStorage.getItem("token")}` });
 async function getJSON(path, retries = 2) {
@@ -59,7 +60,7 @@ const ST = {
   ontime:    { label: "A tiempo",        chip: "bg-emerald-50 text-emerald-700 ring-emerald-600/20", bar: "bg-emerald-500" },
   partial:   { label: "Parcial en tablero", chip: "bg-amber-50 text-amber-700 ring-amber-600/20",    bar: "bg-amber-400" },
   unplanned: { label: "Por cargar",      chip: "bg-gray-100 text-gray-600 ring-gray-500/20",         bar: "bg-gray-300" },
-  converted: { label: "Convertido a SKM", chip: "bg-indigo-50 text-indigo-700 ring-indigo-600/20",   bar: "bg-indigo-500" },
+  converted: { label: "Enviado a merchant", chip: "bg-indigo-50 text-indigo-700 ring-indigo-600/20",   bar: "bg-indigo-500" },
   cancelled: { label: "Cancelado",       chip: "bg-gray-100 text-gray-400 ring-gray-400/20",         bar: "bg-gray-200" },
 };
 const STATUS_RANK = { late: 0, partial: 1, unplanned: 2, ontime: 3, converted: 4, cancelled: 5 };
@@ -123,9 +124,10 @@ export default function ForecastOverview({ onOpenBoard = null }) {
       else status = "ontime";
       return {
         id: o.id, no: o.forecast_no, customer: o.customer_name || "—", style: o.style_name || "—",
+        styleColor: colorForForecast(o),
         description: o.style_description || "", season: o.season || "", status, isOpen,
         qty, conv, open, placed, unplaced, target,
-        workNos: o.work_order_nos || "",
+        workNos: [o.pre_order_nos, o.work_order_nos].filter(Boolean).join(" → "),
         lines: [...g.lines.keys()].sort(sortLines),
         first: g.first, last: g.last,
         workDays: g.dates.size,                                     // días con producción en tablero
@@ -133,7 +135,7 @@ export default function ForecastOverview({ onOpenBoard = null }) {
         daysToFinish: g.last ? Math.max(0, daysBetween(today, g.last)) : null, // desde hoy
         lineDaysNeeded: target > 0 && open > 0 ? Math.ceil(open / target) : null, // a 1 línea
         handover, slack,
-        search: `${o.forecast_no} ${o.customer_name} ${o.style_name} ${o.season} ${o.style_description} ${o.work_order_nos || ""}`.toUpperCase(),
+        search: `${o.forecast_no} ${o.customer_name} ${o.style_name} ${o.season} ${o.style_description} ${o.pre_order_nos || ""} ${o.work_order_nos || ""}`.toUpperCase(),
       };
     });
   }, [orders, holds, today]);
@@ -262,14 +264,14 @@ export default function ForecastOverview({ onOpenBoard = null }) {
               <Kpi Icon={CalendarClock} label="Por cargar" value={fmt(kpi.unplaced)} sub="pzas sin línea" tone={kpi.unplaced > 0 ? "warn" : "ok"} />
               <Kpi Icon={AlertTriangle} label="Atrasados" value={fmt(kpi.late)} sub="fin > entrega" tone={kpi.late > 0 ? "bad" : "ok"} />
               <Kpi Icon={CalendarDays} label="Termina todo" value={kpi.lastAll ? fmtDate(kpi.lastAll) : "—"} sub={kpi.daysToAll != null ? `en ${fmt(kpi.daysToAll)} días` : null} />
-              <Kpi Icon={ArrowRightLeft} label="Convertido a SKM" value={fmt(kpi.conv)} sub="pzas" tone={kpi.conv > 0 ? "info" : "muted"} />
+              <Kpi Icon={ArrowRightLeft} label="Enviado a pre-orden" value={fmt(kpi.conv)} sub="pzas" tone={kpi.conv > 0 ? "info" : "muted"} />
             </div>
 
             {/* Cliente + línea */}
             <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-4">
               <Card title="Resumen por cliente" Icon={Users}>
                 <Table
-                  cols={["Cliente", "Pron.", "Pzas", "En tablero", "SKM", "Termina", "Días p/ completar", "Atras."]}
+                  cols={["Cliente", "Pron.", "Pzas", "En tablero", "Enviado", "Termina", "Días p/ completar", "Atras."]}
                   align={["l", "r", "r", "l", "r", "l", "r", "r"]}
                 >
                   {byClient.map((c) => (
@@ -313,7 +315,7 @@ export default function ForecastOverview({ onOpenBoard = null }) {
               right={
                 <div className="flex items-center gap-2 flex-wrap">
                   <div className="inline-flex rounded-lg bg-gray-100 p-0.5 text-[12px]">
-                    {[["open", "Activos"], ["late", "Atrasados"], ["unplanned", "Por cargar"], ["converted", "Con SKM"], ["all", "Todos"]].map(([k, l]) => (
+                    {[["open", "Activos"], ["late", "Atrasados"], ["unplanned", "Por cargar"], ["converted", "Enviados"], ["all", "Todos"]].map(([k, l]) => (
                       <button key={k} onClick={() => setOnly(k)}
                         className={`px-2.5 py-1 rounded-md ${only === k ? "bg-white shadow-sm font-semibold text-gray-900" : "text-gray-500 hover:text-gray-800"}`}>{l}</button>
                     ))}
@@ -336,15 +338,18 @@ export default function ForecastOverview({ onOpenBoard = null }) {
                     <tr key={r.id} className={`border-t border-gray-100 ${r.status === "cancelled" ? "opacity-50" : ""}`}>
                       <td className="py-2 px-2">
                         <div className="font-mono font-semibold text-teal-800">{r.no}</div>
-                        <div className="text-[11px] text-gray-600 max-w-[170px] truncate" title={r.description || r.style}>{r.style}{r.season ? ` · ${r.season}` : ""}</div>
+                        <div className="text-[11px] text-gray-600 max-w-[170px] truncate flex items-center gap-1" title={r.description || r.style}>
+                          <span className={`w-2 h-2 rounded-full shrink-0 ${r.styleColor.dot}`} aria-hidden />
+                          <span className="truncate">{r.style}{r.season ? ` · ${r.season}` : ""}</span>
+                        </div>
                       </td>
                       <td className="py-2 px-2">{r.customer}</td>
                       <td className="py-2 px-2 text-right tabular-nums">
                         {fmt(r.qty)}
-                        {r.conv > 0 && <div className="text-[10px] text-indigo-700 max-w-[140px] truncate" title={r.workNos}>{fmt(r.conv)} → SKM</div>}
+                        {r.conv > 0 && <div className="text-[10px] text-indigo-700 max-w-[140px] truncate" title={r.workNos}>{fmt(r.conv)} → {r.workNos || "SKM"}</div>}
                       </td>
                       <td className="py-2 px-2 min-w-[130px]">
-                        <div className="h-2 rounded-full bg-gray-100 overflow-hidden flex" title={`SKM ${fmt(r.conv)} · en tablero ${fmt(r.placed)} · por cargar ${fmt(r.unplaced)}`}>
+                        <div className="h-2 rounded-full bg-gray-100 overflow-hidden flex" title={`Enviado ${fmt(r.conv)} · en tablero ${fmt(r.placed)} · por cargar ${fmt(r.unplaced)}`}>
                           <div className="bg-indigo-500" style={{ width: `${(r.conv / base) * 100}%` }} />
                           <div className="bg-teal-500" style={{ width: `${(r.placed / base) * 100}%` }} />
                         </div>

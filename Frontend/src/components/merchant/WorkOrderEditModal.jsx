@@ -105,6 +105,17 @@ function Preview({ label, value }) {
 }
 
 // --- fabric helpers --------------------------------------------------------
+// Identity of a tela inside a line: name + code + consumo (rendimiento).
+// Same name and code with a different consumo is a DIFFERENT tela
+// (e.g. MONIQUE / MQE1200PQE / 0.15 vs MONIQUE / MQE1200PQE / 0.25).
+// The yield is normalised so "0.15" and "0.150" still count as the same.
+const normYield = (y) => {
+  const s = (y ?? "").toString().trim();
+  if (s === "" || isNaN(parseFloat(s))) return "";
+  return String(parseFloat(s));
+};
+const fabricKey = (f) => `${(f?.name || "").trim()}|${(f?.code || "").trim()}|${normYield(f?.yield)}`.toUpperCase();
+
 function cleanFabrics(list) {
   const out = [];
   const seen = new Set();
@@ -113,7 +124,7 @@ function cleanFabrics(list) {
     if (!name) continue;
     const code = (f.code || "").trim() || null;
     const yieldVal = (f.yield ?? "").toString().trim();
-    const key = `${name}|${code || ""}`.toUpperCase();
+    const key = fabricKey({ name, code, yield: yieldVal });
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({ name, code, yield: yieldVal === "" ? null : yieldVal });
@@ -126,7 +137,7 @@ function mergeFabrics(cells) {
   const seen = new Set();
   for (const c of cells) {
     for (const f of c.fabrics || []) {
-      const key = `${f.name}|${f.code || ""}`.toUpperCase();
+      const key = fabricKey(f);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(f);

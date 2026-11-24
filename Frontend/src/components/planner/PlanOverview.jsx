@@ -6,6 +6,9 @@
 //   • KPIs: órdenes activas, clientes, pzas por producir, % asignado,
 //     sin asignar, atrasadas, cuándo termina todo, producido.
 //   • Por cliente, carga por línea (desde hoy), detalle por orden y carga por mes.
+//   • Debajo de «Resumen por cliente»: curvas de aprendizaje por estilo
+//     (StyleLearningCurves.jsx, con su propio panel lateral; esa tarjeta sí
+//     consulta /api/learning-curves).
 //
 // No pide nada al servidor: usa las órdenes y asignaciones que la página ya
 // cargó (PlannerAnalytics → /api/work-orders y /api/line-assignments).
@@ -15,6 +18,27 @@ import {
   CalendarDays, Factory, Search, BarChart3, Loader2, RefreshCw, ChevronRight,
 } from "lucide-react";
 import { Kpi, Card, Table, Meter } from "./ForecastOverview";
+import StyleLearningCurves from "./StyleLearningCurves";
+
+// Hace que la tarjeta de curvas de aprendizaje llene su contenedor en lg+:
+// la tarjeta pasa a columna flex y su área con scroll (la que trae max-h)
+// pierde su tope y ocupa el alto restante. El panel lateral del estilo
+// (fixed / dialog) queda EXCLUIDO para no deformar su contenido.
+const SLC_SKIP = '.fixed, .fixed *, [role="dialog"], [role="dialog"] *, [aria-modal="true"], [aria-modal="true"] *';
+const SLC_MAXH = '[class*="max-h-"], [style*="max-height"]';
+const SLC_FILL_CSS = `
+@media (min-width: 1024px) {
+  .slc-fill > :first-child:not(${SLC_SKIP}) {
+    display: flex; flex-direction: column; flex: 1 1 0%; height: 100%; min-height: 0;
+  }
+  .slc-fill > :first-child :is(:has(:is(${SLC_MAXH}):not(${SLC_SKIP}))):not(${SLC_SKIP}) {
+    display: flex; flex-direction: column; flex: 1 1 0%; min-height: 0;
+  }
+  .slc-fill > :first-child :is(${SLC_MAXH}):not(${SLC_SKIP}) {
+    max-height: none !important; flex: 1 1 0%; min-height: 0; overflow-y: auto;
+  }
+}
+`;
 
 const DEAD = new Set(["cancelled", "rejected"]);
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
@@ -238,7 +262,10 @@ export default function PlanOverview({ workOrders = [], assignments = [], loadin
               <Kpi Icon={Factory} label="Producido" value={fmt(kpi.produced)} sub={`total cosido · ${fmt(kpi.producedOpen)} en activas`} tone="info" />
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-4">
+            <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-4 lg:items-stretch">
+              {/* Columna izquierda: clientes + curvas de aprendizaje (ocupa el
+                  hueco que deja la columna de «Carga por línea», más alta) */}
+              <div className="min-w-0 flex flex-col gap-4">
               <Card title="Resumen por cliente" Icon={Users}>
                 <Table cols={["Cliente", "Órd.", "Pzas", "Asignado", "Producido", "Termina", "Días p/ completar", "Atras."]}
                   align={["l", "r", "r", "l", "r", "l", "r", "r"]}>
@@ -283,6 +310,21 @@ export default function PlanOverview({ workOrders = [], assignments = [], loadin
                   {byClient.length === 0 && <tr><td colSpan={8} className="py-6 text-center text-sm text-gray-500">Sin órdenes activas.</td></tr>}
                 </Table>
               </Card>
+
+              {/* Curvas de aprendizaje por estilo: clic en un estilo abre su panel */}
+              {/* En lg+ la tarjeta llena el alto que sobra hasta igualar la base de
+                  «Carga por línea». Va en absoluto para que su lista no empuje la
+                  altura de la fila; en móvil queda con su alto natural. */}
+              {/* La lista interna de StyleLearningCurves trae un alto máximo fijo;
+                  en lg+ se lo quitamos y la hacemos crecer (flex-1) para que llene la
+                  tarjeta y haga scroll dentro de ella. */}
+              <style>{SLC_FILL_CSS}</style>
+              <div className="relative lg:flex-1 lg:min-h-[320px]">
+                <div className="slc-fill lg:absolute lg:inset-0 flex flex-col">
+                  <StyleLearningCurves compact fill workOrders={workOrders} assignments={assignments} />
+                </div>
+              </div>
+              </div>
 
               <Card title="Carga por línea (desde hoy)" Icon={LayoutGrid}>
                 {byLine.length === 0 ? (

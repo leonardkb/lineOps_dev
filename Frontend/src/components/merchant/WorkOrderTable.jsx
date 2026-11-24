@@ -74,12 +74,39 @@ function fmtNum(v, opts) {
 function fabricList(src) {
   if (Array.isArray(src?.fabrics) && src.fabrics.length) return src.fabrics;
   const name = src?.fabricName || src?.fabric_name;
-  return name ? [{ name, code: src?.fabricCode || src?.fabric_code || null }] : [];
+  return name
+    ? [{ name, code: src?.fabricCode || src?.fabric_code || null, yield: src?.yield ?? src?.yield_per_piece ?? null }]
+    : [];
 }
 
-// "Jersey (JER301), Rib (RIB200)"
+const YIELD_FMT = { maximumFractionDigits: 4 };
+
+// A tela is identified by name + code + consumo: MONIQUE / MQE1200PQE / 0.15
+// and MONIQUE / MQE1200PQE / 0.25 are two different telas.
+const hasYield = (y) => y != null && y !== "" && !isNaN(parseFloat(y));
+const fabricKey = (f) =>
+  `${f?.name || ""}|${f?.code || ""}|${hasYield(f?.yield) ? String(parseFloat(f.yield)) : ""}`.toUpperCase();
+
+// Distinct telas (name + code + consumo) across all of a PO's lines.
+function fabricsFromLines(lines) {
+  const out = [];
+  const seen = new Set();
+  for (const l of lines || []) {
+    for (const f of fabricList(l)) {
+      const k = fabricKey(f);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(f);
+    }
+  }
+  return out;
+}
+
+// "Jersey (JER301) · 0.15, Rib (RIB200) · 0.25"
 const fabricSummary = (list) =>
-  list.map((f) => (f.code ? `${f.name} (${f.code})` : f.name)).join(", ");
+  list
+    .map((f) => `${f.name}${f.code ? ` (${f.code})` : ""}${hasYield(f.yield) ? ` · ${fmtNum(f.yield, YIELD_FMT)}` : ""}`)
+    .join(", ");
 
 const sizeRank = (code) => {
   const i = TALLAS.findIndex((t) => t.code === code);
@@ -174,10 +201,13 @@ export default function WorkOrderTable({ orders, onEdit }) {
             const hasItemCodes = itemCodes.length > 0;
             const expandable = groups.length > 0;
             const isOpen = open.has(id);
-            // Header copy: every distinct name+code pair used by this PO.
+            // Header copy: every distinct tela (name + code + consumo) used by this PO.
+            const lineFabrics = fabricsFromLines(o.lines);
             const headerFabrics = Array.isArray(o.fabric_details) && o.fabric_details.length
               ? o.fabric_details
-              : (Array.isArray(o.fabrics) && o.fabrics.length
+              : lineFabrics.length
+                ? lineFabrics
+                : (Array.isArray(o.fabrics) && o.fabrics.length
                   ? o.fabrics.map((n) => ({ name: n, code: null }))
                   : fabricList({ fabricName: o.fabric_name || o.fabric_supplier, fabricCode: o.fabric_code }));
 
@@ -225,6 +255,9 @@ export default function WorkOrderTable({ orders, onEdit }) {
                         {headerFabrics[0].name}
                         {headerFabrics[0].code && (
                           <span className="ml-1 font-mono text-xs text-slate-400">{headerFabrics[0].code}</span>
+                        )}
+                        {hasYield(headerFabrics[0].yield) && (
+                          <span className="ml-1 font-mono text-xs text-slate-400">· {fmtNum(headerFabrics[0].yield, YIELD_FMT)}</span>
                         )}
                         {headerFabrics.length > 1 && (
                           <span className="ml-1 text-xs text-slate-400">+{headerFabrics.length - 1}</span>
@@ -317,12 +350,20 @@ export default function WorkOrderTable({ orders, onEdit }) {
                                           className="inline-flex items-center gap-1 rounded bg-slate-100 border border-slate-200 px-1.5 py-0.5 text-slate-700">
                                           {f.name}
                                           {f.code && <span className="font-mono text-slate-400">{f.code}</span>}
+                                          {hasYield(f.yield) && (
+                                            <span className="font-mono text-indigo-600" title="Consumo / rendimiento">· {fmtNum(f.yield, YIELD_FMT)}</span>
+                                          )}
                                         </span>
                                       ))}
                                     </div>
                                   )}
                                 </td>
-                                <td className="px-3 py-2 text-right font-mono text-slate-600 whitespace-nowrap">{fmtNum(g.yield)}</td>
+                                <td className="px-3 py-2 text-right font-mono text-slate-600 whitespace-nowrap">
+                                  {/* Una tela puede repetirse con otro consumo: se muestra cada uno. */}
+                                  {g.fabrics.some((f) => hasYield(f.yield))
+                                    ? g.fabrics.map((f) => (hasYield(f.yield) ? fmtNum(f.yield, YIELD_FMT) : "—")).join(" / ")
+                                    : fmtNum(g.yield, YIELD_FMT)}
+                                </td>
                                 <td className="px-3 py-2">
                                   <div className="flex flex-wrap gap-1">
                                     {g.sizes.map((s) => {

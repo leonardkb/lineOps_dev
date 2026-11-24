@@ -3,6 +3,9 @@
 // Pronósticos del cliente (Forecast Board):
 //   • ForecastOrderModal       crear / editar un pronóstico FC####
 //   • ForecastOrdersListModal  lista con editar / quitar del tablero / cancelar / borrar
+//   • ConvertForecastModal     «Enviar a pre-orden»: manda el pronóstico (total o
+//                              parcial) al merchant como PRE#### sin pedir detalles;
+//                              el merchant lo completa a SKM en su tabla de pre-órdenes
 //
 // Un pronóstico NO viene del merchant: lo captura el planner con lo mínimo
 // para poder cargarlo a una línea:
@@ -10,9 +13,10 @@
 //   no. de operarios · SAM · horas de trabajo (· eficiencia, opcional = 100 %)
 // Con eso el tablero calcula su capacidad por día:
 //   pzas/día = operarios × horas × 60 × eficiencia ÷ SAM
-import { useEffect, useMemo, useState } from "react";
-import { X, Loader2, Plus, Pencil, Trash2, Ban, RotateCcw, Eraser, Search, ArrowRightLeft, Copy } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { X, Loader2, Plus, Pencil, Trash2, Ban, RotateCcw, Eraser, Search, ArrowRightLeft, Copy, Send, Check } from "lucide-react";
 import { API_URL } from "../../lib/masterCodeCatalog";
+import { WO_PALETTE, colorForForecast } from "../../lib/workOrderColors";
 
 const authHeaders = () => ({
   "Content-Type": "application/json",
@@ -63,7 +67,7 @@ const inputCls = "w-full border border-gray-300 rounded-lg px-3 py-2 text-sm foc
 //                    (initial.__baseLine = línea a precargar, desde la tarjeta)
 //   today            "YYYY-MM-DD" del tablero (la re-planeación arranca aquí)
 //   holidayDatesFor  (lineNo, fromYmd, days) => ["YYYY-MM-DD", …] festivos
-//   onClose(), onSaved(row, recalculated[])
+//   onClose(), onSaved(row, recalculated[], resized)  resized = { trimmed, added, unplaced, line } o null
 //
 // CAMBIO DE CAPACIDAD (operarios / SAM / horas / eficiencia) de un pronóstico
 // que ya está en el tablero: primero se eligen las LÍNEAS donde aplica (las
@@ -85,6 +89,67 @@ const perDayOf = (c) => {
 };
 const sameCap = (a, b) => CAP_KEYS.every((k) => n(a[k]) === n(b[k]));
 
+// ---- Selector de color del pronóstico ---------------------------------------
+// Un color por PRONÓSTICO (FC####). Muestra la paleta y marca con un puntito
+// blanco los colores que ya usa otro pronóstico abierto (se pueden elegir
+// igual, con aviso). Lo usan el formulario y la tarjeta de detalle del tablero.
+//   forecastId id de este pronóstico (null si es nuevo); se excluye de «usados»
+//   value      índice actual (null = aún sin color: se asigna uno libre al guardar)
+//   picked     true para mostrar «automático»
+//   onPick(i)  elegir; onAuto() volver a automático
+//   refreshKey cambia para volver a leer qué colores están usados
+export function ForecastColorPicker({ forecastId = null, value, picked = false, onPick, onAuto, disabled = false, refreshKey = 0, size = "md" }) {
+  const [colors, setColors] = useState([]);
+  useEffect(() => {
+    let alive = true;
+    fetch(`${API_URL}/api/forecast-colors`, { headers: authHeaders() })
+      .then((r) => r.json()).then((d) => { if (alive && d?.success) setColors(d.colors || []); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [refreshKey]);
+  const usedBy = useMemo(() => {
+    const m = new Map();
+    colors.forEach((c) => {
+      if (c.color_idx == null || (forecastId != null && String(c.id) === String(forecastId))) return;
+      const i = Number(c.color_idx) % WO_PALETTE.length;
+      m.set(i, [...(m.get(i) || []), c.forecast_no]);
+    });
+    return m;
+  }, [colors, forecastId]);
+  const cur = value == null ? null : Number(value) % WO_PALETTE.length;
+  const dot = size === "sm" ? "w-5 h-5" : "w-6 h-6";
+  const clash = cur != null ? usedBy.get(cur) : null;
+  return (
+    <div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {WO_PALETTE.map((c, i) => {
+          const on = cur === i;
+          const others = usedBy.get(i);
+          return (
+            <button key={i} type="button" onClick={() => onPick?.(i)} disabled={disabled}
+              title={others ? `También lo usa: ${others.join(", ")}` : "Libre"} aria-pressed={on}
+              className={`relative ${dot} rounded-full border-2 ${c.bg} ${c.border} disabled:opacity-40 transition-transform
+                ${on ? "ring-2 ring-offset-2 ring-gray-900" : "hover:scale-110"}`}>
+              {others && !on && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-white border border-gray-400" aria-hidden />}
+            </button>
+          );
+        })}
+        {picked && onAuto && (
+          <button type="button" onClick={onAuto} disabled={disabled} className="ml-1 text-[11px] text-gray-500 underline hover:text-gray-800 disabled:opacity-50">
+            automático
+          </button>
+        )}
+      </div>
+      {clash && (
+        <p className="mt-1 text-[11px] text-amber-700">Ese color también lo usa {clash.join(", ")}; se verán iguales en el tablero.</p>
+      )}
+      <p className="mt-1 text-[10px] text-gray-400 inline-flex items-center gap-1">
+        <span className="w-2 h-2 rounded-full bg-white border border-gray-400" aria-hidden /> ya lo usa otro pronóstico
+      </p>
+    </div>
+  );
+}
+
 export function ForecastOrderModal({ initial = null, today = null, holidayDatesFor = null, onClose, onSaved }) {
   const isEdit = !!initial?.id;
   const [form, setForm] = useState(() => (initial ? forecastToForm(initial) : EMPTY));
@@ -92,6 +157,13 @@ export function ForecastOrderModal({ initial = null, today = null, holidayDatesF
   const [customers, setCustomers] = useState([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+
+  // ---- color del pronóstico ------------------------------------------------
+  // Un color por FC####. pickedIdx = null → automático (el que ya tiene, o
+  // uno libre al crearlo).
+  const [pickedIdx, setPickedIdx] = useState(null);
+  const savedIdx = isEdit && initial?.color_idx != null ? Number(initial.color_idx) : null;
+  const shownIdx = pickedIdx ?? savedIdx; // null = nuevo: el servidor le asigna uno libre
 
   // ---- capacidad por línea -------------------------------------------------
   const general = useMemo(() => capOf(initial || {}), [initial]);
@@ -189,7 +261,20 @@ export function ForecastOrderModal({ initial = null, today = null, holidayDatesF
         workingHours: n(capInPut.workingHours),
         efficiency: capInPut.efficiencyPct === "" ? 100 : n(capInPut.efficiencyPct), // 85 o 0.85
         notes: form.notes,
+        // Sólo si el usuario eligió un color: aplica a TODO el estilo.
+        ...(pickedIdx != null ? { colorIdx: pickedIdx } : {}),
       };
+      // Si cambia la cantidad de un pronóstico que ya está en el tablero, el
+      // servidor recorta (o alarga) la corrida desde el final: necesita el
+      // "hoy" del tablero y los festivos de sus líneas.
+      if (isEdit && boardLines.length > 0) {
+        const from = today || new Date().toISOString().slice(0, 10);
+        body.fromDate = from;
+        if (holidayDatesFor) {
+          body.blockedDates = {};
+          boardLines.forEach((ln) => { body.blockedDates[ln] = holidayDatesFor(ln, from, 2200); });
+        }
+      }
       const res = await fetch(`${API_URL}/api/forecast-orders${isEdit ? `/${initial.id}` : ""}`, {
         method: isEdit ? "PUT" : "POST",
         headers: authHeaders(),
@@ -199,6 +284,7 @@ export function ForecastOrderModal({ initial = null, today = null, holidayDatesF
       if (!data?.success) throw new Error(data?.error || `HTTP ${res.status}`);
       let row = data.forecastOrder;
       let recalculated = [];
+      const resized = data.resized || null; // { trimmed, added, unplaced, line }
 
       if (needsPick) {
         const lines = [...pick].filter((k) => k !== "general");
@@ -224,7 +310,7 @@ export function ForecastOrderModal({ initial = null, today = null, holidayDatesF
         row = d2.forecastOrder || row;
         recalculated = d2.recalculated || [];
       }
-      onSaved?.(row, recalculated);
+      onSaved?.(row, recalculated, resized);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -357,6 +443,12 @@ export function ForecastOrderModal({ initial = null, today = null, holidayDatesF
               </div>
             )}
           </div>
+
+          <Field label="Color en el tablero"
+            hint={shownIdx == null ? "Sin elegir: se le asigna un color libre al guardar" : "Sólo para este pronóstico"}>
+            <ForecastColorPicker forecastId={isEdit ? initial.id : null} value={shownIdx} picked={pickedIdx != null}
+              onPick={setPickedIdx} onAuto={() => setPickedIdx(null)} />
+          </Field>
 
           <Field label="Notas">
             <input value={form.notes} onChange={set("notes")} maxLength={2000} className={inputCls} />
@@ -492,15 +584,18 @@ export function ForecastOrdersListModal({ onClose, onEdit, onNew, onChanged, onC
                           {r.status === "partially_converted" && <div className="font-sans text-[10px] font-semibold text-indigo-700">parcial</div>}
                           {converted && <div className="font-sans text-[10px] font-semibold text-emerald-700">convertido</div>}
                         </td>
-                        <td className="py-2 pr-3"><div className="font-medium text-gray-900">{r.style_name}</div>
+                        <td className="py-2 pr-3"><div className="font-medium text-gray-900 inline-flex items-center gap-1.5">
+                          <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${colorForForecast(r).dot}`} aria-hidden />{r.style_name}</div>
                           {r.style_description && <div className="text-[11px] text-gray-500 max-w-[220px] truncate" title={r.style_description}>{r.style_description}</div>}</td>
                         <td className="py-2 pr-3">{r.customer_name}</td>
                         <td className="py-2 pr-3">{r.season || "—"}</td>
                         <td className="py-2 pr-3 text-right tabular-nums">
                           {fmt(qty)}
                           {conv > 0 && (
-                            <div className="text-[10px] text-indigo-700 max-w-[170px] truncate" title={r.work_order_nos || ""}>
-                              {fmt(conv)} → {r.work_order_nos || "SKM"}
+                            <div className="text-[10px] text-indigo-700 max-w-[170px] truncate"
+                              title={[r.pre_order_nos, r.work_order_nos].filter(Boolean).join(" → ")}>
+                              {fmt(conv)} → {r.pre_order_nos || r.work_order_nos || "SKM"}
+                              {r.pre_order_nos && r.work_order_nos ? ` → ${r.work_order_nos}` : ""}
                             </div>
                           )}
                         </td>
@@ -526,7 +621,7 @@ export function ForecastOrdersListModal({ onClose, onEdit, onNew, onChanged, onC
                         <td className="py-2 whitespace-nowrap text-right">
                           {busyId === r.id ? <Loader2 className="w-4 h-4 animate-spin inline text-gray-400" /> : (
                             <span className="inline-flex gap-1">
-                              {isOpen && onConvert && <IconBtn title="Convertir a SKM" onClick={() => onConvert(r)}><ArrowRightLeft className="w-4 h-4 text-indigo-600" /></IconBtn>}
+                              {isOpen && onConvert && <IconBtn title="Enviar a pre-orden (merchant)" onClick={() => onConvert(r)}><Send className="w-4 h-4 text-indigo-600" /></IconBtn>}
                               {isOpen && <IconBtn title="Editar" onClick={() => onEdit?.(r)}><Pencil className="w-4 h-4" /></IconBtn>}
                               {isOpen && held > 0 && <IconBtn title="Quitar del tablero" onClick={() => act(r, "clear")}><Eraser className="w-4 h-4" /></IconBtn>}
                               {isOpen && <IconBtn title="Cancelar" onClick={() => act(r, "cancel")}><Ban className="w-4 h-4" /></IconBtn>}
@@ -575,8 +670,102 @@ function IconBtn({ title, onClick, danger, children }) {
 const ymd10 = (v) => (v ? String(v).slice(0, 10) : "");
 const dayDiff = (a, b) => Math.round((new Date(`${a}T00:00:00`) - new Date(`${b}T00:00:00`)) / 86400000);
 
-export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCell, onRemoveCells, onEdit, onConvert, busy, onClose }) {
+// Barras por día de una orden en una línea (tarjeta de reserva FC/PRE y
+// tarjeta de orden del Plan Board). Pocas: barras anchas con piezas y fecha.
+// Muchas (> 24 días; un pedido grande puede ser 100+): barras finas, rótulo al
+// inicio de cada mes y «Día elegido» abajo. La tira se desplaza dentro de sí
+// misma (nunca ensancha la tarjeta) y se centra en el día elegido.
+// props:
+//   days    [{ d: "YYYY-MM-DD", qty, … }] en orden
+//   selDay  "YYYY-MM-DD"   maxDay  número
+//   onPick(day)            al tocar una barra
+//   barCls(day, on)        clases de color de la barra
+//   ringCls                anillo del día elegido (modo ancho)
+export function DayStrip({ days, selDay, maxDay, onPick, barCls, ringCls = "ring-gray-900" }) {
+  const ref = useRef(null);
+  const compact = days.length > 24;
+  const max = Math.max(1, maxDay || 0);
+  useEffect(() => {
+    const box = ref.current;
+    const el = box?.querySelector('[data-on="1"]');
+    if (box && el) box.scrollLeft = Math.max(0, el.offsetLeft - box.clientWidth / 2 + el.clientWidth / 2);
+  }, [selDay, days.length]);
+
+  if (!compact) {
+    return (
+      <div ref={ref} className="relative flex items-end gap-2 overflow-x-auto pb-1 max-w-full">
+        {days.map((g) => {
+          const on = g.d === selDay;
+          return (
+            <button key={g.d} type="button" data-on={on ? "1" : "0"} onClick={() => onPick(g)}
+              className="group flex flex-col items-center gap-1 shrink-0 focus:outline-none" title={`${dmy(g.d)} · ${fmt(g.qty)} pzas`}>
+              <span className={`text-[10px] tabular-nums ${on ? "font-bold text-gray-900" : "text-gray-500"}`}>{fmt(g.qty)}</span>
+              <span className="w-6 h-14 rounded-md bg-gray-100 flex items-end">
+                <span className={`w-full rounded-md ${barCls(g, on)} ${on ? `ring-2 ring-offset-1 ${ringCls}` : ""}`}
+                  style={{ height: `${Math.max(8, (g.qty / max) * 100)}%` }} />
+              </span>
+              <span className={`text-[10px] tabular-nums ${on ? "font-bold text-gray-900" : "text-gray-500"}`}>{dmy(g.d).slice(0, 5)}</span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  const sel = days.find((g) => g.d === selDay);
+  const isMonthStart = (i) => i === 0 || days[i].d.slice(0, 7) !== days[i - 1].d.slice(0, 7);
+  return (
+    <div>
+      <div ref={ref} className="relative overflow-x-auto pb-1 max-w-full rounded-lg bg-gray-50 border border-gray-100 px-1.5 pt-2">
+        <div className="flex items-end gap-[3px] h-16">
+          {days.map((g, i) => {
+            const on = g.d === selDay;
+            return (
+              <button key={g.d} type="button" data-on={on ? "1" : "0"} onClick={() => onPick(g)}
+                className="relative shrink-0 h-full w-2.5 flex items-end group focus:outline-none" title={`${dmy(g.d)} · ${fmt(g.qty)} pzas`}>
+                {isMonthStart(i) && <span className="absolute -top-0.5 left-0 h-[calc(100%+2px)] w-px bg-gray-300" aria-hidden />}
+                <span className={`w-full rounded-sm ${barCls(g, on)} ${on ? "outline outline-2 outline-offset-1 outline-gray-900" : "group-hover:brightness-90"}`}
+                  style={{ height: `${Math.max(10, (g.qty / max) * 100)}%` }} />
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex gap-[3px] h-4 mt-0.5">
+          {days.map((g, i) => (
+            <span key={g.d} className="relative shrink-0 w-2.5">
+              {isMonthStart(i) && (
+                <span className="absolute left-0 top-0 whitespace-nowrap text-[9px] text-gray-500">
+                  {new Date(`${g.d}T00:00:00`).toLocaleDateString("es-MX", { month: "short", year: "2-digit" })}
+                </span>
+              )}
+            </span>
+          ))}
+        </div>
+      </div>
+      {sel && (
+        <div className="mt-1 text-[11px] text-gray-600">
+          Día elegido: <b className="text-gray-900">{dmy(sel.d)}</b> · {fmt(sel.qty)} pzas
+          <span className="text-gray-400"> · toque una barra para ver otro día</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// onColorChange(idx | null): cambia el color de ESTE pronóstico (FC####);
+// null = automático. Sin él (modo consulta) el color sólo se muestra.
+export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCell, onRemoveCells, onEdit, onConvert, onColorChange, busy, onClose }) {
   const isFc = order.kind === "forecast";
+  const [colorBusy, setColorBusy] = useState(false);
+  const [colorErr, setColorErr] = useState("");
+  const [colorTick, setColorTick] = useState(0);
+  const changeColor = async (idx) => {
+    if (!onColorChange || colorBusy) return;
+    setColorBusy(true); setColorErr("");
+    try { await onColorChange(idx); setColorTick((t) => t + 1); }
+    catch (e) { setColorErr(e?.message || "No se pudo cambiar el color"); }
+    finally { setColorBusy(false); }
+  };
   const accent = isFc
     ? { bar: "bg-teal-600", soft: "bg-teal-200", chip: "bg-teal-600", text: "text-teal-700", ring: "ring-teal-600" }
     : { bar: "bg-violet-600", soft: "bg-violet-200", chip: "bg-violet-600", text: "text-violet-700", ring: "ring-violet-600" };
@@ -656,8 +845,12 @@ export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCel
               <h3 className="font-bold text-gray-900 text-[15px] tracking-tight font-mono">{order.no}</h3>
               <span className={`text-[10px] font-bold rounded-full text-white px-2 py-0.5 ${accent.chip}`}>{isFc ? "PRONÓSTICO" : "PRE-ORDEN"}</span>
             </div>
-            <div className="text-[12px] text-gray-500 truncate mt-0.5">
-              {order.customer || "—"} · {order.style || "—"}
+            <div className="text-[12px] text-gray-500 truncate mt-0.5 flex items-center gap-1.5">
+              {isFc && (
+                <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${colorForForecast({ color_idx: order.colorIdx ?? cells.find((c) => c.color_idx != null)?.color_idx ?? null, forecast_no: order.no }).dot}`}
+                  title="Color del pronóstico" aria-hidden />
+              )}
+              <span className="truncate">{order.customer || "—"} · {order.style || "—"}</span>
             </div>
           </div>
           <span className="shrink-0 text-[12px] font-semibold rounded-lg bg-gray-900 text-white px-2.5 py-1">Línea {hold.line_no}</span>
@@ -668,9 +861,9 @@ export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCel
         </div>
 
         {/* Cuerpo */}
-        <div className="flex-1 overflow-y-auto grid grid-cols-1 md:grid-cols-[1.05fr_1fr] md:divide-x divide-gray-200">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden grid grid-cols-1 md:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)] md:divide-x divide-gray-200">
           {/* Izquierda */}
-          <div className="p-4 space-y-4">
+          <div className="p-4 space-y-4 min-w-0">
             <section>
               <Label right={total > 0 ? `${Math.round((dayQty / total) * 100)}% del total` : null}>Este día</Label>
               <div className="flex items-end gap-6">
@@ -730,27 +923,17 @@ export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCel
               </div>
             </section>
 
-            <section>
-              <Label right={`${lineDays.length} día(s)`}>Días en la Línea {hold.line_no}</Label>
-              <div className="flex items-end gap-2 overflow-x-auto pb-1">
-                {lineDays.map((g) => {
-                  const on = g.d === selDay;
-                  return (
-                    <button key={g.d} onClick={() => onPick(g.cell)} className="flex flex-col items-center gap-1 shrink-0" title={`${dmy(g.d)} · ${fmt(g.qty)} pzas`}>
-                      <span className={`text-[10px] tabular-nums ${on ? "font-bold text-gray-900" : "text-gray-500"}`}>{fmt(g.qty)}</span>
-                      <span className="w-6 h-14 rounded-md bg-gray-100 flex items-end overflow-hidden">
-                        <span className={`w-full ${on ? `${accent.bar} ring-2 ring-offset-1 ${accent.ring}` : "bg-slate-300"}`} style={{ height: `${Math.max(8, (g.qty / maxDay) * 100)}%` }} />
-                      </span>
-                      <span className={`text-[10px] tabular-nums ${on ? "font-bold text-gray-900" : "text-gray-500"}`}>{dmy(g.d).slice(0, 5)}</span>
-                    </button>
-                  );
-                })}
-              </div>
+            <section className="min-w-0">
+              <Label right={`${lineDays.length} día(s)${lineDays.length > 1 ? ` · ${dmy(lineDays[0].d).slice(0, 5)} → ${dmy(lineDays[lineDays.length - 1].d)}` : ""}`}>
+                Días en la Línea {hold.line_no}
+              </Label>
+              <DayStrip days={lineDays} selDay={selDay} maxDay={maxDay} onPick={(g) => onPick(g.cell)}
+                ringCls={accent.ring} barCls={(g, on) => (on ? accent.bar : "bg-slate-300")} />
             </section>
           </div>
 
           {/* Derecha */}
-          <div className="p-4 space-y-4 bg-gray-50/50">
+          <div className="p-4 space-y-4 bg-gray-50/50 min-w-0">
             {isFc || sam > 0 ? (
               <section>
                 <Label right={isFc ? (order.ownLine ? "propios de la línea" : "generales") : null}>Datos para la Línea {hold.line_no}</Label>
@@ -765,6 +948,23 @@ export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCel
               </section>
             ) : null}
 
+            {isFc && (
+              <section>
+                <Label right={colorBusy ? "guardando…" : null}>
+                  Color de {order.no}
+                </Label>
+                {onColorChange ? (
+                  <ForecastColorPicker size="sm" forecastId={hold.pre_order_id}
+                    value={order.colorIdx ?? null} picked={order.colorIdx != null}
+                    disabled={busy || colorBusy} refreshKey={colorTick}
+                    onPick={(i) => changeColor(i)} onAuto={() => changeColor(null)} />
+                ) : (
+                  <span className={`inline-block w-5 h-5 rounded-full ${colorForForecast({ color_idx: order.colorIdx, forecast_no: order.no }).bg}`} />
+                )}
+                {colorErr && <p className="mt-1 text-[11px] text-rose-700">{colorErr}</p>}
+              </section>
+            )}
+
             <section className="grid grid-cols-2 gap-x-4 gap-y-3">
               <Info k="Cliente" v={order.customer} />
               <Info k={isFc ? "Estilo" : "Estilo N°"} v={order.style} mono={!isFc} />
@@ -775,7 +975,7 @@ export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCel
               {order.description && <Info k="Descripción del estilo" v={order.description} wide />}
               {order.notes && <Info k="Notas" v={order.notes} wide />}
               {Number(order.convertedPieces) > 0 && (
-                <Info k="Ya convertido a SKM" v={`${fmt(order.convertedPieces)} pzas → ${order.workOrderNos || "SKM"}`} wide />
+                <Info k="Ya enviado al merchant" v={`${fmt(order.convertedPieces)} pzas → ${[order.preOrderNos, order.workOrderNos].filter(Boolean).join(" → ") || "SKM"}`} wide />
               )}
             </section>
           </div>
@@ -792,7 +992,7 @@ export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCel
           {isFc && onConvert && (
             <button onClick={onConvert} disabled={busy}
               className="px-3 py-2 text-[12px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 inline-flex items-center gap-1.5 disabled:opacity-50">
-              <ArrowRightLeft className="w-3.5 h-3.5" /> Convertir a SKM
+              <Send className="w-3.5 h-3.5" /> Enviar a pre-orden
             </button>
           )}
           {onRemoveCell && <button onClick={() => onRemoveCell(hold)} disabled={busy}
@@ -829,7 +1029,10 @@ export function HoldDetailsCard({ hold, cells, order, today, onPick, onRemoveCel
 // ---------------------------------------------------------------------------
 const code = (v, len) => String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, len);
 
-export function ConvertForecastModal({ forecast, today = null, onClose, onConverted }) {
+// (Ya no se usa desde el tablero: el planner ahora manda el pronóstico como
+// pre-orden con ConvertForecastModal, y el merchant lo completa. Se conserva
+// por si se quiere volver a ofrecer la conversión directa a SKM.)
+export function ConvertForecastToSkmModal({ forecast, today = null, onClose, onConverted }) {
   const open = Math.max(0, (Number(forecast.quantity) || 0) - (Number(forecast.converted_pieces) || 0));
   const [customers, setCustomers] = useState([]);
   const [h, setH] = useState(() => ({
@@ -1078,6 +1281,158 @@ export function ConvertForecastModal({ forecast, today = null, onClose, onConver
               {created ? "Reintentar ligar" : partial ? `Convertir ${fmt(total)} pzas` : "Convertir a SKM"}
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Enviar un pronóstico al merchant como PRE-ORDEN
+//
+// El planner ya no llena el detalle de la SKM. Elige cuántas piezas manda
+// (todas por defecto) y el servidor crea una PRE#### con lo que el pronóstico
+// ya sabe: estilo, cliente, piezas, SAM, fecha de entrega y temporada
+// (POST /api/forecast-orders/:id/to-pre-order). La PRE aparece en la tabla de
+// «Pre-órdenes» del merchant con aviso en su campana, y él la completa a SKM
+// con el mismo wizard de siempre.
+//   • todas las piezas → el pronóstico pasa a «Convertido», casillas liberadas
+//   • menos            → parcial: el resto sigue como pronóstico en el tablero
+// Mismo nombre y props que antes, así PlanBoard no cambia.
+// onConverted recibe { preOrder, pieces, partial, plannedWeek, forecastOrder,
+//                      preOrderNo, workOrderNos: [preOrderNo] }
+// ---------------------------------------------------------------------------
+export function ConvertForecastModal({ forecast, today = null, onClose, onConverted }) {
+  const open = Math.max(0, (Number(forecast.quantity) || 0) - (Number(forecast.converted_pieces) || 0));
+  const [pieces, setPieces] = useState(open ? String(Math.round(open)) : "");
+  const [customerPo, setCustomerPo] = useState("");
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(null); // respuesta del servidor
+
+  const qty = n(pieces);
+  const partial = qty > 0 && qty < open;
+  const invalid = !(qty > 0) || qty > open;
+
+  const submit = async () => {
+    if (invalid) { setError(`Indique entre 1 y ${fmt(open)} pzas.`); return; }
+    setError("");
+    setBusy(true);
+    try {
+      const r = await fetch(`${API_URL}/api/forecast-orders/${forecast.id}/to-pre-order`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ pieces: qty, customerPo: customerPo.trim() || undefined, notes: notes.trim() || undefined, fromDate: today || undefined }),
+      });
+      const d = await r.json().catch(() => null);
+      if (!d?.success) throw new Error(d?.error || `No se pudo enviar (HTTP ${r.status})`);
+      setDone(d);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const finish = () => {
+    if (done) {
+      const no = done.preOrder?.pre_order_no;
+      onConverted?.({ ...done, preOrderNo: no, workOrderNos: no ? [no] : [], pieces: done.pieces });
+    } else onClose?.();
+  };
+
+  const Row = ({ k, v, mono }) => (
+    <div className="flex items-baseline justify-between gap-3 py-1.5 border-b border-gray-100 last:border-0">
+      <span className="text-[12px] text-gray-500">{k}</span>
+      <span className={`text-[13px] font-medium text-gray-900 text-right ${mono ? "font-mono" : ""}`}>{v || "—"}</span>
+    </div>
+  );
+
+  return (
+    <div className="fixed inset-0 z-[75] flex items-center justify-center bg-black/40 p-4" onClick={() => !busy && finish()}>
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg max-h-[94vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="px-5 py-4 border-b flex items-start justify-between gap-4">
+          <div>
+            <h3 className="font-semibold text-gray-900 text-lg inline-flex items-center gap-2">
+              <Send className="w-5 h-5 text-indigo-600" />
+              Enviar <span className="font-mono text-teal-700">{forecast.forecast_no}</span> a pre-orden
+            </h3>
+            <p className="text-sm text-gray-500 mt-0.5">
+              El merchant la recibe en su tabla de pre-órdenes y en su tablero semanal, y la completa a SKM.
+            </p>
+          </div>
+          <button onClick={() => !busy && finish()} className="text-gray-400 hover:text-gray-600 shrink-0"><X className="w-5 h-5" /></button>
+        </div>
+
+        {done ? (
+          <div className="px-5 py-6 space-y-3">
+            <div className="flex items-center gap-3">
+              <span className="w-10 h-10 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center"><Check className="w-5 h-5" /></span>
+              <div>
+                <div className="text-[15px] font-semibold text-gray-900">
+                  Pre-orden <span className="font-mono">{done.preOrder?.pre_order_no}</span> enviada
+                </div>
+                <div className="text-sm text-gray-500">{fmt(done.pieces)} pzas · {forecast.customer_name}</div>
+              </div>
+            </div>
+            <p className="text-[13px] text-gray-600">
+              {done.partial
+                ? <>Quedan <b>{fmt(open - done.pieces)}</b> pzas como pronóstico en el tablero; se liberaron sus días más cercanos.</>
+                : <>El pronóstico pasó a «Convertido» y sus casillas se liberaron.</>}
+              {done.plannedWeek && (done.onMerchantBoard
+                ? <> Ya aparece en el tablero del merchant en la semana del <b>{dmy(done.plannedWeek)}</b>; él puede moverla a otra semana.</>
+                : <> Quedó apartada para la semana del {dmy(done.plannedWeek)}; el merchant la acomoda en su tablero.</>)}
+            </p>
+          </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+            <div className="rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-1">
+              <Row k="Estilo" v={forecast.style_name} />
+              <Row k="Cliente" v={forecast.customer_name} />
+              {forecast.season && <Row k="Temporada" v={forecast.season} />}
+              <Row k="SAM" v={forecast.sam_minutes != null ? String(Number(forecast.sam_minutes)) : null} />
+              <Row k="Entrega" v={dmy(forecast.handover_date ? String(forecast.handover_date).slice(0, 10) : null)} />
+              <Row k="Pendientes" v={`${fmt(open)} pzas${Number(forecast.converted_pieces) > 0 ? ` (ya enviadas ${fmt(forecast.converted_pieces)})` : ""}`} />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Piezas a enviar" required hint={`Máx. ${fmt(open)}`}>
+                <input type="number" min="1" max={open} step="1" value={pieces} onChange={(e) => setPieces(e.target.value)}
+                  className={`${inputCls} text-right tabular-nums`} autoFocus />
+              </Field>
+              <Field label="PO cliente" hint="Opcional">
+                <input value={customerPo} onChange={(e) => setCustomerPo(e.target.value)} className={inputCls} />
+              </Field>
+              <Field label="Nota para el merchant" hint="Opcional" className="col-span-2">
+                <textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} className={inputCls} />
+              </Field>
+            </div>
+
+            {qty > 0 && !invalid && (
+              <p className={`text-[12px] rounded-lg border px-3 py-2 ${partial ? "text-amber-800 bg-amber-50 border-amber-200" : "text-gray-600 bg-white border-gray-200"}`}>
+                {partial
+                  ? <>Envío parcial: {fmt(qty)} pzas pasan a pre-orden; quedan <b>{fmt(open - qty)}</b> como pronóstico (se liberan primero sus días más cercanos).</>
+                  : <>Envío total: el pronóstico pasa a «Convertido» y sus casillas se liberan.</>}
+              </p>
+            )}
+            {error && <div className="text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{error}</div>}
+          </div>
+        )}
+
+        <div className="px-5 py-3 border-t bg-gray-50 flex items-center justify-end gap-2">
+          {done ? (
+            <button onClick={finish} className="px-4 py-2 text-sm bg-gray-900 text-white rounded-lg hover:bg-gray-700">Listo</button>
+          ) : (
+            <>
+              <button onClick={() => onClose?.()} disabled={busy} className="px-4 py-2 text-sm bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50">Cancelar</button>
+              <button onClick={submit} disabled={busy || invalid} className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 inline-flex items-center gap-2">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                {partial ? `Enviar ${fmt(qty)} pzas` : "Enviar a pre-orden"}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>

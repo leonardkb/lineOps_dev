@@ -10,7 +10,10 @@
 // Roll life cycle (fabric_rolls.status):
 //   requested     → pulled from Skytex and requested by Skyrina
 //   assigned      → container chosen (F01, parked on spot A01), waiting for the truck
-//   in_stock      → QR scanned on arrival, stored in its container
+//   arrived       → Recepción step 1: scanned at the dock, not in a container yet
+//   temporary     → Recepción step 3: no container had room; parked in a temporary
+//                   place with a written reason, until it is put in a container
+//   in_stock      → stored in its container (Recepción step 2, or the old one-step scan)
 //   at_inspection → sent to the fabric inspection team
 //   returned      → returned to the supplier
 //   cancelled     → request cancelled before arrival
@@ -34,6 +37,21 @@
 //                               custom origin header "X-Origin-Verify". When set,
 //                               calls that skip CloudFront (straight to the
 //                               API Gateway URL) are rejected with 403.
+//   FABRIC_SKYTEX_ALLOWED_IPS   optional: comma-separated IPs Skytex calls from.
+//                               Read from "CloudFront-Viewer-Address", which
+//                               CloudFront sets itself (the caller cannot fake it);
+//                               the distribution must forward that header to the
+//                               origin. Other IPs get 403.
+//   FABRIC_SKYTEX_SIGNING_SECRET  optional: shared secret for signed pushes. Skytex sends
+//                               X-Skytex-Timestamp: <unix seconds>
+//                               X-Skytex-Signature: sha256=<hex HMAC-SHA256(secret,
+//                                                   "<timestamp>.<raw body>")>
+//                               Requests older than 5 minutes are rejected (replay).
+//                               server.js must keep the raw body (req.rawBody).
+//   FABRIC_SKYTEX_REQUIRE_SIGNATURE  "true" = unsigned pushes are rejected and the
+//                               API key alone is no longer accepted. Leave unset
+//                               while Skytex migrates (then a signature, if sent,
+//                               must be valid, otherwise the API key is checked).
 //   FABRIC_AGING_DAYS   optional, days in stock before a roll is flagged (default 30)
 // Until the API is live, the screen also accepts the test JSON pasted or uploaded
 // (POST /api/fabric-warehouse/skytex/preview) and runs it through the same mapper.
@@ -82,7 +100,7 @@ const FIELDS = [
   { key: "width_unit", label: "Width Unit", aliases: ["unidadancho", "widthuom"] },
   { key: "weight", label: "Weight", aliases: ["peso", "rollweight", "pesorollo"] },
   { key: "weight_unit", label: "Weight Unit", aliases: ["unidadpeso", "pesounidad", "weightuom", "uompeso"] },
-  { key: "weight_gsm", label: "Gramaje (g/m²)", aliases: ["gsm", "gramaje", "grammage", "gm2", "grm2", "gramsm2"] },
+  { key: "weight_gsm", label: "Gramaje (g/m²)", aliases: ["gsm", "gramaje", "gramajegm2", "grammage", "gm2", "grm2", "gramsm2"] },
   { key: "composition", label: "Composition", aliases: ["composicion", "content"] },
   { key: "month_buy", label: "Month Buy", aliases: ["mescompra", "buymonth"] },
   { key: "fabric_item_number", label: "Fabric item number", aliases: ["itemnumber", "fabricitem", "fabriccode", "articulo"] },
@@ -151,6 +169,114 @@ function normalizeRoll(obj) {
 
 // Dedup key for a roll: supplier code + roll number.
 const rollKeyOf = (r) => `${String(r.supplier_code || r.supplier || "").trim().toUpperCase()}|${String(r.roll_no || "").trim().toUpperCase()}`;
+
+// ---------------------------------------------------------------------------
+// Upload of the roll list in an Excel / CSV file (Recepción › Escanear rollos).
+// The screen reads the file and sends its cells as rows of values; the header
+// row is found here (any of the first 20 rows) and matched with the same
+// aliases as the Skytex JSON. Every IMPORT_COLUMNS column must be present —
+// the fields of the roll detail plus the roll number. Yardas / Metros and any
+// other agreed field are read when present.
+// ---------------------------------------------------------------------------
+const IMPORT_COLUMNS = [
+  ["roll_no", "Rollo de tela"],
+  ["fabric_name", "Fabric name"], ["color", "Color"],
+  ["lot", "Lote"], ["po_number", "Purchase order number"],
+  ["supplier", "Supplier"], ["customer", "Cliente"],
+  ["supplier_code", "Supplier Code"], ["width", "Width"],
+  ["width_unit", "Width Unit"], ["weight", "Weight"],
+  ["weight_unit", "Weight Unit"], ["weight_gsm", "Gramaje (g/m²)"],
+  ["composition", "Composition"], ["month_buy", "Month Buy"],
+  ["fabric_item_number", "Fabric item number"], ["fabric_type", "Tipo de tela"],
+  ["arrival_date", "Fecha de entrega"], ["size", "Size"],
+  ["item_sku_code", "Item SKU code"], ["purchase_term", "Término de compra"],
+  ["import_ref", "Importación"], ["remarks", "Remarks"],
+].map(([key, label]) => ({ key, label }));
+const IMPORT_MAX_ROWS = 3000;
+// Column sizes of fabric_rolls: longer text is cut so one cell can't fail the whole file.
+const IMPORT_MAX_LEN = {
+  po_number: 80, supplier: 150, supplier_code: 60, color: 80, lot: 80, width: 40, width_unit: 20,
+  weight: 40, weight_unit: 20, weight_gsm: 40, month_buy: 40, fabric_item_number: 80, fabric_name: 200,
+  fabric_type: 80, customer: 150, size: 40, item_sku_code: 120, purchase_term: 80, import_ref: 120,
+};
+const SCI_NUMBER = /^\d+(?:\.\d+)?E\+?\d+$/i;
+const filled = (c) => c != null && String(c).trim() !== "";
+
+// → { items, errors, duplicates, headerRow, extraColumns } | { status, error, extra }
+function readImportSheet(matrix, firstRow = 1) {
+  const rows = Array.isArray(matrix) ? matrix.map((r) => (Array.isArray(r) ? r : [])) : [];
+  if (!rows.some((r) => r.some(filled))) return { status: 400, error: "El archivo está vacío." };
+
+  // Header row: among the first 20 rows, the one that names the most fields.
+  let head = -1;
+  let best = 0;
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    const n = new Set(rows[i].map((c) => ALIAS.get(normKey(c))?.key).filter(Boolean)).size;
+    if (n > best) { best = n; head = i; }
+  }
+  if (best < 2) {
+    const firstFilled = rows.find((r) => r.some(filled)) || [];
+    return {
+      status: 422,
+      error: "No se encontró la fila de encabezados. La primera fila del archivo debe tener los nombres de las columnas.",
+      extra: { code: "missing_columns", missing: IMPORT_COLUMNS.map((f) => f.label), found: firstFilled.filter(filled).map(String), headerRow: null },
+    };
+  }
+
+  const header = rows[head].map((c) => (c == null ? "" : String(c).trim()));
+  const col = {};
+  header.forEach((h, i) => {
+    const f = h && ALIAS.get(normKey(h));
+    if (f && col[f.key] == null) col[f.key] = i;
+  });
+  const headerRow = firstRow + head;
+  const missing = IMPORT_COLUMNS.filter((f) => col[f.key] == null).map((f) => f.label);
+  if (missing.length) {
+    return {
+      status: 422,
+      error: `Faltan ${missing.length} columna(s) en el archivo: ${missing.join(", ")}.`,
+      extra: { code: "missing_columns", missing, found: header.filter(Boolean), headerRow },
+    };
+  }
+
+  const items = [];
+  const errors = [];
+  const duplicates = [];
+  const seen = new Map();
+  for (let i = head + 1; i < rows.length; i++) {
+    const cells = rows[i];
+    if (!cells.some(filled)) continue;
+    const rowNo = firstRow + i;
+    const obj = {};
+    for (const [k, idx] of Object.entries(col)) obj[k] = cells[idx];
+    const raw = {};
+    header.forEach((h, idx) => { if (h && filled(cells[idx])) raw[h] = cells[idx]; });
+    const r = normalizeRoll(obj);
+    if (!r.roll_no) { errors.push({ row: rowNo, error: "Sin número de rollo" }); continue; }
+    if (SCI_NUMBER.test(r.roll_no)) {
+      errors.push({ row: rowNo, roll_no: r.roll_no, error: "El número de rollo quedó en notación científica. Dé formato de texto a la columna en Excel y guarde de nuevo." });
+      continue;
+    }
+    if (r.roll_no.length > 80) { errors.push({ row: rowNo, roll_no: r.roll_no.slice(0, 30), error: "Número de rollo de más de 80 caracteres" }); continue; }
+    for (const [k, max] of Object.entries(IMPORT_MAX_LEN)) if (r[k] && r[k].length > max) r[k] = r[k].slice(0, max);
+    const key = rollKeyOf(r);
+    if (seen.has(key)) { duplicates.push({ row: rowNo, roll_no: r.roll_no, first: seen.get(key) }); continue; }
+    seen.set(key, rowNo);
+    items.push({ row: rowNo, r, raw, key });
+  }
+  if (items.length > IMPORT_MAX_ROWS) {
+    return { status: 400, error: `Máximo ${IMPORT_MAX_ROWS} rollos por archivo; este tiene ${items.length}. Divídalo en varios archivos.` };
+  }
+  if (!items.length) {
+    return {
+      status: 422,
+      error: errors.length ? `Ningún renglón tiene un número de rollo válido (${errors.length} con error).` : "No hay rollos debajo de los encabezados.",
+      extra: { code: "no_rolls", errors: errors.slice(0, 100), headerRow },
+    };
+  }
+  const extraColumns = header.filter((h) => h && !ALIAS.has(normKey(h)));
+  return { items, errors, duplicates, headerRow, extraColumns };
+}
 
 // Find the first array of objects inside whatever Skytex returns.
 function extractArray(payload) {
@@ -365,7 +491,7 @@ async function initSchema({ pool, setSchema }) {
         out_reference VARCHAR(120),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT chk_fabric_roll_status CHECK (status IN
-          ('requested','assigned','in_stock','at_inspection','returned','cancelled'))
+          ('requested','assigned','arrived','temporary','in_stock','at_inspection','returned','cancelled'))
       );
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_status ON fabric_rolls(status);");
@@ -523,6 +649,32 @@ async function initSchema({ pool, setSchema }) {
         PRIMARY KEY (request_id, roll_id)
       );
     `);
+
+    // Recepción in three steps: 1 scan the rolls that arrived (status 'arrived'),
+    // 2 put them in a container (spot + container scanned → 'in_stock'),
+    // 3 when no container has room, a temporary place with a reason ('temporary').
+    // planned_box_code keeps the container a roll was reserved in before it
+    // arrived; it is only a hint for step 2.
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS arrived_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS arrived_by BIGINT;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS planned_box_code VARCHAR(40);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_place VARCHAR(120);");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_reason TEXT;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_at TIMESTAMPTZ;");
+    await client.query("ALTER TABLE fabric_rolls ADD COLUMN IF NOT EXISTS temp_by BIGINT;");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_fabric_rolls_arrived_at ON fabric_rolls(arrived_at);");
+    // Databases created before: widen the status check once (it is not rebuilt on every start).
+    const chk = await client.query(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conname = 'chk_fabric_roll_status' AND conrelid = 'fabric_rolls'::regclass`
+    );
+    if (!chk.rows[0] || !chk.rows[0].def.includes("temporary")) {
+      await client.query("ALTER TABLE fabric_rolls DROP CONSTRAINT IF EXISTS chk_fabric_roll_status;");
+      await client.query(
+        `ALTER TABLE fabric_rolls ADD CONSTRAINT chk_fabric_roll_status CHECK (status IN
+          ('requested','assigned','arrived','temporary','in_stock','at_inspection','returned','cancelled'))`
+      );
+    }
 
     console.log("✅ fabric-warehouse tables ready in prod_db_schema");
   } finally {
@@ -754,7 +906,12 @@ function registerFabricWarehouse(app, deps) {
   //   { "transfer_id": "TR-2026-000123", "event": "transfer", "data": [ {roll}, … ] }
   // (transfer_id may also come inside each roll.)
   //
-  // Auth: header "X-Api-Key: <FABRIC_SKYTEX_WEBHOOK_KEY>" (or Authorization: Bearer).
+  // Auth, in this order (see the header of this file for the env vars):
+  //   1. X-Origin-Verify (only through CloudFront)       -> 403
+  //   2. caller IP in FABRIC_SKYTEX_ALLOWED_IPS, if set  -> 403
+  //   3. HMAC signature (X-Skytex-Signature + X-Skytex-Timestamp) when sent or
+  //      required; otherwise header "X-Api-Key: <FABRIC_SKYTEX_WEBHOOK_KEY>"
+  //      (or Authorization: Bearer)                      -> 401
   //
   // Idempotent — sending the same transfer_id again (retry or correction):
   //   • rolls already registered are UPDATED with the new data (never duplicated)
@@ -783,16 +940,82 @@ function registerFabricWarehouse(app, deps) {
     return null;
   };
 
+  // --- Extra checks for the Skytex push (each one is off until configured) ---
+  const SIGNATURE_TOLERANCE_S = 300; // 5 minutes: older signed requests are treated as replays
+
+  const allowedSkytexIps = () =>
+    String(process.env.FABRIC_SKYTEX_ALLOWED_IPS || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+  // CloudFront-Viewer-Address is "1.2.3.4:5678" (IPv4) or "2001:db8::1:5678" (IPv6).
+  const viewerIp = (req) => {
+    const v = String(req.get("cloudfront-viewer-address") || "").trim();
+    if (!v) return null;
+    const m = v.match(/^\[?([^\]]+?)\]?:\d+$/);
+    return m ? m[1] : v;
+  };
+
+  const signatureRequired = () => String(process.env.FABRIC_SKYTEX_REQUIRE_SIGNATURE || "").trim().toLowerCase() === "true";
+
+  // Returns { sent, ok, reason }. "sent" = the caller included signature headers.
+  const checkSignature = (req) => {
+    const secret = String(process.env.FABRIC_SKYTEX_SIGNING_SECRET || "").trim();
+    const sig = String(req.get("x-skytex-signature") || "").trim().replace(/^sha256=/i, "").toLowerCase();
+    const ts = String(req.get("x-skytex-timestamp") || "").trim();
+    const sent = Boolean(sig || ts);
+    if (!sent) return { sent, ok: false, reason: "missing signature headers" };
+    if (!secret) return { sent, ok: false, reason: "signing secret not configured on Skyrina side" };
+    if (!sig || !ts) return { sent, ok: false, reason: "both X-Skytex-Signature and X-Skytex-Timestamp are required" };
+    if (!/^\d{9,11}$/.test(ts) || Math.abs(Date.now() / 1000 - Number(ts)) > SIGNATURE_TOLERANCE_S) {
+      return { sent, ok: false, reason: "timestamp invalid or older than 5 minutes" };
+    }
+    if (!Buffer.isBuffer(req.rawBody)) return { sent, ok: false, reason: "raw body not available (server.js must set req.rawBody)" };
+    const expected = crypto.createHmac("sha256", secret).update(`${ts}.`).update(req.rawBody).digest("hex");
+    return sameKey(sig, expected) ? { sent, ok: true } : { sent, ok: false, reason: "signature does not match" };
+  };
+
+  // Log rejected calls (without secrets) so attempts show up in CloudWatch.
+  const logRejected = (req, status, reason) =>
+    console.warn(`[skytex-webhook] rejected ${status}: ${reason} (ip=${viewerIp(req) || "unknown"})`);
+
   app.post(`${BASE}/skytex/transfers`, withClient(async (req, res, client) => {
     // Only through CloudFront (which adds X-Origin-Verify), never straight to API Gateway.
     const originSecret = String(process.env.FABRIC_ORIGIN_VERIFY || "").trim();
     if (originSecret && !sameKey(String(req.get("x-origin-verify") || ""), originSecret)) {
+      logRejected(req, 403, "missing or wrong X-Origin-Verify");
       return res.status(403).json({ success: false, code: "forbidden", error: "Use the published URL." });
     }
+
+    // Only Skytex's own IPs, when the list is configured.
+    const ips = allowedSkytexIps();
+    if (ips.length) {
+      const ip = viewerIp(req);
+      if (!ip || !ips.includes(ip)) {
+        logRejected(req, 403, "IP not in FABRIC_SKYTEX_ALLOWED_IPS");
+        return res.status(403).json({ success: false, code: "forbidden", error: "Caller not allowed." });
+      }
+    }
+
     const key = webhookKey();
-    if (!key) return res.status(503).json({ success: false, code: "not_configured", error: "Webhook not configured on Skyrina side (FABRIC_SKYTEX_WEBHOOK_KEY)." });
-    const sent = String(req.get("x-api-key") || "").trim() || String(req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
-    if (!sent || !sameKey(sent, key)) return res.status(401).json({ success: false, code: "unauthorized", error: "Invalid or missing API key." });
+    const signingConfigured = Boolean(String(process.env.FABRIC_SKYTEX_SIGNING_SECRET || "").trim());
+    if (!key && !signingConfigured) {
+      return res.status(503).json({ success: false, code: "not_configured", error: "Webhook not configured on Skyrina side (FABRIC_SKYTEX_WEBHOOK_KEY or FABRIC_SKYTEX_SIGNING_SECRET)." });
+    }
+
+    // Signature first: required, or checked whenever Skytex sends one.
+    const sig = checkSignature(req);
+    if (signatureRequired() || sig.sent) {
+      if (!sig.ok) {
+        logRejected(req, 401, sig.reason);
+        return res.status(401).json({ success: false, code: "unauthorized", error: `Invalid request signature: ${sig.reason}.` });
+      }
+    } else {
+      // Transition period: unsigned calls still authenticate with the API key.
+      const sent = String(req.get("x-api-key") || "").trim() || String(req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      if (!key || !sent || !sameKey(sent, key)) {
+        logRejected(req, 401, "invalid or missing API key");
+        return res.status(401).json({ success: false, code: "unauthorized", error: "Invalid or missing API key." });
+      }
+    }
 
     const body = req.body;
     if (!body || typeof body !== "object") return res.status(400).json({ success: false, code: "invalid_payload", error: "Body must be JSON." });
@@ -975,7 +1198,7 @@ function registerFabricWarehouse(app, deps) {
               COUNT(r.id)::int AS rolls,
               COUNT(r.id) FILTER (WHERE r.status = 'requested')::int AS en_skytex,
               COUNT(r.id) FILTER (WHERE r.status = 'assigned')::int AS reserved,
-              COUNT(r.id) FILTER (WHERE r.status IN ('in_stock','at_inspection','returned'))::int AS received,
+              COUNT(r.id) FILTER (WHERE r.status IN ('arrived','temporary','in_stock','at_inspection','returned'))::int AS received,
               COUNT(r.id) FILTER (WHERE r.status = 'cancelled')::int AS cancelled,
               COALESCE(SUM(r.yards) FILTER (WHERE r.status <> 'cancelled'), 0) AS yards,
               to_char(MIN(r.arrival_date) FILTER (WHERE r.status IN ('requested','assigned')), 'YYYY-MM-DD') AS next_delivery,
@@ -1326,7 +1549,8 @@ function registerFabricWarehouse(app, deps) {
       return { status: 200, body: { success: true, duplicate: false, unrequested: true, roll: fresh.rows[0] } };
     }
 
-    const pending = f.rows.filter((r) => ["requested", "assigned"].includes(r.status));
+    // arrived / temporary: already scanned at the dock (Recepción step 1) → stored here.
+    const pending = f.rows.filter((r) => ["requested", "assigned", "arrived", "temporary"].includes(r.status));
     if (!pending.length) {
       const r = f.rows[0];
       const where = r.box_code ? ` en ${r.box_code}${r.location_code ? ` (${r.location_code})` : ""}` : r.location_code ? ` en ${r.location_code}` : "";
@@ -1535,15 +1759,24 @@ function registerFabricWarehouse(app, deps) {
   // Undo a receipt scanned by mistake (only while still in stock).
   app.post(`${BASE}/rolls/:id/undo-receive`, authenticateToken, withClient(async (req, res, client) => {
     await client.query("BEGIN");
+    // Scanned at the dock first (arrived_at set) → back to «Asignar a contenedor»,
+    // out of the container. Otherwise → reserved in its container, as before.
     const { rows } = await client.query(
-      `UPDATE fabric_rolls SET status = 'assigned', received_at = NULL, received_by = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'in_stock' RETURNING id, location_id`,
+      `UPDATE fabric_rolls r
+          SET status       = CASE WHEN r.arrived_at IS NOT NULL THEN 'arrived' ELSE 'assigned' END,
+              box_id       = CASE WHEN r.arrived_at IS NOT NULL THEN NULL ELSE r.box_id END,
+              location_id  = CASE WHEN r.arrived_at IS NOT NULL THEN NULL ELSE r.location_id END,
+              container_id = CASE WHEN r.arrived_at IS NOT NULL THEN NULL ELSE r.container_id END,
+              received_at = NULL, received_by = NULL, updated_at = now()
+         FROM (SELECT id, location_id AS old_loc, box_id AS old_box FROM fabric_rolls WHERE id = $1 FOR UPDATE) prev
+        WHERE r.id = prev.id AND r.status = 'in_stock'
+        RETURNING r.id, r.status, prev.old_loc, (SELECT code FROM fabric_boxes WHERE id = prev.old_box) AS old_box_code`,
       [req.params.id]
     );
     if (!rows.length) { await client.query("ROLLBACK"); return fail(res, 409, "Solo se puede deshacer un rollo que sigue en inventario."); }
-    await logMove(client, { rollId: rows[0].id, type: "receive_undone", from: rows[0].location_id, userId: req.user?.id });
+    await logMove(client, { rollId: rows[0].id, type: "receive_undone", from: rows[0].old_loc, fromBox: rows[0].old_box_code, userId: req.user?.id });
     await client.query("COMMIT");
-    res.json({ success: true });
+    res.json({ success: true, status: rows[0].status });
   }));
 
   // Resolve a scanned code to a roll (used by the inspection send screen).
@@ -1559,6 +1792,425 @@ function registerFabricWarehouse(app, deps) {
     );
     if (!rows.length) return fail(res, 404, `No existe el rollo ${scan.roll_no}.`);
     res.json({ success: true, rolls: rows });
+  }));
+
+  // ======================================================================
+  //  RECEPCIÓN: 1 Escanear rollos → 2 Asignar a contenedor → 3 Lugar temporal
+  // ======================================================================
+  //   1  POST /reception/arrive        a roll that arrived (Skytex list or any roll)
+  //                                    → 'arrived'. Saved on every scan.
+  //   2  POST /rolls/put-away          selected 'arrived'/'temporary' rolls → one
+  //                                    container (spot + container scanned) → 'in_stock'
+  //   3  POST /rolls/to-temporary      no container with room: 'arrived' → 'temporary',
+  //                                    with a required reason and an optional place
+  //      POST /reception/identify      what is this code? (spot, container or roll); saves nothing
+  //      GET  /reception               everything the screen shows
+  const MAX_PUTAWAY = 500;
+
+  const arrivedMessage = (r) => ({
+    arrived: `${r.roll_no} ya se escaneó. Falta asignarlo a un contenedor.`,
+    temporary: `${r.roll_no} ya llegó y está en el lugar temporal${r.temp_place ? ` «${r.temp_place}»` : ""}.`,
+    in_stock: `${r.roll_no} ya está guardado en ${r.box_code || "—"}${r.location_code ? ` (${r.location_code})` : ""}.`,
+    at_inspection: `${r.roll_no} está en inspección.`,
+    returned: `${r.roll_no} fue devuelto al proveedor.`,
+  }[r.status] || `El rollo ${r.roll_no} está en estado «${r.status}».`);
+
+  // ?date=YYYY-MM-DD → the PDA's «today» for the scanned-today list.
+  app.get(`${BASE}/reception`, authenticateToken, withClient(async (req, res, client) => {
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || "") ? req.query.date : new Date().toISOString().slice(0, 10);
+    const expected = await client.query(
+      `${ROLL_SELECT} WHERE r.status IN ('requested','assigned') ORDER BY r.po_number NULLS LAST, r.roll_no LIMIT 3000`
+    );
+    const arrived = await client.query(
+      `${ROLL_SELECT} WHERE r.status = 'arrived' ORDER BY r.arrived_at DESC NULLS LAST, r.id DESC LIMIT 2000`
+    );
+    const temporary = await client.query(
+      `${ROLL_SELECT} WHERE r.status = 'temporary' ORDER BY r.temp_at NULLS LAST, r.id LIMIT 2000`
+    );
+    const today = await client.query(
+      `${ROLL_SELECT} WHERE r.arrived_at::date = $1::date AND r.status <> 'cancelled'
+        ORDER BY r.arrived_at DESC, r.id DESC LIMIT 2000`,
+      [day]
+    );
+    // Free room in the containers that are on a spot (the same count roomInBox uses).
+    const roomy = await client.query(
+      `SELECT * FROM (
+         SELECT b.id, b.code, l.code AS location_code,
+                GREATEST(COALESCE(b.capacity, l.capacity, 0)
+                  - (SELECT COUNT(*) FROM fabric_rolls r WHERE r.box_id = b.id AND r.status IN ('assigned','in_stock')), 0)::int AS free
+           FROM fabric_boxes b JOIN fabric_locations l ON l.id = b.location_id
+          WHERE b.is_active) x
+        ORDER BY x.free DESC, x.code`
+    );
+    const withRoom = roomy.rows.filter((b) => b.free > 0);
+    const places = await client.query(
+      `SELECT temp_place AS place FROM fabric_rolls
+        WHERE temp_place IS NOT NULL AND temp_at >= now() - interval '90 days'
+        GROUP BY temp_place ORDER BY MAX(temp_at) DESC LIMIT 8`
+    );
+    res.json({
+      success: true, date: day,
+      expected: expected.rows, arrived: arrived.rows, temporary: temporary.rows, today: today.rows,
+      space: {
+        placed: roomy.rows.length,
+        withRoom: withRoom.length,
+        free: withRoom.reduce((s, b) => s + b.free, 0),
+        boxes: withRoom.slice(0, 8),
+      },
+      places: places.rows.map((p) => p.place),
+      maxPutAway: MAX_PUTAWAY,
+    });
+  }));
+
+  // Step 1. Body: { raw, allowUnrequested? }
+  //   → { roll, unrequested?, reservedIn? } | { duplicate: true, roll, message }
+  //   → 404 code "not_requested" when the roll is not on the Skytex list
+  app.post(`${BASE}/reception/arrive`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = str(req.body?.raw);
+    if (!raw) return fail(res, 400, "Código vacío.");
+    const label = await classifyCode(client, raw);
+    if (label && (label.kind === "box" || label.kind === "location")) {
+      const what = label.kind === "box" ? `del contenedor ${label.box.code}` : `del lugar ${label.location.code}`;
+      return fail(res, 409, `Esa es la etiqueta ${what}. Aquí solo se escanean rollos; el contenedor se elige en «Asignar a contenedor».`, { code: "label" });
+    }
+    const f = await findScannedRoll(client, raw);
+    if (f.error) return fail(res, f.status, f.error);
+    const { scan } = f;
+    const userId = req.user?.id ?? null;
+
+    // Not on the Skytex list.
+    if (!f.rows.length) {
+      if (req.body?.allowUnrequested !== true) {
+        return fail(res, 404, `El rollo ${scan.roll_no} no está en la lista de Skytex.`, { code: "not_requested", rollNo: scan.roll_no });
+      }
+      await client.query("BEGIN");
+      const ins = await client.query(
+        `INSERT INTO fabric_rolls (skytex_key, roll_no, supplier_code, raw, status, source, arrived_at, arrived_by, requested_by)
+         VALUES ($1, $2, $3, $4, 'arrived', 'scan', now(), $5, $5)
+         ON CONFLICT (skytex_key) DO UPDATE
+           SET status = 'arrived', box_id = NULL, container_id = NULL, location_id = NULL,
+               arrived_at = now(), arrived_by = EXCLUDED.arrived_by,
+               received_at = NULL, received_by = NULL, updated_at = now()
+         WHERE fabric_rolls.status = 'cancelled'
+         RETURNING id`,
+        [`SCAN|${scan.roll_no.toUpperCase()}`, scan.roll_no, scan.supplier_code, JSON.stringify({ scanned: scan.raw }), userId]
+      );
+      if (!ins.rows.length) {
+        await client.query("ROLLBACK");
+        return fail(res, 409, `El rollo ${scan.roll_no} ya está registrado. Actualice la pantalla.`);
+      }
+      await logMove(client, { rollId: ins.rows[0].id, type: "arrived", reason: "Sin solicitud a Skytex", userId });
+      await client.query("COMMIT");
+      const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [ins.rows[0].id]);
+      return res.json({ success: true, duplicate: false, unrequested: true, roll: fresh.rows[0] });
+    }
+
+    const open = f.rows.filter((r) => ["requested", "assigned"].includes(r.status));
+    if (!open.length) {
+      const r = f.rows[0];
+      return res.json({ success: true, duplicate: true, roll: r, message: arrivedMessage(r) });
+    }
+    if (open.length > 1) {
+      return fail(res, 409, `Hay ${open.length} rollos ${scan.roll_no} de distintos proveedores. Escanee el código completo.`);
+    }
+    const roll = open[0];
+    const reservedIn = roll.status === "assigned" ? roll.box_code || null : null;
+    await client.query("BEGIN");
+    // The roll leaves its reserved container (it is at the dock now); the code
+    // stays in planned_box_code as a hint for step 2.
+    const upd = await client.query(
+      `UPDATE fabric_rolls
+          SET status = 'arrived', arrived_at = now(), arrived_by = $2,
+              planned_box_code = COALESCE($3, planned_box_code),
+              box_id = NULL, location_id = NULL, container_id = NULL, updated_at = now()
+        WHERE id = $1 AND status IN ('requested','assigned')
+        RETURNING id`,
+      [roll.id, userId, reservedIn]
+    );
+    if (!upd.rows.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, "El rollo cambió de estado. Actualice e intente de nuevo.");
+    }
+    await logMove(client, {
+      rollId: roll.id, type: "arrived", from: roll.location_id, fromBox: roll.box_code || null,
+      reference: roll.po_number, userId,
+    });
+    await client.query("COMMIT");
+    const fresh = await client.query(`${ROLL_SELECT} WHERE r.id = $1`, [roll.id]);
+    res.json({ success: true, duplicate: false, roll: fresh.rows[0], reservedIn });
+  }));
+
+  // Undo a step-1 scan made by mistake (only while it waits for a container).
+  // Skytex roll → back to the Skytex list; roll without request → removed (cancelled).
+  app.post(`${BASE}/rolls/:id/undo-arrival`, authenticateToken, withClient(async (req, res, client) => {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `UPDATE fabric_rolls
+          SET status = CASE WHEN source = 'scan' THEN 'cancelled' ELSE 'requested' END,
+              arrived_at = NULL, arrived_by = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'arrived'
+        RETURNING id, status`,
+      [req.params.id]
+    );
+    if (!rows.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, "Solo se puede deshacer un rollo que todavía espera contenedor.");
+    }
+    await logMove(client, { rollId: rows[0].id, type: "arrival_undone", userId: req.user?.id });
+    await client.query("COMMIT");
+    res.json({ success: true, status: rows[0].status });
+  }));
+
+  // What is this code? Saves nothing. Body: { raw, expect? }
+  //   → { kind: "location", location } | { kind: "box", box } | { kind: "invalid_box", error }
+  //   → { kind: "roll", rollNo, rolls }   (rolls: every match, any status)
+  app.post(`${BASE}/reception/identify`, authenticateToken, withClient(async (req, res, client) => {
+    const raw = str(req.body?.raw);
+    if (!raw) return fail(res, 400, "Código vacío.");
+    const label = await classifyCode(client, raw, req.body?.expect);
+    if (label) return res.json({ success: true, ...label });
+    const f = await findScannedRoll(client, raw);
+    if (f.error) return fail(res, f.status, f.error);
+    res.json({ success: true, kind: "roll", rollNo: f.scan.roll_no, rolls: f.rows });
+  }));
+
+  // ======================================================================
+  //  UPLOAD: the roll list in an Excel / CSV file
+  // ======================================================================
+  // Body: { fileName, firstRow, rows: [[cell, …], …], dryRun }
+  //   The screen reads the file (xlsx, xls, csv) and sends its cells.
+  //   dryRun (default) → what would happen; nothing is saved.
+  //   dryRun false     → the rolls go on the «por llegar» list (status requested,
+  //                      the same list the Skytex transfers fill), so the normal
+  //                      scan in «Escanear rollos» checks them off.
+  // Per roll (matched by supplier code + roll number, like Skytex):
+  //   new        → added to the list
+  //   update     → already on the list: its data is updated with the file
+  //   rerequest  → was cancelled: back on the list
+  //   link       → was scanned without a request: gets the file's data
+  //   received   → already arrived / in stock: only empty fields are filled
+  // 422 code "missing_columns" { missing, found, headerRow } when a column is missing.
+  async function planImport(client, items, lock = false) {
+    const keys = items.map((it) => it.key);
+    const nos = [...new Set(items.map((it) => it.r.roll_no.toUpperCase()))];
+    const { rows } = await client.query(
+      `SELECT id, skytex_key, UPPER(roll_no) AS rn, UPPER(COALESCE(supplier_code, '')) AS sc, status, source
+         FROM fabric_rolls
+        WHERE skytex_key = ANY($1::text[]) OR (UPPER(roll_no) = ANY($2::text[]) AND status <> 'cancelled')
+        ORDER BY id${lock ? " FOR UPDATE" : ""}`,
+      [keys, nos]
+    );
+    const byKey = new Map(rows.map((x) => [x.skytex_key, x]));
+    const byNo = new Map();
+    for (const x of rows) if (x.status !== "cancelled") byNo.set(x.rn, [...(byNo.get(x.rn) || []), x]);
+    const used = new Set();
+    return items.map((it) => {
+      const sc = String(it.r.supplier_code || "").trim().toUpperCase();
+      const same = (byNo.get(it.r.roll_no.toUpperCase()) || []).filter((x) => !used.has(x.id));
+      let hit = byKey.get(it.key);
+      let action;
+      if (hit && hit.status !== "cancelled") {
+        action = hit.source === "scan" ? "link" : ["requested", "assigned"].includes(hit.status) ? "update" : "received";
+      } else if (same.some((x) => x.source === "scan")) {
+        hit = same.find((x) => x.source === "scan");
+        action = "link";
+      } else {
+        // The same roll registered with or without the supplier code.
+        const loose = same.filter((x) => x.source !== "scan" && (!x.sc || !sc || x.sc === sc));
+        if (loose.length === 1) {
+          hit = loose[0];
+          action = ["requested", "assigned"].includes(hit.status) ? "update" : "received";
+        } else if (hit) {
+          action = "rerequest";
+        } else {
+          action = "new";
+        }
+      }
+      if (hit) {
+        if (used.has(hit.id)) return { ...it, action: "duplicate" };
+        used.add(hit.id);
+      }
+      return { ...it, action, id: hit?.id ?? null, status: hit?.status ?? null };
+    });
+  }
+
+  app.post(`${BASE}/reception/import`, authenticateToken, withClient(async (req, res, client) => {
+    const fileName = (str(req.body?.fileName) || "archivo").slice(0, 150);
+    const sheet = readImportSheet(req.body?.rows, Math.max(1, parseInt(req.body?.firstRow, 10) || 1));
+    if (sheet.error) return fail(res, sheet.status, sheet.error, sheet.extra || {});
+    const dryRun = req.body?.dryRun !== false;
+    const userId = req.user?.id ?? null;
+
+    if (!dryRun) await client.query("BEGIN");
+    const plan = await planImport(client, sheet.items, !dryRun);
+    const counts = { new: 0, update: 0, rerequest: 0, link: 0, received: 0, duplicate: 0 };
+    for (const p of plan) counts[p.action]++;
+
+    const summary = {
+      fileName,
+      headerRow: sheet.headerRow,
+      total: plan.length,
+      counts,
+      errors: sheet.errors.slice(0, 200),
+      errorCount: sheet.errors.length,
+      duplicates: [
+        ...sheet.duplicates,
+        ...plan.filter((p) => p.action === "duplicate").map((p) => ({ row: p.row, roll_no: p.r.roll_no, first: null })),
+      ].slice(0, 200),
+      extraColumns: sheet.extraColumns,
+    };
+
+    if (dryRun) {
+      const byPo = new Map();
+      for (const p of plan) {
+        if (p.action === "duplicate") continue;
+        const k = p.r.po_number || "Sin PO";
+        const c = byPo.get(k) || { po: k, rolls: 0, yards: 0 };
+        c.rolls++; c.yards += Number(p.r.yards) || 0;
+        byPo.set(k, c);
+      }
+      return res.json({
+        success: true, dryRun: true, ...summary,
+        yards: plan.reduce((s, p) => s + (p.action === "duplicate" ? 0 : Number(p.r.yards) || 0), 0),
+        byPo: [...byPo.values()].sort((a, b) => b.rolls - a.rolls),
+        preview: plan.slice(0, 300).map((p) => ({
+          row: p.row, action: p.action, status: p.status,
+          roll_no: p.r.roll_no, po_number: p.r.po_number, supplier: p.r.supplier,
+          fabric_name: p.r.fabric_name, color: p.r.color, lot: p.r.lot, yards: p.r.yards,
+        })),
+      });
+    }
+
+    const reason = `Cargado desde el archivo «${fileName}»`;
+    const vals = (r) => FIELD_KEYS.map((k) => r[k]);
+    const sets = (start, fillOnly = false) => FIELD_KEYS
+      .map((k, i) => (fillOnly ? `${k} = COALESCE(${k}, $${start + i})` : `${k} = COALESCE($${start + i}, ${k})`))
+      .join(", ");
+    const saved = { new: 0, update: 0, rerequest: 0, link: 0, received: 0, skipped: 0 };
+    const ids = []; // every roll of the file, in file order (for printing its labels)
+
+    for (const p of plan) {
+      const { r, key } = p;
+      const rawJson = JSON.stringify({ ...p.raw, _archivo: fileName, _renglon: p.row });
+      if (p.action === "duplicate") { saved.skipped++; continue; }
+      if (p.action === "new") {
+        const cols = ["skytex_key", ...FIELD_KEYS, "raw", "requested_by"];
+        const ins = await client.query(
+          `INSERT INTO fabric_rolls (${cols.join(",")})
+           VALUES (${cols.map((_, i) => `$${i + 1}`).join(",")})
+           ON CONFLICT (skytex_key) DO NOTHING RETURNING id`,
+          [key, ...vals(r), rawJson, userId]
+        );
+        if (!ins.rows.length) { saved.skipped++; continue; }
+        p.id = ins.rows[0].id;
+        await logMove(client, { rollId: ins.rows[0].id, type: "requested", reference: r.po_number, reason, userId });
+      } else if (p.action === "update") {
+        await client.query(`UPDATE fabric_rolls SET ${sets(2)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
+      } else if (p.action === "rerequest") {
+        const upd = await client.query(
+          `UPDATE fabric_rolls
+              SET ${sets(4)}, raw = $2, status = 'requested', requested_by = $3, requested_at = now(),
+                  container_id = NULL, location_id = NULL, box_id = NULL, location_set_at = NULL, updated_at = now()
+            WHERE id = $1 AND status = 'cancelled' RETURNING id`,
+          [p.id, rawJson, userId, ...vals(r)]
+        );
+        if (!upd.rows.length) { saved.skipped++; continue; }
+        await logMove(client, { rollId: p.id, type: "requested", reference: r.po_number, reason, userId });
+      } else if (p.action === "link") {
+        // Keeps its own key if another (cancelled) row already uses this one.
+        await client.query(
+          `UPDATE fabric_rolls
+              SET skytex_key = CASE WHEN EXISTS (SELECT 1 FROM fabric_rolls x WHERE x.skytex_key = $2 AND x.id <> $1)
+                                    THEN skytex_key ELSE $2 END,
+                  raw = $3, source = 'skytex', ${sets(4)}, updated_at = now()
+            WHERE id = $1`,
+          [p.id, key, rawJson, ...vals(r)]
+        );
+      } else if (p.action === "received") {
+        await client.query(`UPDATE fabric_rolls SET ${sets(2, true)}, updated_at = now() WHERE id = $1`, [p.id, ...vals(r)]);
+      }
+      saved[p.action]++;
+      ids.push(p.id);
+    }
+    await client.query("COMMIT");
+    // The saved rolls with all their data, so the screen can print their labels.
+    const fresh = ids.length ? (await client.query(`${ROLL_SELECT} WHERE r.id = ANY($1::bigint[])`, [ids])).rows : [];
+    const order = new Map(ids.map((id, i) => [String(id), i]));
+    fresh.sort((a, b) => order.get(String(a.id)) - order.get(String(b.id)));
+    res.json({
+      success: true, dryRun: false, ...summary, saved,
+      onList: saved.new + saved.update + saved.rerequest,
+      rolls: fresh,
+    });
+  }));
+
+
+  // Step 2 (and from step 3). Body: { ids, boxId }. All or nothing.
+  app.post(`${BASE}/rolls/put-away`, authenticateToken, withClient(async (req, res, client) => {
+    const ids = idList(req.body?.ids);
+    const boxId = parseInt(req.body?.boxId, 10);
+    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
+    if (ids.length > MAX_PUTAWAY) return fail(res, 400, `Máximo ${MAX_PUTAWAY} rollos por guardado.`);
+    if (!boxId) return fail(res, 400, "Escanee el lugar y después el contenedor.");
+    const userId = req.user?.id ?? null;
+
+    await client.query("BEGIN");
+    // Lock the container so two PDAs cannot fill the same free space.
+    await client.query(`SELECT id FROM fabric_boxes WHERE id = $1 FOR UPDATE`, [boxId]);
+    const cur = await client.query(
+      `SELECT id, status, po_number, temp_place FROM fabric_rolls WHERE id = ANY($1::bigint[]) FOR UPDATE`, [ids]
+    );
+    const ok = cur.rows.filter((r) => r.status === "arrived" || r.status === "temporary");
+    if (!ok.length) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, "Ninguno de esos rollos espera contenedor. Actualice la lista.");
+    }
+    const room = await roomInBox(client, boxId, ok.map((r) => r.id), ok.length);
+    if (room.error) {
+      await client.query("ROLLBACK");
+      const free = room.B && room.B.capacity != null ? Math.max(0, room.B.capacity - room.B.used) : null;
+      return fail(res, room.status, room.error, { code: room.code, free });
+    }
+    const B = room.B;
+    await client.query(
+      `UPDATE fabric_rolls
+          SET status = 'in_stock', box_id = $2, location_id = $3, container_id = $4,
+              received_at = now(), received_by = $5, location_set_at = now(), updated_at = now()
+        WHERE id = ANY($1::bigint[])`,
+      [ok.map((r) => r.id), B.id, B.location_id, B.container_id, userId]
+    );
+    for (const r of ok) {
+      await logMove(client, {
+        rollId: r.id, type: "received", to: B.location_id, toBox: B.code, reference: r.po_number, userId,
+        reason: r.status === "temporary" ? `Desde el lugar temporal${r.temp_place ? ` «${r.temp_place}»` : ""}` : null,
+      });
+    }
+    await client.query("COMMIT");
+    res.json({ success: true, saved: ok.length, skipped: ids.length - ok.length, box: await boxInfo(client, B.id) });
+  }));
+
+  // Step 3. Body: { ids, reason, place? }
+  app.post(`${BASE}/rolls/to-temporary`, authenticateToken, withClient(async (req, res, client) => {
+    const ids = idList(req.body?.ids);
+    const reason = str(req.body?.reason);
+    const place = str(req.body?.place);
+    if (!ids.length) return fail(res, 400, "Seleccione al menos un rollo.");
+    if (!reason || reason.length < 3) return fail(res, 400, "Escriba por qué los rollos van al lugar temporal.");
+    if (reason.length > 500) return fail(res, 400, "El motivo es demasiado largo (máximo 500 caracteres).");
+    if (place && place.length > 120) return fail(res, 400, "El nombre del lugar es demasiado largo (máximo 120 caracteres).");
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `UPDATE fabric_rolls
+          SET status = 'temporary', temp_reason = $2, temp_place = $3, temp_at = now(), temp_by = $4, updated_at = now()
+        WHERE id = ANY($1::bigint[]) AND status = 'arrived'
+        RETURNING id`,
+      [ids, reason, place, req.user?.id ?? null]
+    );
+    for (const r of rows) {
+      await logMove(client, { rollId: r.id, type: "temporary", reference: place, reason, userId: req.user?.id });
+    }
+    await client.query("COMMIT");
+    res.json({ success: true, moved: rows.length, skipped: ids.length - rows.length });
   }));
 
   // ======================================================================
@@ -2256,7 +2908,7 @@ function registerFabricWarehouse(app, deps) {
     if (po) { params.push(po); poSql = ` AND COALESCE(r.po_number, 'Sin PO') = $${params.length}`; }
     const scope = `r.source = 'skytex' AND r.status <> 'cancelled'
                    AND (r.status IN ('requested','assigned') OR r.requested_at >= now() - make_interval(days => $1))${poSql}`;
-    const RECEIVED = `r.status IN ('in_stock','at_inspection','returned')`;
+    const RECEIVED = `r.status IN ('arrived','temporary','in_stock','at_inspection','returned')`;
 
     const byPo = await client.query(
       `SELECT COALESCE(r.po_number, 'Sin PO') AS po_number,
@@ -2374,6 +3026,7 @@ function registerFabricWarehouse(app, deps) {
 
 registerFabricWarehouse.initSchema = initSchema;
 registerFabricWarehouse.normalizeRoll = normalizeRoll;
+registerFabricWarehouse.readImportSheet = readImportSheet;
 registerFabricWarehouse.parseRollScan = parseRollScan;
 registerFabricWarehouse.cleanScan = cleanScan;
 registerFabricWarehouse.labelCandidates = labelCandidates;

@@ -9,7 +9,7 @@
 //   <FinishedWarehouseNav active={tab} onNavigate={setTab}>
 //     {tab === "dashboard"   && <FinishedWarehouseDashboard onNavigate={setTab} />}
 //     {tab === "escaneo"     && <FinishedWarehouseScan onNavigate={setTab} />}
-//     {tab === "pre-empaque" && <PrePacking />}
+//     {tab === "banda"       && <FinishedWarehouseBanda />}
 //     {tab === "inventario"  && <FinishedWarehouseInventory onNavigate={setTab} />}
 //   </FinishedWarehouseNav>
 //
@@ -20,7 +20,7 @@
 // right of the fixed sidebar with a padding on <body>.
 import { useState, useEffect, useCallback, useRef, Children } from "react";
 import {
-  Warehouse, LayoutDashboard, ScanLine, ClipboardList, Boxes, LogOut,
+  Warehouse, LayoutDashboard, ScanLine, ClipboardList, Boxes, LogOut, Cpu,
   PanelLeftClose, PanelLeftOpen, Menu, X, ChevronRight, Search,
 } from "lucide-react";
 import { api, cx, ConfirmProvider, ShellCtx, setPendingSearch } from "./finishedShared";
@@ -31,6 +31,7 @@ export const WAREHOUSE_NAV_SECTIONS = [
     items: [
       { key: "dashboard",  label: "Dashboard",  icon: LayoutDashboard },
       { key: "escaneo",    label: "Escaneo",    icon: ScanLine, badge: "pendingTickets", tone: "amber" },
+      { key: "banda",      label: "Banda",      icon: Cpu },
       
     ],
   },
@@ -44,6 +45,8 @@ export const WAREHOUSE_NAV_SECTIONS = [
 ];
 // Flat list (kept for code that imported it before).
 export const WAREHOUSE_NAV_ITEMS = WAREHOUSE_NAV_SECTIONS.flatMap((s) => s.items);
+// Page shown when the requested tab isn't in the menu (e.g. the removed "pre-empaque").
+export const WAREHOUSE_DEFAULT_TAB = "dashboard";
 
 const COLLAPSE_KEY = "fwSidebarCollapsed";
 
@@ -110,6 +113,17 @@ export default function FinishedWarehouseNav({
   };
 
   const current = sections.flatMap((s) => s.items).find((i) => i.key === active);
+
+  // The parent owns the tab. If it asks for a page that isn't in the menu
+  // (an old default, a saved tab, a role setting still pointing at
+  // "pre-empaque"), send it to the default page instead.
+  const fallback = sections.flatMap((s) => s.items).some((i) => i.key === WAREHOUSE_DEFAULT_TAB)
+    ? WAREHOUSE_DEFAULT_TAB
+    : sections[0]?.items[0]?.key;
+  const valid = !!current;
+  useEffect(() => {
+    if (!valid && fallback) onNavigate(fallback);
+  }, [valid, fallback]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const sidebar = (mini) => (
     <div className="h-full flex flex-col bg-[#131b3a] text-slate-300">
@@ -279,7 +293,7 @@ export default function FinishedWarehouseNav({
           <div className="fw-shell-main transition-[padding]">
             {topBar}
             <main className="px-4 sm:px-6 lg:px-8 py-6">
-              <div className="max-w-7xl mx-auto">{children}</div>
+              <div className="max-w-7xl mx-auto">{valid ? children : null}</div>
             </main>
           </div>
         </div>

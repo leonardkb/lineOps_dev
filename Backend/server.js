@@ -464,6 +464,7 @@ await registerSupermarketPlan.initSchema({ pool, setSchema });   // ← nueva
 await registerHolidays.initSchema({ pool, setSchema });
 await plannerStyleParams.initSchema({ pool, setSchema });   // planner style standards
 await registerPreOrders.initSchema({ pool, setSchema });
+await registerPanelRequests.initSchema({ pool, setSchema });   // 📦 solicitudes de paneles
 await registerPreOrderHolds.initSchema({ pool, setSchema });   // ← add
 await registerForecastOrders.initSchema({ pool, setSchema });  // 📈 Tablero de pronóstico (después de customers)
 await registerOrderSets.initSchema({ pool, setSchema });   // ← must come first
@@ -471,11 +472,14 @@ await registerBom.initSchema({ pool, setSchema });   // ← must come first
 await registerWorkOrders.initSchema({ pool, setSchema });
 await registerOrderClose.initSchema({ pool, setSchema });
 await planWeekLocks.initSchema({ pool, setSchema });   // 🔒 después de line_assignments
+await learningCurves.initSchema({ pool, setSchema });  // 📈 curvas de aprendizaje (después de line_assignments)
 await planUrgentChanges.initSchema({ pool, setSchema }); // ⚡ bitácora de cambios urgentes
 await registerPlanRebalance.initSchema({ pool, setSchema }); // ⚖️ plan_board_snapshots
 await registerCutOrders.initSchema({ pool, setSchema });
+await registerPanelStock.initSchema({ pool, setSchema });             
 await registerCutOrderRequests.initSchema({ pool, setSchema });   // solicitudes de corte (después de cut_orders)
 await registerFinishedWarehouse.initSchema({ pool, setSchema });
+await registerBanda.initSchema({ pool, setSchema });   // 📦 banda_eventos
  await registerFabricWarehouse.initSchema({ pool, setSchema });
 await registerFinishedWarehouseAnalytics.initSchema({ pool, setSchema });
 await registerMerchantPlan.initSchema({ pool, setSchema });
@@ -1147,6 +1151,16 @@ app.get("/api/me", authenticateToken, async (req, res) => {
   });
 });
 
+// TV screens call this every hour to stay logged in 24/7
+app.post("/api/refresh-token", authenticateToken, (req, res) => {
+  const token = jwt.sign(
+    { id: req.user.id, username: req.user.username, role: req.user.actual_role },
+    JWT_SECRET,
+    { expiresIn: "72h" } // safety margin for reboots or network outages
+  );
+  res.json({ success: true, token });
+});
+
 // ======================================================================
 // 🔒 PLAN BOARD LOCK
 // The planner finishes the plan, then clicks "Bloquear tablero". While locked,
@@ -1255,6 +1269,10 @@ registerHolidays(app, { authenticateToken, pool, setSchema });
 const registerFabricWarehouse = require("./fabric-warehouse");
    registerFabricWarehouse(app, { authenticateToken, pool, setSchema });
 
+
+const registerPlanningStyleFit = require("./planning-style-fit");
+registerPlanningStyleFit(app, { authenticateToken, pool, setSchema, holidays: registerHolidays, planWeekLocks });
+
 // Planner-owned SAM / operators / hours / efficiency PER STYLE. The Plan Board
 // capacity comes from here, NOT from the line engineers' line_runs.
 const plannerStyleParams = require("./planner-style-params");
@@ -1263,6 +1281,15 @@ plannerStyleParams(app, {
   effApproverRoles: ["ceo","master"],
 });
 
+// 📈 Curvas de aprendizaje por estilo + línea. Debe ir DESPUÉS de plannerStyleParams:
+// registra su resolvedor en plannerStyleParams, que lo usa en la carga de cada
+// línea-día (asignar, mover, mover en lote, cambios urgentes y re-planeo).
+const learningCurves = require("./learning-curves");
+learningCurves(app, {
+  authenticateToken, pool, setSchema, plannerStyleParams,
+  curveRoles: ["planner", "master", "ceo", "skyrina"],
+  ceoRoles: ["ceo", "master", "skyrina"],
+});
 
 
 const registerBom = require("./bom");
@@ -1283,7 +1310,16 @@ const registerMerchantAnalytics = require("./merchant-analytics");
 registerMerchantAnalytics(app, { authenticateToken, pool, setSchema });
 
 const registerPreOrderHolds = require("./pre-order-holds");
-registerPreOrderHolds(app, { authenticateToken, pool, setSchema });
+registerPreOrderHolds(app, { authenticateToken, pool, setSchema, holidays: registerHolidays });
+
+const registerPanelRequests = require("./panel-requests");
+// 📦 Solicitudes de paneles: la línea pide, el supermercado surte, la línea recibe.
+registerPanelRequests(app, { authenticateToken, pool, setSchema });
+
+
+const registerPanelStock = require("./panel-stock");                 // with the other requires
+registerPanelStock(app, { authenticateToken, pool, setSchema });      // below registerPanelRequests(...)
+// AFTER registerCutOrders.initSchema
 
 // 📈 Tablero de pronóstico del cliente: pronósticos FC#### + sus reservas de línea/día.
 const registerForecastOrders = require("./forecast-orders");
@@ -1294,6 +1330,9 @@ registerMerchantPlan(app, { authenticateToken, pool, setSchema });
 
 const registerFinishedWarehouse = require("./finished-warehouse");
 registerFinishedWarehouse(app, { authenticateToken, pool, setSchema });
+
+const registerBanda = require("./banda-plc");
+registerBanda(app, { authenticateToken, pool, setSchema });
 
 const registerCutOrders = require("./cut-orders");
 registerCutOrders(app, { authenticateToken, pool, setSchema });
@@ -1330,7 +1369,7 @@ registerSupermarketPlan(app, {
   authenticateToken,
   pool,
   setSchema,
-  publisherRoles: ["planner", "supervisor", "master", "soporte_it", "skyrina", "admin","supermarcado"],
+  publisherRoles: ["planner", "supervisor", "master","admin","supermarcado"],
 });
 
 const registerEfficiencyPermission = require("./efficiency-permission");
@@ -4220,6 +4259,317 @@ app.post("/api/line-assignments/move-batch", authenticateToken, async (req, res)
     client.release();
   }
 });
+
+
+// ---------------------------------------------------------------------------
+// POST /api/line-assignments/carry-balance
+//
+// «Confirmar» en la campana de Saldos del Plan Board (órdenes abiertas: en
+// proceso o pendientes).
+// Una celda pasada cerró corta (se asignaron 500, se cosieron 300): este
+// endpoint, en UNA transacción,
+//   1. liquida esa celda por lo que sí se cosió (misma lógica que settle-day,
+//      registerWorkOrders.settleDayInTx);
+//   2. pone el saldo (200) al FRENTE del siguiente día laborable de la MISMA
+//      línea (el día siguiente a la celda corta, nunca antes de hoy);
+//   3. reacomoda POR PIEZAS lo que ya estaba planeado: cada día se llena hasta
+//      su capacidad y lo que no cabe pasa al frente del día siguiente, donde
+//      se combina con lo que haya; el empuje termina en el primer día con
+//      hueco. La misma orden + color + estado en el mismo día queda en una
+//      sola celda (saldo 82 + 268 = 350).
+//
+// 🔒 A diferencia de las demás rutas del planner, ésta NO llama a
+//    planWeekLocks.enforce(): el saldo de una orden en proceso debe seguir al
+//    día siguiente aunque ese día (o la celda corta) caiga en una semana
+//    bloqueada por el CEO. Sólo se recorren celdas 'planned' / 'released' de
+//    hoy en adelante de esa línea; completadas e historia no se tocan.
+//    El tablero bloqueado (plan_board_lock) sí aplica: el middleware de
+//    BOARD_WRITE_PREFIXES rechaza esta ruta cuando está bloqueado.
+//
+// Body: { workOrderId, lineNo, date }   (date = día que cerró corto)
+// ---------------------------------------------------------------------------
+app.post("/api/line-assignments/carry-balance", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  const addDaysStr = (ymdStr, k) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() + k);
+    return dt.toISOString().slice(0, 10);
+  };
+  const isWeekend = (ymdStr) => {
+    const [y, m, d] = ymdStr.split("-").map(Number);
+    const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+    return dow === 0 || dow === 6;
+  };
+  const MAX_DAYS = 400; // tope del recorrido (días naturales)
+  let inTx = false;
+  try {
+    await setSchema(client);
+    const { workOrderId, lineNo, date } = req.body || {};
+    const woId = parseInt(workOrderId, 10);
+    const line = String(lineNo == null ? "" : lineNo);
+    const shortDay = String(date || "").slice(0, 10);
+    if (!Number.isFinite(woId) || !line || !/^\d{4}-\d{2}-\d{2}$/.test(shortDay)) {
+      return res.status(400).json({ success: false, error: "Faltan workOrderId, lineNo o date." });
+    }
+
+    const today = (await client.query("SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d")).rows[0].d;
+    if (shortDay >= today) {
+      return res.status(400).json({ success: false, error: "Sólo se confirman saldos de días que ya cerraron (anteriores a hoy)." });
+    }
+
+    // Sólo órdenes abiertas.
+    const woRes = await client.query("SELECT id, work_order_no, status FROM work_orders WHERE id = $1", [woId]);
+    const wo = woRes.rows[0];
+    if (!wo) return res.status(404).json({ success: false, error: "Orden no encontrada." });
+    const st = String(wo.status || "").toLowerCase();
+    if (["completed", "cancelled", "canceled", "closed"].includes(st)) {
+      return res.status(409).json({ success: false, error: `La orden ${wo.work_order_no} ya no está abierta (${st}).` });
+    }
+    // Órdenes abiertas en proceso o pendientes: ambas se pueden confirmar
+    // (las completadas / canceladas ya se rechazaron arriba).
+
+    // Estándar del planner para el estilo: tamaño de la celda de día completo.
+    const style = await plannerStyleParams.styleOfWorkOrder(client, woId);
+    if (!(await plannerStyleParams.getParams(client, style))) {
+      return plannerStyleParams.styleParamsRequired(res, style);
+    }
+
+    // Días festivos / paros de esa línea (fuera de la transacción: si la tabla
+    // no existe, el error no aborta la transacción).
+    const holidaySet = new Set();
+    try {
+      const hrows = await registerHolidays.holidaysBetween(client, { from: shortDay, to: addDaysStr(shortDay, MAX_DAYS + 30) });
+      for (const h of hrows) if (h.line_no == null || String(h.line_no) === line) holidaySet.add(String(h.holiday_date).slice(0, 10));
+    } catch (e) { console.warn("⚠️  holidays not available for carry-balance:", e.message); }
+    // Las semanas bloqueadas NO se brincan: es justo lo que pide esta acción.
+    const isWorkday = (d) => !isWeekend(d) && !holidaySet.has(d);
+    const nextWorkday = (d) => { let x = addDaysStr(d, 1); while (!isWorkday(x)) x = addDaysStr(x, 1); return x; };
+
+    // Primer día destino: el día laborable siguiente a la celda corta; si ese
+    // ya pasó, hoy (o el siguiente laborable desde hoy).
+    let start = nextWorkday(shortDay);
+    if (start < today) { start = today; while (!isWorkday(start)) start = addDaysStr(start, 1); }
+
+    await client.query("BEGIN");
+    inTx = true;
+    // (sin planWeekLocks.enforce a propósito, ver arriba)
+    // Un solo «Confirmar» a la vez por línea.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`carry-balance:${line}`]);
+
+    // 1) Liquidar la celda corta.
+    const settled = await registerWorkOrders.settleDayInTx(client, { workOrderId: woId, lineNo: line, date: shortDay });
+    if (!settled.found) {
+      await client.query("ROLLBACK"); inTx = false;
+      return res.status(404).json({ success: false, error: "No hay asignación en esa celda." });
+    }
+    if (!(settled.balance > 0)) {
+      await client.query("COMMIT"); inTx = false;
+      return res.json({ success: true, balance: 0, placed: [], shifted: 0, message: "El día ya estaba completo; no hay saldo que mover." });
+    }
+
+    // 2) REFLUJO POR PIEZAS desde el primer día destino.
+    //
+    //    La línea es una fila: el saldo entra al FRENTE del primer día y todo
+    //    lo que ya estaba planeado se acomoda detrás, llenando cada día hasta
+    //    su capacidad. Lo que no cabe en un día pasa al frente del siguiente;
+    //    en cuanto un día tiene hueco suficiente, el empuje se acaba.
+    //
+    //    Ejemplo (capacidad 350): día 19 = saldo SKM0442 82 + SKM0442 350.
+    //      → día 19: 82 + 268 = 350 (se fusionan en una sola celda)
+    //      → día 20: recibe 82 al frente; si ahí hay otra orden con hueco, se
+    //        combina con ella; si no, sus últimas piezas pasan al día 21, etc.
+    //
+    //    Capacidad con estilos mezclados: cada pieza "pesa" 1/target de su
+    //    estilo ese día (target = cellCapacity().target, piezas/día del estilo),
+    //    y un día está lleno cuando la suma de pesos llega a 1.
+    //    Filas 'planned'/'released' se reacomodan; las demás (completed, etc.)
+    //    sólo ocupan capacidad y no se mueven. El orden de la línea se respeta:
+    //    en cuanto algo de un día se desborda, todo lo que va detrás también.
+    const styleOfWo = new Map([[woId, style]]);
+    const getStyle = async (id) => {
+      if (!styleOfWo.has(id)) styleOfWo.set(id, await plannerStyleParams.styleOfWorkOrder(client, id));
+      return styleOfWo.get(id);
+    };
+    const capCache = new Map();
+    const capOf = async (st, day) => {
+      const k = `${st}|${day}`;
+      if (!capCache.has(k)) {
+        const cap = await plannerStyleParams.cellCapacity(client, { lineNo: line, date: day, style: st });
+        capCache.set(k, { target: Math.floor(Number(cap.target) || 0), availableMinutes: cap.availableMinutes });
+      }
+      return capCache.get(k);
+    };
+
+    const lineRes = await client.query(
+      `SELECT id, work_order_id, color, status, assigned_quantity,
+              to_char(assigned_date, 'YYYY-MM-DD') AS d
+         FROM line_assignments
+        WHERE line_no = $1
+          AND assigned_date >= $2::date
+          AND status NOT IN ('cancelled', 'rejected')
+        ORDER BY assigned_date, id
+        FOR UPDATE`,
+      [line, start]
+    );
+    const movByDay = new Map();   // día -> filas planned/released (se reacomodan)
+    const fixedByDay = new Map(); // día -> otras filas (sólo ocupan capacidad)
+    for (const r of lineRes.rows) {
+      if (!isWorkday(r.d)) continue; // fin de semana / festivo: no se toca
+      const m = r.status === "planned" || r.status === "released" ? movByDay : fixedByDay;
+      if (!m.has(r.d)) m.set(r.d, []);
+      m.get(r.d).push({ ...r, qty: Number(r.assigned_quantity) || 0 });
+    }
+
+    let carry = settled.leftovers
+      .filter((l) => Number(l.qty) > 0)
+      .map((l) => ({ woId, color: l.color, qty: Number(l.qty), status: "planned", fromRow: null, isBalance: true, ownDay: false }));
+    const dayPlans = []; // [{ day, keep: Map(rowId -> qty), incoming: [seg], present: Set(woId) }]
+    {
+      let day = start, scanned = 0;
+      while (carry.length && scanned < MAX_DAYS) {
+        scanned++;
+        const fixed = fixedByDay.get(day) || [];
+        const mov = movByDay.get(day) || [];
+        let load = 0;
+        for (const f of fixed) {
+          const t = (await capOf(await getStyle(f.work_order_id), day)).target;
+          if (t > 0) load += f.qty / t;
+        }
+        const seq = [
+          ...carry,
+          ...mov.map((r) => ({ woId: r.work_order_id, color: r.color, qty: r.qty, status: r.status, fromRow: r.id, isBalance: false, ownDay: true })),
+        ];
+        const next = [];
+        const keep = new Map(mov.map((r) => [r.id, 0]));
+        const incoming = [];
+        for (const seg of seq) {
+          if (next.length) { next.push({ ...seg, ownDay: false }); continue; } // respetar el orden
+          const st = await getStyle(seg.woId);
+          const t = (await capOf(st, day)).target;
+          if (t <= 0) {
+            await client.query("ROLLBACK"); inTx = false;
+            return res.status(409).json({ success: false, error: `La Línea ${line} no tiene estándar de capacidad para ${st} el ${day}.` });
+          }
+          const room = Math.max(0, Math.floor((1 - load) * t + 1e-6));
+          const q = Math.min(room, seg.qty);
+          if (q > 0) {
+            load += q / t;
+            if (seg.ownDay) keep.set(seg.fromRow, (keep.get(seg.fromRow) || 0) + q);
+            else incoming.push({ ...seg, qty: q });
+          }
+          if (seg.qty - q > 0) next.push({ ...seg, qty: seg.qty - q, ownDay: false });
+        }
+        const present = new Set([
+          ...fixed.map((f) => f.work_order_id),
+          ...mov.filter((r) => (keep.get(r.id) || 0) > 0).map((r) => r.work_order_id),
+          ...incoming.map((s) => s.woId),
+        ]);
+        dayPlans.push({ day, mov, keep, incoming, present });
+        carry = next;
+        day = nextWorkday(day);
+      }
+      if (carry.length) {
+        await client.query("ROLLBACK"); inTx = false;
+        return res.status(400).json({ success: false, error: `No se pudo recorrer la Línea ${line}: el horizonte de ${MAX_DAYS} días no alcanza.` });
+      }
+    }
+
+    // 3) Aplicar. Primero se recortan / borran las filas que soltaron piezas
+    //    (assigned_quantity tiene CHECK > 0), luego se insertan las piezas que
+    //    llegaron a cada día con mergeOrInsertAssignment, que las FUSIONA con
+    //    la fila de la misma orden + color + estado si ya existe ese día
+    //    (así saldo 82 + 268 de la misma orden quedan en una sola celda de 350).
+    const touchedDays = new Set([shortDay]);
+    let rowsChanged = 0, piecesShifted = 0, releasedMoved = 0;
+    for (const p of dayPlans) {
+      for (const r of p.mov) {
+        const k = p.keep.get(r.id) || 0;
+        if (k === r.qty) continue;
+        if (k <= 0) await client.query(`DELETE FROM line_assignments WHERE id = $1`, [r.id]);
+        else await client.query(`UPDATE line_assignments SET assigned_quantity = $2, updated_at = now() WHERE id = $1`, [r.id, k]);
+        rowsChanged++;
+        touchedDays.add(p.day);
+      }
+    }
+    const placed = [];   // saldo por día
+    const combined = []; // días donde el saldo quedó junto a otra(s) orden(es)
+    for (const p of dayPlans) {
+      let balHere = 0;
+      for (const seg of p.incoming) {
+        const cap = await capOf(await getStyle(seg.woId), p.day);
+        await mergeOrInsertAssignment(client, {
+          workOrderId: seg.woId,
+          lineRunId: null,
+          lineNo: line,
+          assignedDate: p.day,
+          quantity: seg.qty,
+          availableMinutes: cap.availableMinutes,
+          requiredRate: cap.target,
+          startDate: p.day,
+          endDate: p.day,
+          status: seg.status,
+          color: seg.color,
+        });
+        touchedDays.add(p.day);
+        if (seg.isBalance) balHere += seg.qty;
+        else {
+          piecesShifted += seg.qty;
+          if (seg.status === "released") releasedMoved++;
+        }
+      }
+      if (balHere > 0) {
+        placed.push({ date: p.day, qty: balHere });
+        const others = [...p.present].filter((id) => String(id) !== String(woId));
+        if (others.length) combined.push({ date: p.day, qty: balHere, withIds: others });
+      }
+    }
+    if (combined.length) {
+      const ids = [...new Set(combined.flatMap((c) => c.withIds))];
+      const names = new Map((await client.query(`SELECT id, work_order_no FROM work_orders WHERE id = ANY($1)`, [ids])).rows.map((r) => [String(r.id), r.work_order_no]));
+      for (const c of combined) { c.with = c.withIds.map((id) => names.get(String(id)) || `#${id}`); delete c.withIds; }
+    }
+    const shifted = rowsChanged;
+    const shiftedReleased = releasedMoved;
+
+    // 4) Corridas borrador que quedaron sin celda (día corto vacío o días que
+    //    se reacomodaron).
+    for (const d of touchedDays) await cleanupOrphanDraftRuns(client, line, d);
+
+    // Semanas bloqueadas que se tocaron (para el aviso del tablero).
+    const lockedWeeks = await planWeekLocks.lockedWeekSet(client);
+    const lockedTouched = [...new Set([...touchedDays].filter((d) => planWeekLocks.isLockedDay(lockedWeeks, d)).map((d) => planWeekLocks.weekStartOf(d)))].sort();
+
+    await client.query("COMMIT"); inTx = false;
+    console.log(
+      `[carry-balance v4-reflow] wo=${woId} line=${line} short=${shortDay} balance=${settled.balance} ` +
+      `start=${start} placed=${placed.map((p) => `${p.qty}@${p.date}`).join(",") || "-"} ` +
+      `combined=${combined.map((c) => `${c.qty}@${c.date}+${c.with.join("+")}`).join(",") || "-"} ` +
+      `rowsChanged=${shifted} piecesShifted=${piecesShifted} lockedWeeks=${lockedTouched.join(",") || "-"} by=${req.user?.id ?? "?"}`
+    );
+    res.json({
+      success: true,
+      assigned: settled.assigned,
+      produced: settled.produced,
+      balance: settled.balance,
+      startDate: start,
+      combined,          // [{ date, qty, with:[OT] }]
+      placed,            // [{ date, qty }] saldo por día
+      shifted,           // filas que soltaron piezas
+      piecesShifted,     // piezas de otras celdas que se corrieron
+      shiftedReleased,
+      lockedWeeks: lockedTouched,
+    });
+  } catch (err) {
+    if (inTx) await client.query("ROLLBACK").catch(() => {});
+    if (err && err.code === "PRODUCED_UNRESOLVED") return res.status(409).json({ success: false, error: err.message });
+    console.error("❌ Error en carry-balance:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
  
 
 // ---------------------------------------------------------------------------
@@ -4876,6 +5226,167 @@ app.get("/api/line-runs/:lineNo", async (req, res) => {
     client.release();
   }
 });
+
+// ===========================================================================
+// 📺 LINE TV DASHBOARD ENDPOINTS (LineTvDashboard.jsx)
+// ===========================================================================
+
+// GET /api/line-tv/week-efficiency/:lineNo?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+// Per-day SAM efficiency of one line (weekly graphs: last week vs this week).
+//   efficiency = Σ(packed pcs × SAM) / Σ(operators × working_hours × 60) × 100
+// Packed pcs = sewed qty of operations named pack / emp / finished / terminado.
+// Draft runs are excluded.
+app.get("/api/line-tv/week-efficiency/:lineNo", authenticateToken, async (req, res) => {
+  const { lineNo } = req.params;
+  const { startDate, endDate } = req.query;
+  const isYMD = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+  if (!isYMD(startDate) || !isYMD(endDate)) {
+    return res.status(400).json({ success: false, error: "startDate and endDate (YYYY-MM-DD) are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const result = await client.query(
+      `WITH run_totals AS (
+         SELECT
+           lr.run_date,
+           COALESCE(lr.sam_minutes, 0)::numeric     AS sam,
+           COALESCE(lr.working_hours, 0)::numeric   AS wh,
+           COALESCE(lr.target_pcs, 0)::numeric      AS target,
+           COALESCE(
+             NULLIF((SELECT COUNT(*) FROM run_operators ro WHERE ro.run_id = lr.id), 0),
+             lr.operators_count,
+             0
+           )::numeric                               AS ops,
+           COALESCE((
+             SELECT SUM(se.sewed_qty)
+               FROM operator_operations oo
+               JOIN operation_sewed_entries se ON se.operation_id = oo.id
+              WHERE oo.run_id = lr.id
+                AND (   oo.operation_name ILIKE '%pack%'
+                     OR oo.operation_name ILIKE '%emp%'
+                     OR oo.operation_name ILIKE '%finished%'
+                     OR oo.operation_name ILIKE '%terminado%')
+           ), 0)::numeric                           AS packed
+         FROM line_runs lr
+         WHERE lr.line_no = $1
+           AND lr.run_date BETWEEN $2::date AND $3::date
+           AND COALESCE(lr.is_draft, false) = false
+       )
+       SELECT
+         to_char(run_date, 'YYYY-MM-DD') AS date,
+         SUM(packed)                     AS produced,
+         SUM(target)                     AS target,
+         SUM(packed * sam)               AS sam_output,
+         SUM(ops * wh * 60)              AS available_minutes,
+         COUNT(*)                        AS runs
+       FROM run_totals
+       GROUP BY run_date
+       ORDER BY run_date`,
+      [String(lineNo), startDate, endDate]
+    );
+
+    const history = result.rows.map((row) => {
+      const samOutput = parseFloat(row.sam_output) || 0;
+      const availableMinutes = parseFloat(row.available_minutes) || 0;
+      return {
+        date: row.date,
+        produced: parseFloat(row.produced) || 0,
+        target: parseFloat(row.target) || 0,
+        samOutput,
+        availableMinutes,
+        runs: parseInt(row.runs, 10) || 0,
+        efficiency: availableMinutes > 0 ? (samOutput / availableMinutes) * 100 : 0,
+      };
+    });
+
+    res.json({ success: true, lineNo: String(lineNo), period: { startDate, endDate }, history });
+  } catch (err) {
+    console.error("❌ Error fetching line TV week efficiency:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/line-tv/operator-week-efficiency/:lineNo?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+//
+// Per-day, per-operator totals for one line, used by the TV operator table
+// ("Prom. semana" column). Same formula as the table:
+//   operator meta for a day = target_pcs of the run × number of operations
+//   efficiency              = Σ sewed qty / Σ meta × 100
+//
+// run_operators has no permanent employee id, so an operator is matched across
+// days by name (trimmed, case-insensitive). If the name is empty, by operator_no.
+// Draft runs are excluded.
+//
+// Paste this in server1.js right after the /api/line-tv/week-efficiency/:lineNo
+// endpoint.
+// ---------------------------------------------------------------------------
+app.get("/api/line-tv/operator-week-efficiency/:lineNo", authenticateToken, async (req, res, next) => {
+  const { lineNo } = req.params;
+  const { startDate, endDate } = req.query;
+  const isYMD = (s) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+  if (!isYMD(startDate) || !isYMD(endDate)) {
+    return res.status(400).json({ success: false, error: "startDate and endDate (YYYY-MM-DD) are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await setSchema(client);
+
+    const result = await client.query(
+      `SELECT
+         to_char(lr.run_date, 'YYYY-MM-DD')                                        AS date,
+         COALESCE(NULLIF(lower(btrim(ro.operator_name)), ''), '#' || ro.operator_no) AS operator_key,
+         MAX(ro.operator_name)                                                      AS operator_name,
+         MIN(ro.operator_no)                                                        AS operator_no,
+         SUM(COALESCE(sw.qty, 0))                                                   AS produced,
+         SUM(COALESCE(lr.target_pcs, 0))                                            AS meta
+       FROM line_runs lr
+       JOIN run_operators ro       ON ro.run_id = lr.id
+       JOIN operator_operations oo ON oo.run_operator_id = ro.id
+       LEFT JOIN LATERAL (
+         SELECT SUM(se.sewed_qty) AS qty
+           FROM operation_sewed_entries se
+          WHERE se.operation_id = oo.id
+       ) sw ON true
+       WHERE lr.line_no = $1
+         AND lr.run_date BETWEEN $2::date AND $3::date
+         AND COALESCE(lr.is_draft, false) = false
+       GROUP BY lr.run_date, operator_key
+       ORDER BY lr.run_date, MIN(ro.operator_no)`,
+      [String(lineNo), startDate, endDate]
+    );
+
+    const days = result.rows.map((row) => {
+      const produced = parseFloat(row.produced) || 0;
+      const meta = parseFloat(row.meta) || 0;
+      return {
+        date: row.date,
+        operatorKey: row.operator_key,
+        operatorName: row.operator_name,
+        operatorNo: row.operator_no,
+        produced,
+        meta,
+        efficiency: meta > 0 ? (produced / meta) * 100 : null,
+      };
+    });
+
+    res.json({ success: true, lineNo: String(lineNo), period: { startDate, endDate }, days });
+  } catch (err) {
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+
 
 // ✅ Get line leader latest run
 app.get("/api/lineleader/latest-run", async (req, res) => {

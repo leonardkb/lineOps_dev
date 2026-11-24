@@ -89,6 +89,9 @@ export default function AdvancedPlanningPage() {
   ];
 
   const isEfficiencyTab = activeTab === "efficiency";
+  // Estado de Órdenes is a wide table: use the full width and show its KPIs
+  // next to the page title.
+  const isStatusTab = activeTab === "status";
 
   // Clear message after 5 seconds
   useEffect(() => {
@@ -106,18 +109,30 @@ export default function AdvancedPlanningPage() {
           lines fit on screen without scrolling. */}
       <div
         className={`mx-auto ${
-          isEfficiencyTab ? "max-w-[1920px] px-4 pt-3 pb-0" : "max-w-7xl p-4 sm:p-6"
+          isEfficiencyTab
+            ? "max-w-[1920px] px-4 pt-3 pb-0"
+            : isStatusTab
+            ? "max-w-[1920px] p-4 sm:p-6"
+            : "max-w-7xl p-4 sm:p-6"
         }`}
       >
-        <div className={isEfficiencyTab ? "mb-2" : "mb-6"}>
-          <h1 className={`${isEfficiencyTab ? "text-lg" : "text-2xl"} font-semibold text-gray-900`}>
-            Planificación Avanzada
-          </h1>
-          {!isEfficiencyTab && (
-            <p className="text-sm text-gray-600">
-              Gestione órdenes de trabajo y asignaciones a líneas de producción
-            </p>
-          )}
+        <div
+          className={`${isEfficiencyTab ? "mb-2" : "mb-6"} ${
+            isStatusTab ? "flex flex-wrap items-center gap-x-8 gap-y-4" : ""
+          }`}
+        >
+          <div className="shrink-0">
+            <h1 className={`${isEfficiencyTab ? "text-lg" : "text-2xl"} font-semibold text-gray-900`}>
+              Planificación Avanzada
+            </h1>
+            {!isEfficiencyTab && (
+              <p className="text-sm text-gray-600">
+                Gestione órdenes de trabajo y asignaciones a líneas de producción
+              </p>
+            )}
+          </div>
+          {/* OrderStatus renders its KPI cards into this slot */}
+          {isStatusTab && <div id="planning-header-kpis" className="min-w-[320px] flex-1" />}
         </div>
 
         {/* Message Display */}

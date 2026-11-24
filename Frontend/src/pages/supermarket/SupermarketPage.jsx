@@ -12,6 +12,7 @@ import NavSupermarket from "../../components/supermarket/NavSupermarket";
 import SupermarketPlanBoard from "../../components/supermarket/SupermarketPlanBoard";
 import PublishedWeeksList from "../../components/supermarket/PublishedWeeksList";
 import SupermarketPanels from "../../components/supermarket/SupermarketPanels";
+import SupermarketPanelStock from "../../components/supermarket/SupermarketPanelStock";
 import { API_URL } from "../../lib/masterCodeCatalog";
 
 const authHeaders = () => ({
@@ -66,6 +67,13 @@ export default function SupermarketPage() {
       label: "Paneles",
       visible: true,
     },
+    {
+      // Escanear los tickets de inspección: cada panel entra al stock una vez
+      // y se ve al momento si llegó lo que se cortó.
+      id: "stock",
+      label: "Recibir paneles",
+      visible: true,
+    },
   ];
 
   const shared = { data, loading, refreshing, error, onRefresh: () => load(), onRetry: () => load({ initial: true }) };
@@ -74,41 +82,46 @@ export default function SupermarketPage() {
     <div className="min-h-screen bg-gray-50">
       <NavSupermarket />
 
-      <div className="mx-auto max-w-7xl p-4 sm:p-6">
-        <div className="mb-6">
-          <h1 className="text-2xl font-semibold text-gray-900">Supermercado</h1>
-          <p className="text-sm text-gray-600">
-            Consulte el plan de producción que planeación publicó para surtir material
-          </p>
-        </div>
+      <div className="mx-auto max-w-7xl px-4 pt-4 pb-6 sm:px-6 sm:pt-5">
+        {/* Encabezado y pestañas en una sola franja: título a la izquierda,
+            pestañas a la derecha, una sola línea inferior para los dos. En
+            pantallas angostas las pestañas bajan debajo del título. */}
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-x-8 gap-y-2 border-b">
+          <div className="pb-2.5 min-w-0">
+            <h1 className="text-2xl font-semibold text-gray-900 leading-tight">Supermercado</h1>
+            <p className="text-sm text-gray-600">
+              Consulte el plan de producción que planeación publicó para surtir material
+            </p>
+          </div>
 
-        {/* Tabs */}
-        <div className="mb-6 flex flex-wrap gap-2 border-b">
-          {tabs.map(
-            (tab) =>
-              tab.visible && (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`px-4 py-2 text-sm font-medium transition inline-flex items-center gap-2 ${
-                    activeTab === tab.id
-                      ? "text-gray-900 border-b-2 border-gray-900"
-                      : "text-gray-500 hover:text-gray-700"
-                  }`}
-                >
-                  {tab.label}
-                  {tab.badge != null && (
-                    <span
-                      className={`text-xs rounded-full px-1.5 py-0.5 ${
-                        activeTab === tab.id ? "bg-gray-900 text-white" : "bg-gray-200 text-gray-600"
-                      }`}
-                    >
-                      {tab.badge}
-                    </span>
-                  )}
-                </button>
-              )
-          )}
+          <nav className="flex flex-wrap gap-1" aria-label="Secciones del supermercado">
+            {tabs.map(
+              (tab) =>
+                tab.visible && (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    aria-current={activeTab === tab.id ? "page" : undefined}
+                    className={`-mb-px px-4 py-2.5 text-sm font-medium transition inline-flex items-center gap-2 border-b-2 ${
+                      activeTab === tab.id
+                        ? "text-gray-900 border-gray-900"
+                        : "text-gray-500 border-transparent hover:text-gray-700"
+                    }`}
+                  >
+                    {tab.label}
+                    {tab.badge != null && (
+                      <span
+                        className={`text-xs rounded-full px-1.5 py-0.5 ${
+                          activeTab === tab.id ? "bg-gray-900 text-white" : "bg-gray-200 text-gray-600"
+                        }`}
+                      >
+                        {tab.badge}
+                      </span>
+                    )}
+                  </button>
+                )
+            )}
+          </nav>
         </div>
 
         {/* Content */}
@@ -116,6 +129,7 @@ export default function SupermarketPage() {
           {activeTab === "planboard" && <SupermarketPlanBoard {...shared} />}
           {activeTab === "weeks" && <PublishedWeeksList {...shared} />}
           {activeTab === "panels" && <SupermarketPanels />}
+          {activeTab === "stock" && <SupermarketPanelStock />}
         </div>
       </div>
     </div>

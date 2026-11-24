@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
+import { flushSync } from "react-dom";
 import MetaSummary from "../components/MetaSummary";
 import NavBarline from "../components/NavBarline";
+import PanelRequestsButton from "../components/lineleader/PanelRequestsButton";
 import QRCode from "qrcode";
 import html2canvas from "html2canvas";
 
@@ -96,7 +98,7 @@ function normalizeRole(role) {
 }
 
 // ─── Baja eficiencia: configuración del aviso de las 4:45 p.m. ────────────────
-// A esta hora, si la eficiencia va por debajo del umbral, la página abre un
+// A esta hora, si la eficiencia diaria (Diario Eficiencia) va por debajo del umbral, la página abre un
 // modal para que el jefe de línea explique el motivo.
 const EFF_REASON_THRESHOLD = 70; // %
 const EFF_REASON_HOUR = 16;      // 16 h = 4 p.m.
@@ -132,7 +134,7 @@ function isAfterEffReasonTime(now = new Date()) {
 }
 
 /**
- * Modal de motivo de baja eficiencia (< 60%).
+ * Modal de motivo de baja eficiencia diaria (< 70%).
  * Muestra línea, jefe de línea y fecha, y pide seleccionar uno o varios motivos.
  */
 function EfficiencyReasonModal({
@@ -172,7 +174,7 @@ function EfficiencyReasonModal({
               Eficiencia por debajo del {EFF_REASON_THRESHOLD}%
             </div>
             <div className="mt-1 text-sm text-red-700">
-              Eficiencia actual:{" "}
+              Eficiencia diaria:{" "}
               <span className="font-bold">
                 {Number(efficiency ?? 0).toFixed(1)}%
               </span>
@@ -537,10 +539,51 @@ const calculateRealtimeEfficiency = (finishedGarments, operatorsCount, workingHo
   return Math.round(realtimeEfficiency * 100) / 100;
 };
 
+// Shows "23 nov 2026" instead of the raw ISO string. Uses UTC so the day doesn't shift.
+function formatHeaderDate(value) {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+}
+
+// ---- Hourly entry helpers ----
+// Reads the start (and optional end) time from a slot label such as "07:00-08:00", "07–08" or "7:30".
+// Returns minutes since midnight, or null when the label has no time in it.
+function parseSlotRange(label) {
+  const matches = [...String(label || "").matchAll(/(\d{1,2})(?::(\d{2}))?/g)];
+  if (!matches.length) return null;
+  const toMin = (m) => Number(m[1]) * 60 + Number(m[2] || 0);
+  const start = toMin(matches[0]);
+  if (start >= 24 * 60) return null;
+  let end = matches[1] ? toMin(matches[1]) : start + 60;
+  if (end <= start) end += 24 * 60; // block that crosses midnight
+  return { start, end };
+}
+
+// Label of the block that contains the current time, or null.
+function findSlotByTime(slots, now = new Date()) {
+  const mins = now.getHours() * 60 + now.getMinutes();
+  for (const s of slots || []) {
+    const r = parseSlotRange(s.slot_label);
+    if (r && mins >= r.start && mins < r.end) return s.slot_label;
+  }
+  return null;
+}
+
+// Block to open by default: the current hour, else the first block not fully saved, else the last one.
+function pickDefaultSlotLabel(slots, isSlotFilled) {
+  if (!slots?.length) return null;
+  const byTime = findSlotByTime(slots);
+  if (byTime) return byTime;
+  const firstOpen = slots.find((s) => !isSlotFilled(s.slot_label));
+  return (firstOpen || slots[slots.length - 1]).slot_label;
+}
+
 export default function LineLeaderPage() {
   const navigate = useNavigate();
 
   const [tab, setTab] = useState("summary");
+  const [summaryView, setSummaryView] = useState("details"); // "details" | "meta"
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState("");
   const [saving, setSaving] = useState(false);
@@ -853,7 +896,7 @@ export default function LineLeaderPage() {
     };
   }, [currentRunId, effReasonKey]);
 
-  // Revisa cada 30 s: a partir de las 4:45 p.m., si la eficiencia va por debajo
+  // Revisa cada 30 s: a partir de las 4:45 p.m., si la eficiencia diaria va por debajo
   // del umbral y aún no se respondió, abre el modal.
   useEffect(() => {
     if (!currentRunId) return;
@@ -863,7 +906,7 @@ export default function LineLeaderPage() {
       if (loading) return;
       if (!isAfterEffReasonTime()) return;
       if (!(elapsedMinutes > 0)) return; // los datos aún no están listos
-      if (realTimeEfficiency < EFF_REASON_THRESHOLD) {
+      if (overallEfficiency < EFF_REASON_THRESHOLD) {
         setEffReasonOpen(true);
       }
     };
@@ -877,7 +920,7 @@ export default function LineLeaderPage() {
     effReasonSnoozeUntil,
     loading,
     elapsedMinutes,
-    realTimeEfficiency,
+    overallEfficiency,
   ]);
 
   const toggleEffReason = (code) => {
@@ -925,7 +968,7 @@ export default function LineLeaderPage() {
             action_plan: effReasonSelected.includes("inefficiencies")
               ? effReasonActionPlan.trim()
               : null,
-            efficiency: Math.round(realTimeEfficiency * 100) / 100,
+            efficiency: Math.round(overallEfficiency * 100) / 100,
           }),
         }
       );
@@ -950,7 +993,7 @@ export default function LineLeaderPage() {
     if (!token || !user) return navigate("/", { replace: true });
 
     if (normalizeRole(user.role) !== "lineleader") {
-      return navigate("/planner", { replace: true });
+      return navigate("/", { replace: true });
     }
 
     const lineNo = user.line_number;
@@ -1212,6 +1255,141 @@ export default function LineLeaderPage() {
     if (opIds.length === 0) return false;
     const primaryOpId = opIds[0];
     return lockedSlots[styleIndex]?.[`${primaryOpId}-${slotLabel}`] || false;
+  };
+
+  // ---- Fast hourly entry ----
+  // Height of the app's own top bar ("Líder de Línea"), so the hour strip pins just below it
+  // instead of sliding underneath it. Measured from the page, so it follows any header size.
+  const [stickyTop, setStickyTop] = useState(0);
+  useEffect(() => {
+    let headerEl = null;
+    let ro = null;
+    const findHeader = () => {
+      // Whatever sits at the very top of the screen; walk up to the element that is fixed/sticky.
+      let node = document.elementFromPoint(Math.round(window.innerWidth / 2), 2);
+      while (node && node !== document.body && node !== document.documentElement) {
+        const pos = window.getComputedStyle(node).position;
+        if (pos === "fixed" || pos === "sticky") return node;
+        node = node.parentElement;
+      }
+      return null;
+    };
+    const measure = () => {
+      if (!headerEl || !document.body.contains(headerEl)) {
+        headerEl = findHeader();
+        if (headerEl && typeof ResizeObserver !== "undefined") {
+          ro?.disconnect();
+          ro = new ResizeObserver(measure);
+          ro.observe(headerEl);
+        }
+      }
+      const r = headerEl?.getBoundingClientRect();
+      // Only trust it if it really is a top bar (starts at the top and isn't huge).
+      setStickyTop(r && r.top <= 1 && r.height > 0 && r.height < 200 ? Math.round(r.bottom) : 0);
+    };
+    measure();
+    const t = setTimeout(measure, 400); // after fonts/layout settle
+    window.addEventListener("resize", measure);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("resize", measure);
+      ro?.disconnect();
+    };
+  }, []);
+
+  const entryInputRefs = useRef({}); // { operatorId: <input> }
+  const slotChipRefs = useRef({}); // { slotLabel: <button> }
+  const autoPickKeyRef = useRef("");
+
+  const isSlotFullySaved = (styleIndex, slotLabel) =>
+    operatorsList.length > 0 &&
+    operatorsList.every((op) => isSlotLocked(styleIndex, op.id, slotLabel));
+
+  // Block running right now (refreshes whenever elapsedMinutes ticks).
+  const nowSlotLabel = useMemo(() => findSlotByTime(slots), [slots, elapsedMinutes]);
+
+  // Open the current hour each time the operations tab is entered or the style changes.
+  useEffect(() => {
+    if (tab === "summary") {
+      autoPickKeyRef.current = "";
+      return;
+    }
+    if (!slots.length || !operatorsList.length) return;
+    const key = `${selectedStyleIndex}|${tab}`;
+    if (autoPickKeyRef.current === key) return;
+    autoPickKeyRef.current = key;
+    const pick = pickDefaultSlotLabel(slots, (label) => isSlotFullySaved(selectedStyleIndex, label));
+    if (pick) {
+      setSelectedTimeSlot(pick);
+      setOpGroup(firstOpenGroup(pick));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, selectedStyleIndex, slots, operatorsList, lockedSlots]);
+
+  // Keep the selected hour chip visible in the strip.
+  useEffect(() => {
+    const el = slotChipRefs.current[selectedTimeSlot];
+    if (el && typeof el.scrollIntoView === "function") {
+      el.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+    }
+  }, [selectedTimeSlot, tab]);
+
+  // Enter / "Siguiente" on the keypad jumps to the next operator that is not locked.
+  // ---- Operator group tabs (1–6, 7–12, ...) ----
+  const OP_GROUP_SIZE = 6;
+  const [opGroup, setOpGroup] = useState(0);
+  const advanceAfterSaveRef = useRef(false);
+  const opGroupCount = Math.max(1, Math.ceil(operatorsList.length / OP_GROUP_SIZE));
+  const groupOfOperator = (operatorId) =>
+    Math.max(0, Math.floor(operatorsList.findIndex((o) => o.id === operatorId) / OP_GROUP_SIZE));
+  // First group in this hour that still has an operator to save (or the first group).
+  const firstOpenGroup = (slotLabel) => {
+    const i = operatorsList.findIndex((o) => !isSlotLocked(selectedStyleIndex, o.id, slotLabel));
+    return i < 0 ? 0 : Math.floor(i / OP_GROUP_SIZE);
+  };
+  const selectSlot = (slotLabel) => {
+    setSelectedTimeSlot(slotLabel);
+    setOpGroup(firstOpenGroup(slotLabel));
+  };
+
+  // Keep the group valid if the style (and its operator count) changes.
+  useEffect(() => {
+    if (opGroup > opGroupCount - 1) setOpGroup(opGroupCount - 1);
+  }, [opGroup, opGroupCount]);
+
+  // After Guardar: if the whole group is now saved, move on to the next group with work left.
+  useEffect(() => {
+    if (!advanceAfterSaveRef.current || saving) return;
+    advanceAfterSaveRef.current = false;
+    const groupOps = operatorsList.slice(opGroup * OP_GROUP_SIZE, (opGroup + 1) * OP_GROUP_SIZE);
+    if (groupOps.length && groupOps.every((o) => isSlotLocked(selectedStyleIndex, o.id, selectedTimeSlot))) {
+      setOpGroup(firstOpenGroup(selectedTimeSlot));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lockedSlots, saving]);
+
+  // Enter / "Siguiente" on the keypad jumps to the next operator that is not locked,
+  // switching to the next group tab when the current one is finished.
+  const focusNextEntry = (operatorId) => {
+    const order = operatorsList
+      .filter((o) => !isSlotLocked(selectedStyleIndex, o.id, selectedTimeSlot))
+      .map((o) => o.id);
+    const next = order[order.indexOf(operatorId) + 1];
+    if (next == null) {
+      entryInputRefs.current[operatorId]?.blur(); // last one: close the keypad
+      return;
+    }
+    if (!entryInputRefs.current[next]) {
+      // Render the next group right now, so focus stays inside the same tap
+      // (otherwise phones close the keypad).
+      flushSync(() => setOpGroup(groupOfOperator(next)));
+    }
+    const el = entryInputRefs.current[next];
+    if (el) {
+      el.focus({ preventScroll: true });
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.select?.();
+    }
   };
 
   const getOperatorTotalCumulative = (styleIndex, operatorId) => {
@@ -1918,7 +2096,7 @@ export default function LineLeaderPage() {
         lineNo={effLineNo}
         jefeLinea={effJefeLinea}
         date={effReasonDate}
-        efficiency={realTimeEfficiency}
+        efficiency={overallEfficiency}
         selected={effReasonSelected}
         onToggle={toggleEffReason}
         note={effReasonNote}
@@ -1934,75 +2112,97 @@ export default function LineLeaderPage() {
         errorMsg={effReasonError}
       />
 
-      <div className="mx-auto max-w-6xl p-4 sm:p-6">
-        <div className="rounded-3xl border bg-white shadow-sm p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <div className="text-xl font-semibold text-gray-900">
-                Línea {user?.line_number} • {header.date || ""}
-                <span className="ml-3 inline-flex items-center rounded-full border bg-gray-50 px-3 py-1 text-sm text-gray-700">
-                  {header.styleLabel || "Corrida"}
-                </span>
-                {header.workOrderNo && (
-                  <span className="ml-2 inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-sm text-blue-800">
-                    WO: {header.workOrderNo}
-                  </span>
-                )}
-              </div>
-
-              <div className="mt-2 text-sm text-gray-700">
-                Operadores: {header.operators} &nbsp;&nbsp; Horas de trabajo: {header.workingHours}
-                &nbsp;&nbsp; SAM: {header.sam} min
-              </div>
-              <div className="mt-1 text-sm text-gray-700">
-                Eficiencia: {Math.round(safeNum(header.efficiency) * 100)}%
-              </div>
-              <div className="mt-1 text-sm text-gray-700">Total cosido: {finishedGarmentsTotal}</div>
-
-              <div className="mt-2">
-                <AlarmStatusIndicator
-                  isActive={!alarmPaused && !snoozeUntil}
-                  isPaused={alarmPaused}
-                  nextAlarmTime={nextAlarmTime}
-                />
-              </div>
+      <div className="mx-auto max-w-6xl p-3 sm:p-6">
+        <div className="rounded-2xl border bg-white shadow-sm p-3">
+          {/* Row 1: line + date, alarm status on the right */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 truncate text-base font-semibold text-gray-900">
+              Línea {user?.line_number}
+              {header.date ? (
+                <span className="font-normal text-gray-500"> · {formatHeaderDate(header.date)}</span>
+              ) : null}
             </div>
-
-            <div className="flex flex-col items-end gap-3">
-              <div className="flex gap-3">
-                <button
-                  onClick={() => setTab("summary")}
-                  className={
-                    tab === "summary"
-                      ? "rounded-xl bg-gray-900 text-white px-5 py-2 text-sm font-semibold"
-                      : "rounded-xl border bg-white px-5 py-2 text-sm font-semibold text-gray-900"
-                  }
-                >
-                  Resumen
-                </button>
-                <button
-                  onClick={() => setTab("operations")}
-                  className={
-                    tab === "operations"
-                      ? "rounded-xl bg-gray-900 text-white px-5 py-2 text-sm font-semibold"
-                      : "rounded-xl border bg-white px-5 py-2 text-sm font-semibold text-gray-900"
-                  }
-                >
-                  Operaciones
-                </button>
-              </div>
-
-              {lastSavedTime && (
-                <div className="text-xs text-gray-500">
-                  Último guardado: {new Date(lastSavedTime).toLocaleTimeString()}
-                </div>
-              )}
+            <div className="shrink-0 origin-right scale-90">
+              <AlarmStatusIndicator
+                isActive={!alarmPaused && !snoozeUntil}
+                isPaused={alarmPaused}
+                nextAlarmTime={nextAlarmTime}
+              />
             </div>
           </div>
 
+          {/* Row 2: style + work order(s).
+              One WO stays on the same line as the style (shortened if needed);
+              two or more WOs wrap onto the next line. */}
+          {(() => {
+            const workOrders = String(header.workOrderNo || "")
+              .split(/[,;|]/)
+              .map((w) => w.trim())
+              .filter(Boolean);
+            const several = workOrders.length > 1;
+            return (
+              <div className={`mt-1.5 flex items-center gap-1.5 ${several ? "flex-wrap" : "flex-nowrap"}`}>
+                <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border bg-gray-50 px-2 py-0.5 text-[11px] font-medium text-gray-700">
+                  {header.styleLabel || "Corrida"}
+                </span>
+                {workOrders.map((wo) => (
+                  <span
+                    key={wo}
+                    title={`WO: ${wo}`}
+                    className={`min-w-0 truncate rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-800 ${
+                      several ? "max-w-full" : ""
+                    }`}
+                  >
+                    WO: {wo}
+                  </span>
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* Row 3: run data in one line */}
+          <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-gray-600">
+            <span><b className="font-semibold text-gray-900">{header.operators}</b> operadores</span>
+            <span><b className="font-semibold text-gray-900">{header.workingHours}</b> h</span>
+            <span>SAM <b className="font-semibold text-gray-900">{header.sam}</b></span>
+            <span>Efic. <b className="font-semibold text-gray-900">{Math.round(safeNum(header.efficiency) * 100)}%</b></span>
+            <span>Cosido <b className="font-semibold text-gray-900">{finishedGarmentsTotal}</b></span>
+          </div>
+
+          {/* Row 4: page tabs, equal width */}
+          <div className="mt-2.5 flex gap-1.5">
+            <button
+              onClick={() => setTab("summary")}
+              className={`flex-1 rounded-lg px-2 py-1.5 text-xs font-semibold ${
+                tab === "summary" ? "bg-gray-900 text-white" : "border bg-white text-gray-900"
+              }`}
+            >
+              Resumen
+            </button>
+            <button
+              onClick={() => setTab("operations")}
+              className={`flex-1 rounded-lg px-2 py-1.5 text-xs font-semibold ${
+                tab === "operations" ? "bg-gray-900 text-white" : "border bg-white text-gray-900"
+              }`}
+            >
+              Operaciones
+            </button>
+            {/* Pedir paneles al supermercado y confirmar lo que llega.
+                The wrapper sizes the component's own button to match the other two tabs. */}
+            <div className="flex-1 [&_button]:!w-full [&_button]:!rounded-lg [&_button]:!px-2 [&_button]:!py-1.5 [&_button]:!text-xs">
+              <PanelRequestsButton getToken={getToken} />
+            </div>
+          </div>
+
+          {lastSavedTime && tab === "summary" && (
+            <div className="mt-1.5 text-right text-[11px] text-gray-500">
+              Guardado {new Date(lastSavedTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+            </div>
+          )}
+
           {/* Style Selection Tabs */}
           {styles.length > 1 && (
-            <div className="mt-4">
+            <div className="mt-3">
               <div className="flex gap-2 border-b">
                 {styles.map((style, idx) => (
                   <button
@@ -2039,69 +2239,112 @@ export default function LineLeaderPage() {
           </div>
         ) : null}
 
-        <div className="mt-4">
+        <div className="mt-3">
           {tab === "summary" ? (
             <>
-              {/* Summary Cards Banner */}
-              {currentStyle && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-5 mb-6">
-                  <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                    <p className="text-sm font-medium text-gray-500 uppercase tracking-wider mb-1">Objetivo Total</p>
-                    <p className="text-3xl font-bold text-gray-900">{Math.round(target).toLocaleString()}</p>
-                    <p className="text-xs text-gray-500 mt-2">piezas</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                    <p className="text-sm font-medium text-gray-500 uppercase tracking-wider mb-1">Meta en tiempo real</p>
-                    <p className="text-3xl font-bold text-gray-900">
-                      {realTimeTarget.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </p>
-                    <p className="text-xs text-gray-500 mt-2">piezas esperadas hasta ahora</p>
-                    <div className="w-full bg-gray-200 rounded-full h-1.5 mt-3">
-                      <div
-                        className="bg-blue-600 h-1.5 rounded-full transition-all duration-500"
-                        style={{ width: `${Math.min(realTimeProgress, 100)}%` }}
-                      ></div>
-                    </div>
-                    <p className="text-xs text-gray-500 mt-1">{realTimeProgress.toFixed(1)}% del objetivo</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                    <p className="text-sm font-medium text-gray-500 uppercase tracking-wider mb-1">Total Cosido</p>
-                    <p className="text-3xl font-bold text-gray-900">{Math.round(finishedGarmentsTotal).toLocaleString()}</p>
-                    <p className="text-xs text-gray-500 mt-2">piezas terminadas</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className={`w-3 h-3 rounded-full ${getStatusDot(realTimeEfficiency, 'realtimeEfficiency')}`}></span>
-                      <p className="text-sm font-medium text-gray-500 uppercase tracking-wider">Real‑time Efficiency</p>
-                    </div>
-                    <p className="text-3xl font-bold text-gray-900">{realTimeEfficiency.toFixed(1)}%</p>
-                    <p className="text-xs text-gray-500 mt-2">basada en tiempo real</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className={`w-3 h-3 rounded-full ${getStatusDot(overallEfficiency, 'efficiency')}`}></span>
-                      <p className="text-sm font-medium text-gray-500 uppercase tracking-wider">Diario Eficiencia</p>
-                    </div>
-                    <p className="text-3xl font-bold text-gray-900">{overallEfficiency.toFixed(1)}%</p>
-                    <p className="text-xs text-gray-500 mt-2">basada en SAM</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className={`w-3 h-3 rounded-full ${getStatusDot(targetAchievement, 'cumplimiento')}`}></span>
-                      <p className="text-sm font-medium text-gray-500 uppercase tracking-wider">Cumplimiento</p>
-                    </div>
-                    <p className="text-3xl font-bold text-gray-900">{targetAchievement.toFixed(1)}%</p>
-                    <div className="w-full bg-gray-200 rounded-full h-1.5 mt-2">
-                      <div
-                        className="bg-gray-900 h-1.5 rounded-full transition-all duration-500"
-                        style={{ width: `${Math.min(targetAchievement, 100)}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                </div>
-              )}
+              {/* Sub-tabs: Detalle de trabajo / Resumen de meta */}
+              <div
+                role="tablist"
+                aria-label="Vista del resumen"
+                className="mb-3 grid grid-cols-2 gap-1 rounded-xl bg-gray-100 p-1"
+              >
+                {[
+                  { key: "details", label: "Detalle de trabajo" },
+                  { key: "meta", label: "Resumen de meta" },
+                ].map((t) => {
+                  const active = summaryView === t.key;
+                  return (
+                    <button
+                      key={t.key}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      onClick={() => setSummaryView(t.key)}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900 ${
+                        active ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                      }`}
+                    >
+                      {t.label}
+                    </button>
+                  );
+                })}
+              </div>
 
-              <MetaSummary header={header} target={target} slots={slotsForSummary} />
+              {summaryView === "details" ? (
+                currentStyle && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3">
+                    {/* Meta */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-3">
+                      <p className="text-xs font-medium text-gray-500">Meta</p>
+                      <p className="mt-0.5 text-2xl font-bold leading-tight text-gray-900">
+                        {Math.round(target).toLocaleString()}
+                      </p>
+                      <p className="text-[11px] text-gray-500">piezas</p>
+                    </div>
+
+                    {/* Meta en tiempo real */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-3">
+                      <p className="text-xs font-medium text-gray-500">Meta en tiempo real</p>
+                      <p className="mt-0.5 text-2xl font-bold leading-tight text-gray-900">
+                        {realTimeTarget.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 1 })}
+                      </p>
+                      <div className="mt-1.5 h-1 w-full rounded-full bg-gray-200">
+                        <div
+                          className="h-1 rounded-full bg-blue-600 transition-all duration-500"
+                          style={{ width: `${Math.min(realTimeProgress, 100)}%` }}
+                        ></div>
+                      </div>
+                      <p className="mt-1 text-[11px] text-gray-500">{realTimeProgress.toFixed(1)}% de la meta</p>
+                    </div>
+
+                    {/* Total cosido */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-3">
+                      <p className="text-xs font-medium text-gray-500">Total cosido</p>
+                      <p className="mt-0.5 text-2xl font-bold leading-tight text-gray-900">
+                        {Math.round(finishedGarmentsTotal).toLocaleString()}
+                      </p>
+                      <p className="text-[11px] text-gray-500">piezas terminadas</p>
+                    </div>
+
+                    {/* Eficiencia en tiempo real */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-3">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${getStatusDot(realTimeEfficiency, 'realtimeEfficiency')}`}></span>
+                        <p className="text-xs font-medium text-gray-500">Efic. tiempo real</p>
+                      </div>
+                      <p className="mt-0.5 text-2xl font-bold leading-tight text-gray-900">{realTimeEfficiency.toFixed(1)}%</p>
+                      <p className="text-[11px] text-gray-500">hasta ahora</p>
+                    </div>
+
+                    {/* Eficiencia diaria */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-3">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${getStatusDot(overallEfficiency, 'efficiency')}`}></span>
+                        <p className="text-xs font-medium text-gray-500">Efic. diaria</p>
+                      </div>
+                      <p className="mt-0.5 text-2xl font-bold leading-tight text-gray-900">{overallEfficiency.toFixed(1)}%</p>
+                      <p className="text-[11px] text-gray-500">basada en SAM</p>
+                    </div>
+
+                    {/* Cumplimiento */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-3">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${getStatusDot(targetAchievement, 'cumplimiento')}`}></span>
+                        <p className="text-xs font-medium text-gray-500">Cumplimiento</p>
+                      </div>
+                      <p className="mt-0.5 text-2xl font-bold leading-tight text-gray-900">{targetAchievement.toFixed(1)}%</p>
+                      <div className="mt-1.5 h-1 w-full rounded-full bg-gray-200">
+                        <div
+                          className="h-1 rounded-full bg-gray-900 transition-all duration-500"
+                          style={{ width: `${Math.min(targetAchievement, 100)}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  </div>
+                )
+              ) : (
+                <MetaSummary header={header} target={target} slots={slotsForSummary} />
+              )}
               
               {assignments.length > 0 && (
                 <div className="mt-6 rounded-3xl border bg-white shadow-sm p-6">
@@ -2141,112 +2384,189 @@ export default function LineLeaderPage() {
             // Time-based Operations Section
             currentStyle && (
               <div className="space-y-4">
-                {/* Time Slot Selection Cards */}
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3">
-                  {slots.map((slot) => {
-                    const isSelected = selectedTimeSlot === slot.slot_label;
-                    const slotTarget = slotTargetsMap[slot.slot_label]?.slot_target || 0;
-                    const cumulativeTarget = slotTargetsMap[slot.slot_label]?.cumulative_target || 0;
-                    
-                    return (
-                      <button
-                        key={slot.slot_label}
-                        onClick={() => setSelectedTimeSlot(slot.slot_label)}
-                        className={`
-                          rounded-2xl border p-4 text-center transition-all
-                          ${isSelected 
-                            ? 'bg-gray-900 text-white border-gray-900 shadow-lg ring-2 ring-gray-900 ring-offset-2' 
-                            : 'bg-white hover:border-gray-300 hover:shadow-md'
-                          }
-                        `}
-                      >
-                        <div className="font-bold text-xl">{slot.slot_label}</div>
-                        <div className={`text-xs mt-1 ${isSelected ? 'text-gray-300' : 'text-gray-500'}`}>
-                          Meta: {Math.round(slotTarget)}
-                        </div>
-                        <div className={`text-xs font-semibold mt-1 ${isSelected ? 'text-gray-300' : 'text-gray-700'}`}>
-                          Acum: {Math.round(cumulativeTarget)}
-                        </div>
-                      </button>
-                    );
-                  })}
+                {/* Hour strip: one swipeable row, pinned while scrolling */}
+                <div
+                  className="sticky z-20 rounded-xl border bg-white p-1.5 shadow-sm"
+                  style={{ top: stickyTop + 6 }}
+                >
+                  <div
+                    className="flex gap-2 overflow-x-auto overscroll-x-contain [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+                    role="tablist"
+                    aria-label="Bloques horarios"
+                  >
+                    {slots.map((slot) => {
+                      const label = slot.slot_label;
+                      const isSelected = selectedTimeSlot === label;
+                      const isDone = isSlotFullySaved(selectedStyleIndex, label);
+                      const isNow = nowSlotLabel === label;
+                      const slotTarget = slotTargetsMap[label]?.slot_target || 0;
+                      return (
+                        <button
+                          key={label}
+                          type="button"
+                          role="tab"
+                          aria-selected={isSelected}
+                          ref={(el) => {
+                            if (el) slotChipRefs.current[label] = el;
+                            else delete slotChipRefs.current[label];
+                          }}
+                          onClick={() => selectSlot(label)}
+                          className={`min-w-[64px] shrink-0 rounded-xl border-2 px-3 py-2 text-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900 ${
+                            isSelected
+                              ? "border-gray-900 bg-gray-900 text-white"
+                              : isNow
+                              ? "border-blue-300 bg-blue-50 text-gray-900"
+                              : "border-gray-200 bg-white text-gray-900 hover:border-gray-300"
+                          }`}
+                        >
+                          <div className="text-lg font-bold leading-tight whitespace-nowrap">{label}</div>
+                          <div className={`mt-0.5 text-xs font-medium leading-tight ${isSelected ? "text-gray-300" : isDone ? "text-green-700" : isNow ? "text-blue-700" : "text-gray-500"}`}>
+                            {isDone ? "✓ listo" : isNow ? "ahora" : `Meta ${Math.round(slotTarget)}`}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
-                {/* Selected Time Slot Data Entry Section */}
-                {selectedTimeSlot && (
-                  <div className="rounded-3xl border bg-white shadow-sm overflow-hidden">
-                    <div className="p-6">
-                      <div className="mb-6">
-                        <h3 className="text-lg font-semibold text-gray-900">
-                          Ingresar producción por hora - Estilo {header.styleLabel}
+                {/* Selected hour: one compact row per operator */}
+                {selectedTimeSlot && (() => {
+                  const filledCount = operatorsList.filter((op) => {
+                    const v = getOperatorValueForSlot(selectedStyleIndex, op.id, selectedTimeSlot);
+                    return isSlotLocked(selectedStyleIndex, op.id, selectedTimeSlot) || (v !== "" && v != null);
+                  }).length;
+                  const openOps = operatorsList.filter((o) => !isSlotLocked(selectedStyleIndex, o.id, selectedTimeSlot));
+                  const lastOpenId = openOps.length ? openOps[openOps.length - 1].id : null;
+                  return (
+                  <div className="rounded-2xl border bg-white shadow-sm overflow-hidden">
+                    <div className="flex items-start justify-between gap-3 border-b px-4 py-3">
+                      <div className="min-w-0">
+                        <h3 className="text-sm font-semibold text-gray-900">
+                          Bloque {selectedTimeSlot} · Meta {Math.round(slotTargetsMap[selectedTimeSlot]?.slot_target || 0)}
                         </h3>
-                        <p className="text-sm text-gray-600 mt-1">
-                          Ingresa las piezas cosidas en cada bloque horario
-                        </p>
-                        <p className="text-xs text-gray-500 mt-2">
-                          🔒 Los valores guardados no pueden modificarse
+                        <p className="mt-0.5 text-xs text-gray-500">
+                          Estilo {header.styleLabel} · 🔒 lo guardado no se puede cambiar
                         </p>
                       </div>
+                      <span className="shrink-0 rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-700">
+                        {filledCount} de {operatorsList.length}
+                      </span>
+                    </div>
 
-                      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-6">
-                        {operatorsList.map((op) => {
-                          const operatorId = op.id;
-                          const currentValue = getOperatorValueForSlot(selectedStyleIndex, operatorId, selectedTimeSlot);
-                          const isLocked = isSlotLocked(selectedStyleIndex, operatorId, selectedTimeSlot);
-                          const totalCapacity = getOperatorTotalCapacity(operatorId);
-                          const cumulativeTotal = getOperatorTotalCumulative(selectedStyleIndex, operatorId);
-                          
+                    {/* Group tabs: 1–6, 7–12, 13–18, ... */}
+                    {opGroupCount > 1 && (
+                      <div
+                        role="tablist"
+                        aria-label="Grupos de operadores"
+                        className="grid gap-1.5 px-2 pt-2"
+                        style={{ gridTemplateColumns: `repeat(${opGroupCount}, minmax(0, 1fr))` }}
+                      >
+                        {Array.from({ length: opGroupCount }, (_, g) => {
+                          const groupOps = operatorsList.slice(g * OP_GROUP_SIZE, (g + 1) * OP_GROUP_SIZE);
+                          const filled = groupOps.filter((o) => {
+                            const v = getOperatorValueForSlot(selectedStyleIndex, o.id, selectedTimeSlot);
+                            return isSlotLocked(selectedStyleIndex, o.id, selectedTimeSlot) || (v !== "" && v != null);
+                          }).length;
+                          const allSaved = groupOps.every((o) => isSlotLocked(selectedStyleIndex, o.id, selectedTimeSlot));
+                          const active = g === opGroup;
                           return (
-                            <div key={op.id} className="flex flex-col items-center relative">
-                              <div className="text-xl font-semibold text-gray-900">
-                                Op. {op.operator_no}
+                            <button
+                              key={g}
+                              type="button"
+                              role="tab"
+                              aria-selected={active}
+                              onClick={() => setOpGroup(g)}
+                              className={`rounded-xl border-2 px-1 py-2 text-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900 ${
+                                active ? "border-gray-900 bg-gray-900 text-white" : "border-gray-300 bg-white text-gray-900"
+                              }`}
+                            >
+                              <div className="text-base font-bold leading-tight">
+                                {groupOps[0]?.operator_no}–{groupOps[groupOps.length - 1]?.operator_no}
                               </div>
-                              <div className="text-sm text-gray-600 mb-1 text-center">
-                                {op.operator_name || 'Sin nombre'}
+                              <div
+                                className={`mt-0.5 text-xs font-medium leading-tight ${
+                                  active ? "text-gray-300" : allSaved ? "text-green-700" : "text-gray-500"
+                                }`}
+                              >
+                                {allSaved ? "✓ listo" : `${filled} de ${groupOps.length}`}
                               </div>
-                              <div className="text-xs font-medium text-blue-600 mb-2">
-                                Cap: {totalCapacity.toFixed(3)} pcs/h
-                              </div>
-                              <div className="relative">
-                                <input
-                                  type="number"
-                                  value={currentValue}
-                                  onChange={(e) => handleTimeSlotChange(
-                                    selectedStyleIndex,
-                                    operatorId,
-                                    selectedTimeSlot,
-                                    e.target.value
-                                  )}
-                                  placeholder="0"
-                                  disabled={isLocked}
-                                  className={`
-                                    w-24 h-24 rounded-2xl border-2 text-center
-                                    text-3xl font-bold outline-none transition-all
-                                    ${isLocked 
-                                      ? 'bg-gray-100 border-gray-300 text-gray-500 cursor-not-allowed' 
-                                      : 'border-gray-200 focus:ring-2 focus:ring-gray-900/10 focus:border-gray-400'
-                                    }
-                                  `}
-                                  min="0"
-                                />
-                                {isLocked && (
-                                  <span className="absolute -top-2 -right-2 text-xs bg-gray-800 text-white px-1.5 py-0.5 rounded-full">
-                                    🔒
-                                  </span>
-                                )}
-                              </div>
-                              <div className="text-sm font-semibold text-gray-700 mt-2">
-                                Total acumulado: {cumulativeTotal}
-                              </div>
-                            </div>
+                            </button>
                           );
                         })}
                       </div>
+                    )}
 
+                    {/* Two operators per row on phones (3–4 on wider screens); only the current group */}
+                    <ul className="grid grid-cols-2 gap-2 p-2 pb-3 sm:grid-cols-3 lg:grid-cols-4">
+                      {operatorsList.slice(opGroup * OP_GROUP_SIZE, (opGroup + 1) * OP_GROUP_SIZE).map((op) => {
+                        const operatorId = op.id;
+                        const currentValue = getOperatorValueForSlot(selectedStyleIndex, operatorId, selectedTimeSlot);
+                        const isLocked = isSlotLocked(selectedStyleIndex, operatorId, selectedTimeSlot);
+                        const totalCapacity = getOperatorTotalCapacity(operatorId);
+                        const cumulativeTotal = getOperatorTotalCumulative(selectedStyleIndex, operatorId);
+
+                        return (
+                          <li
+                            key={op.id}
+                            className={`min-w-0 rounded-xl border p-2 ${isLocked ? "border-gray-200 bg-gray-50" : "border-gray-200 bg-white"}`}
+                          >
+                            <div className="flex items-center gap-2">
+                              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gray-900 text-sm font-bold text-white">
+                                {op.operator_no}
+                              </div>
+                              <div className="min-w-0 truncate text-sm font-semibold text-gray-900">
+                                {op.operator_name || "Sin nombre"}
+                              </div>
+                            </div>
+                            <div className="mt-1 truncate text-[11px] text-gray-500">
+                              Cap {totalCapacity.toFixed(1)}/h · Acum {cumulativeTotal}
+                            </div>
+                            {isLocked ? (
+                              <div
+                                className="mt-1.5 flex h-12 w-full items-center justify-center gap-1.5 rounded-xl bg-gray-200 text-xl font-bold text-gray-600"
+                                title="Guardado"
+                              >
+                                <span className="text-sm" aria-hidden="true">🔒</span>
+                                {currentValue === "" || currentValue == null ? 0 : currentValue}
+                              </div>
+                            ) : (
+                              <input
+                                ref={(el) => {
+                                  if (el) entryInputRefs.current[operatorId] = el;
+                                  else delete entryInputRefs.current[operatorId];
+                                }}
+                                type="number"
+                                inputMode="numeric"
+                                pattern="[0-9]*"
+                                enterKeyHint={operatorId === lastOpenId ? "done" : "next"}
+                                aria-label={`Piezas operador ${op.operator_no}`}
+                                value={currentValue}
+                                onChange={(e) =>
+                                  handleTimeSlotChange(selectedStyleIndex, operatorId, selectedTimeSlot, e.target.value)
+                                }
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    focusNextEntry(operatorId);
+                                  }
+                                }}
+                                onFocus={(e) => e.target.select()}
+                                onWheel={(e) => e.currentTarget.blur()}
+                                placeholder="0"
+                                min="0"
+                                className="mt-1.5 h-12 w-full scroll-mb-24 scroll-mt-44 rounded-xl border-2 border-gray-300 text-center text-xl font-bold outline-none transition-colors focus:border-gray-900 focus:ring-2 focus:ring-gray-900/10"
+                              />
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+
+                    <div className="px-4 pb-4">
                       {/* Collapsible operations details */}
-                      <details className="mt-8">
+                      <details className="mt-3">
                         <summary className="text-sm font-medium text-gray-700 cursor-pointer hover:text-gray-900">
-                          ► Ver todas las operaciones de este operador
+                          Ver todas las operaciones de este operador
                         </summary>
                         <div className="mt-4 space-y-4 border-t pt-4">
                           {operatorsList.map((op) => {
@@ -2306,57 +2626,58 @@ export default function LineLeaderPage() {
                       </details>
                     </div>
                   </div>
-                )}
+                  );
+                })()}
 
-                {/* Global Save Button */}
-                <div className="sticky bottom-4 bg-white rounded-2xl border shadow-lg p-4">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      {alarmVisible && (
-                        <button
-                          onClick={handleDismissAlarm}
-                          className="rounded-xl bg-red-100 text-red-700 px-4 py-2 text-sm font-semibold hover:bg-red-200"
-                        >
-                          ⏰ Cerrar alarma
-                        </button>
-                      )}
-                      <div className="text-sm text-gray-600">
-                        {lastSavedTime && (
-                          <>Último guardado: {new Date(lastSavedTime).toLocaleTimeString()}</>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3">
+                {/* Save bar: one slim row pinned to the bottom */}
+                <div className="sticky bottom-0 z-20 -mx-3 flex items-center gap-2 border-t bg-white px-3 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom,0px))] shadow-[0_-2px_8px_rgba(0,0,0,0.06)] sm:bottom-2 sm:mx-0 sm:rounded-2xl sm:border sm:pb-2">
+                  <div className="min-w-0 flex-1 truncate text-xs leading-tight text-gray-500">
+                    {alarmVisible ? (
                       <button
-                        onClick={handleSave}
-                        disabled={saving || !currentStyle}
-                        className="rounded-xl bg-green-600 text-white px-8 py-3 text-base font-semibold
-                                 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed
-                                 shadow-lg hover:shadow-xl transition-all"
+                        type="button"
+                        onClick={handleDismissAlarm}
+                        className="rounded-md bg-red-100 px-2 py-1 text-xs font-semibold text-red-700 hover:bg-red-200"
                       >
-                        {saving ? (
-                          <span className="flex items-center gap-2">
-                            <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                            </svg>
-                            Guardando...
-                          </span>
-                        ) : (
-                          '💾 Guardar producción'
-                        )}
+                        ⏰ Cerrar alarma
                       </button>
-                      <button
-                        onClick={openTicketBuilder}
-                        disabled={!currentStyle}
-                        className="rounded-xl bg-gray-900 text-white px-6 py-3 text-base font-semibold
-                                 hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed
-                                 shadow-lg transition-all"
-                      >
-                        🖨️ Imprimir ticket
-                      </button>
-                    </div>
+                    ) : lastSavedTime ? (
+                      <>Guardado {new Date(lastSavedTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</>
+                    ) : (
+                      "Sin guardar"
+                    )}
                   </div>
+                  <button
+                    type="button"
+                    onClick={openTicketBuilder}
+                    disabled={!currentStyle}
+                    aria-label="Imprimir ticket"
+                    className="flex shrink-0 items-center gap-1.5 rounded-xl border-2 border-gray-300 bg-white px-4 py-2.5 text-base font-semibold text-gray-900 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <span aria-hidden="true">🖨️</span> Ticket
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      advanceAfterSaveRef.current = true;
+                      handleSave();
+                    }}
+                    disabled={saving || !currentStyle}
+                    className="flex shrink-0 items-center gap-1.5 rounded-xl bg-green-600 px-5 py-2.5 text-base font-semibold text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {saving ? (
+                      <>
+                        <svg className="h-5 w-5 animate-spin" viewBox="0 0 24 24" aria-hidden="true">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                        Guardando…
+                      </>
+                    ) : (
+                      <>
+                        <span aria-hidden="true">💾</span> Guardar
+                      </>
+                    )}
+                  </button>
                 </div>
               </div>
             )
